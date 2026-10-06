@@ -538,7 +538,7 @@ mod tests {
             "{parsed:?}"
         );
         assert_eq!(
-            printable("  Stream\u{7}\r\nDeck\u{200b}  ", 48),
+            printable("  Control\u{7}\r\nDeck\u{200b}  ", 48),
             "ControlDeck\u{200b}"
         );
         assert_eq!(printable("ab   cd", 3), "ab");

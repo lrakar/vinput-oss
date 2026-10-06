@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 pub use armed::{Armed, ArmedSource, CaptureBackend, CaptureStream, Changed};
 #[cfg(windows)]
 pub use wasapi::{ArmedMicrophone, Wasapi, WasapiSource, WasapiStream, WasapiWatch, microphones};
+#[cfg(windows)]
+pub(crate) use wasapi::{apartment, device_id};
 pub use wav::{WavSource, wav_bytes};
 
 use crate::Result;

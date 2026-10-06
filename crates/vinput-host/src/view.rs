@@ -172,6 +172,7 @@ fn settings(settings: &Settings, graphics_card: bool) -> wire::Settings {
         languages: settings.languages.join(", "),
         autostart: settings.autostart,
         ready_sound: settings.ready_sound,
+        stop_sound: settings.stop_sound,
         check_updates: settings.check_updates,
         // What the user wants only counts on a PC that has a card.
         graphics_card: settings.local_gpu && graphics_card,
@@ -322,6 +323,9 @@ fn tier(tier: Tier) -> wire::ProTier {
 fn pro(all: &Facts<'_>) -> wire::Pro {
     let facts = &all.pro;
     let offers = facts.prices.offers.iter();
+    // The price of a first month is for someone new: whoever is signed out
+    // may be, and of an account the server says.
+    let new = facts.email.is_none() || facts.info.is_some_and(|info| info.intro_eligible);
     let mut shown = wire::Pro {
         doing: facts.doing,
         problem: facts.problem.map(str::to_owned),
@@ -329,11 +333,13 @@ fn pro(all: &Facts<'_>) -> wire::Pro {
             .map(|offer| wire::ProOffer {
                 tier: tier(offer.tier),
                 monthly: offer.monthly,
+                first: if new { offer.first } else { 0 },
                 yearly: offer.yearly,
                 seconds: offer.cap_seconds,
             })
             .collect(),
         currency: facts.prices.currency.clone(),
+        open: facts.prices.open,
         spare: spare(all).map(str::to_owned),
         ..wire::Pro::default()
     };
@@ -629,6 +635,7 @@ mod tests {
             tier: Tier::Plus,
             resets_at: 1_793_491_200,
             complimentary: false,
+            intro_eligible: false,
         };
         facts.pro.info = Some(&info);
         // Known from a while ago, with the server out of reach now.
@@ -690,10 +697,12 @@ mod tests {
             offers: vec![vinput_core::cloud::Offer {
                 tier: Tier::Pro,
                 monthly: 700,
+                first: 490,
                 yearly: 6900,
                 cap_seconds: 144_000,
             }],
             currency: "usd".into(),
+            open: false,
         };
         // To someone signed out as to anyone else.
         facts.pro = no_pro(&said);
@@ -703,11 +712,41 @@ mod tests {
             [wire::ProOffer {
                 tier: wire::ProTier::Pro,
                 monthly: 700,
+                first: 490,
                 yearly: 6900,
                 seconds: 144_000,
             }]
         );
         assert_eq!(shown.currency, "usd");
+        assert!(!shown.open && wire::Pro::default().open);
+
+        // The price of a first month is shown to whoever is signed out, who
+        // may be new, and to an account only once the server has said it
+        // is: not before it has said anything, and not on a no.
+        let first = |facts: &Facts<'_>| build(facts).pro.offers[0].first;
+        facts.pro.email = Some("ana@example.com");
+        assert_eq!(first(&facts), 0);
+        let info = AccountInfo {
+            email: "ana@example.com".into(),
+            entitled: false,
+            subscription: None,
+            used_seconds: 0,
+            cap_seconds: 144_000,
+            tier: Tier::Pro,
+            resets_at: 0,
+            complimentary: false,
+            intro_eligible: false,
+        };
+        facts.pro.info = Some(&info);
+        assert_eq!(first(&facts), 0);
+        let new = AccountInfo {
+            intro_eligible: true,
+            ..info.clone()
+        };
+        facts.pro.info = Some(&new);
+        assert_eq!(first(&facts), 490);
+        // The prices themselves are everyone's.
+        assert_eq!(build(&facts).pro.offers[0].monthly, 700);
     }
 
     #[test]

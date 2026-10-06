@@ -9,7 +9,7 @@ Vinput lives in the system tray. Two keys drive dictation, **F1** and **F2** by 
 - **Tap** the key to start dictating and tap again to stop, or **hold** it and release when you are done.
 - **Escape** cancels. A dictation, search or memo that is running, or that has stopped and is still being recognized, is dropped: nothing more is typed, opened or saved. Escape is Vinput's only for that long; the rest of the time it does what it does everywhere.
 - **F1** types what you said. **F2** does the same and then presses Enter, for chat boxes and prompts.
-- While it listens, the tray icon turns red and a small live audio meter appears under the text cursor. A soft sound marks the moment it starts listening.
+- While it listens, the tray icon turns red and a small live audio meter appears under the text cursor. A soft click marks the moment it starts listening and a lower one the moment it stops; each can be switched off.
 
 A key you pick in Settings does a **dictated search**: tap or hold it, say what you are looking for, and Vinput opens the search in your default browser, whatever window you were in. It searches with Google unless you put another address under Settings, Advanced, Web search, with `%s` where the words go: `https://duckduckgo.com/?q=%s`, `https://www.bing.com/search?q=%s`, or the search of any other site.
 

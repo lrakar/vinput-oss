@@ -99,6 +99,14 @@ pub(super) fn least_a_month(pro: &Pro) -> String {
     )
 }
 
+/// The least a first month costs, where the server has a price for it that
+/// whoever is looking would pay: `\u{20ac}1.49`.
+pub(super) fn least_first(pro: &Pro) -> Option<String> {
+    let firsts = pro.offers.iter().map(|offer| offer.first);
+    let least = firsts.filter(|first| *first > 0).min()?;
+    Some(price(least, &pro.currency))
+}
+
 /// An amount in hundredths of `currency` as people write it: `\u{20ac}6`,
 /// `\u{20ac}5.90`, `CHF 6`.
 pub(super) fn price(hundredths: u32, currency: &str) -> String {
@@ -517,6 +525,16 @@ mod tests {
         assert_eq!(price(605, "usd"), "$6.05");
         assert_eq!(price(500, "gbp"), "\u{a3}5");
         assert_eq!(price(600, "chf"), "CHF 6");
+        assert_eq!(price(349, "eur"), "\u{20ac}3.49");
+        assert_eq!(price(149, "eur"), "\u{20ac}1.49");
+        // The least a first month costs, among the tiers that have such a
+        // price; none where no tier has.
+        let mut pro = Pro::default();
+        assert_eq!(least_first(&pro), None);
+        pro.offers[1].first = 349;
+        assert_eq!(least_first(&pro).as_deref(), Some("\u{20ac}3.49"));
+        pro.offers[0].first = 149;
+        assert_eq!(least_first(&pro).as_deref(), Some("\u{20ac}1.49"));
     }
 
     #[test]

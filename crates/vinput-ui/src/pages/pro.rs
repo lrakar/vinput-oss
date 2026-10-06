@@ -8,11 +8,13 @@
 //! itself. Prices and the allowance are the ones in the view, which are the
 //! server's once it has said.
 
-use vinput_view::{Command, PRO_MODEL, Page, Pro, ProDoing, ProPlan, ProTier, ProWho, View};
+use vinput_view::{
+    Command, PRO_MODEL, PRO_SOON, Page, Pro, ProDoing, ProPlan, ProTier, ProWho, View,
+};
 
 use super::common::{
-    DOT, ProTrouble, date, day, fraction, hours_low, least_a_month, notice_bar, owing, price,
-    pro_in_use, pro_trouble,
+    DOT, ProTrouble, date, day, fraction, hours_low, least_a_month, least_first, notice_bar, owing,
+    price, pro_in_use, pro_trouble,
 };
 use crate::node::{
     Action, ButtonKind, Content, Icon, Node, Severity, TextStyle, Tone, accent_button, badge,
@@ -23,6 +25,11 @@ use crate::node::{
 /// are used up: said once, under the tiers.
 const SAME: &str = "Both use the same recognition. When the month's hours run out, VinPUT \
                     carries on with a model on this PC.";
+
+/// What a price for the first month means, said once under the tiers that
+/// have one: what is paid afterwards, and for how long.
+const INTRO: &str = "The first month is at the introductory price. After that the regular price \
+                     applies until you cancel.";
 
 /// The way to a model for the time the hours are used up, for someone who
 /// has none on this PC.
@@ -56,12 +63,18 @@ pub fn content(view: &View) -> Content {
     }
 }
 
-/// Why the server could not be asked, with a way to ask again.
+/// Why the server could not be asked, with a way to ask again. That no plan
+/// can be subscribed to yet is news, and asking again would not change it.
 fn problem_bar(pro: &Pro) -> Option<Node> {
     let problem = pro.problem.as_ref()?;
-    let retry = pro.who == ProWho::SignedIn;
+    let soon = problem == PRO_SOON;
+    let retry = pro.who == ProWho::SignedIn && !soon;
     Some(Node::InfoBar {
-        severity: Severity::Critical,
+        severity: if soon {
+            Severity::Info
+        } else {
+            Severity::Critical
+        },
         text: problem.clone(),
         action: retry.then(|| ("Try again".to_owned(), Action::send(Command::ProRefresh))),
         dismiss: None,
@@ -115,7 +128,11 @@ fn pitch(pro: &Pro, with_prices: bool, control: Option<Node>) -> Node {
     points.push(format!("{} of dictation a month", hours_on_offer(pro)));
     let mut about = setting(Icon::Star, "Dictate with VinPUT Pro").below(bullets(points));
     if with_prices {
-        about = about.detail(format!("From {}", least_a_month(pro)));
+        let from = least_a_month(pro);
+        about = about.detail(match least_first(pro) {
+            Some(first) => format!("From {first} for the first month, then from {from}"),
+            None => format!("From {from}"),
+        });
     }
     if let Some(control) = control {
         about = about.control(control);
@@ -368,20 +385,33 @@ fn plans(pro: &Pro) -> Vec<Node> {
         let a_month = format!("{} a month", price(offer.monthly, &pro.currency));
         let a_year = format!("or {} a year", price(offer.yearly, &pro.currency));
         two_free &= u64::from(offer.yearly) <= 10 * u64::from(offer.monthly);
-        let prices = [
-            accent_button(a_month, subscribe(ProPlan::Monthly))
-                .enabled(free)
-                .into(),
-            button(a_year, subscribe(ProPlan::Yearly))
-                .kind(ButtonKind::Subtle)
-                .enabled(free)
-                .into(),
-        ];
+        let mut comes_with = format!("{} of dictation a month", hours(offer.seconds));
+        let prices = if pro.open {
+            row([
+                accent_button(a_month, subscribe(ProPlan::Monthly))
+                    .enabled(free)
+                    .into(),
+                button(a_year, subscribe(ProPlan::Yearly))
+                    .kind(ButtonKind::Subtle)
+                    .enabled(free)
+                    .into(),
+            ])
+        } else {
+            // Nothing to press yet: the prices move beside the hours.
+            comes_with = format!("{comes_with}{DOT}{a_month} {a_year}");
+            styled("Opening soon", TextStyle::Body, Tone::Disabled)
+        };
+        // The button stays what a month costs for as long as one pays; what
+        // the first one costs someone new is said beside the hours.
+        if offer.first > 0 {
+            let first = price(offer.first, &pro.currency);
+            comes_with = format!("{comes_with}{DOT}first month {first}");
+        }
         rows.push(
             plain_setting(tier_name(offer.tier))
                 .indented()
-                .detail(format!("{} of dictation a month", hours(offer.seconds)))
-                .control(row(prices))
+                .detail(comes_with)
+                .control(prices)
                 .into(),
         );
     }
@@ -395,10 +425,16 @@ fn plans(pro: &Pro) -> Vec<Node> {
     let mut paying = "You pay by card on a page of our payment provider, which opens in your \
                       browser. Cancel at any time."
         .to_owned();
-    if two_free {
+    if !pro.open {
+        "Subscribing opens shortly. Until then, the models under Models are free to use."
+            .clone_into(&mut paying);
+    } else if two_free {
         paying.insert_str(0, "Paid by the year, two months are free. ");
     }
     let mut page = vec![pitch(pro, false, None), header("Choose a plan"), card(rows)];
+    if least_first(pro).is_some() {
+        page.push(note(INTRO));
+    }
     if pro.offers.len() > 1 {
         page.push(note(SAME));
     }
@@ -758,6 +794,137 @@ mod tests {
         view.pro.offers[0].monthly = 250;
         view.pro.currency = "usd".to_owned();
         assert!(Seen::of(&content(&view).body).says("From $2.50 a month"));
+    }
+
+    #[test]
+    fn a_first_month_at_less_is_said_beside_the_regular_price_and_never_in_its_place() {
+        let plain = seen("pro-not-subscribed");
+        let view = scene("pro-intro");
+        let seen = Seen::of(&content(&view).body);
+        // The buttons say what a month and a year cost for as long as one
+        // pays, and lead where they led.
+        assert_eq!(seen.labels(), plain.labels());
+        assert_eq!(seen.commands(), plain.commands());
+        assert_eq!(
+            accents(&seen),
+            ["\u{20ac}2.50 a month", "\u{20ac}5 a month"]
+        );
+        // What the first month costs is beside the hours of its tier.
+        for (tier, comes_with) in [
+            (
+                "Plus",
+                "8 hours of dictation a month \u{b7} first month \u{20ac}1.49",
+            ),
+            (
+                "Pro",
+                "25 hours of dictation a month \u{b7} first month \u{20ac}3.49",
+            ),
+        ] {
+            let detail = detail_of(&view, tier).map(|(detail, _)| detail);
+            assert_eq!(detail.as_deref(), Some(comes_with));
+        }
+        // And what follows it is said once, under the tiers.
+        let said = |seen: &Seen| seen.texts.iter().filter(|text| *text == INTRO).count();
+        assert_eq!(said(&seen), 1);
+        assert_eq!(
+            INTRO,
+            "The first month is at the introductory price. After that the regular price applies \
+             until you cancel."
+        );
+
+        // An account the server does not call new is shown none of it.
+        assert!(!plain.says("first month") && !plain.says("introductory"));
+        // A tier without such a price says nothing of one beside a tier
+        // that has it.
+        let mut view = view;
+        view.pro.offers[0].first = 0;
+        let seen = Seen::of(&content(&view).body);
+        let plus = detail_of(&view, "Plus").map(|(detail, _)| detail);
+        assert_eq!(plus.as_deref(), Some("8 hours of dictation a month"));
+        assert!(seen.says("first month \u{20ac}3.49") && said(&seen) == 1);
+        view.pro.offers[1].first = 0;
+        assert_eq!(Seen::of(&content(&view).body).texts, plain.texts);
+
+        // Someone signed out, who may be new, reads both prices in the
+        // pitch; without such a price it is the one it was.
+        let mut view = scene("pro-intro-signed-out");
+        let seen = Seen::of(&content(&view).body);
+        let pitch = "From \u{20ac}1.49 for the first month, then from \u{20ac}2.50 a month";
+        assert!(seen.texts.iter().any(|text| text == pitch));
+        assert_eq!(seen.labels(), ["Sign in with Google"]);
+        view.pro.currency = "usd".to_owned();
+        assert!(Seen::of(&content(&view).body).says("From $1.49 for the first month"));
+        assert!(!self::seen("pro-signed-out").says("first month"));
+
+        // Said calmly wherever it is said.
+        for name in crate::mock::SCENES {
+            for text in self::seen(name).texts {
+                let lower = text.to_lowercase();
+                for word in ["limited", "hurry", "today", "offer", "discount", "%"] {
+                    assert!(!lower.contains(word), "{name}: {text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn while_no_plan_can_be_subscribed_to_the_tiers_are_shown_with_nothing_to_press() {
+        let mut view = scene("pro-opening-soon");
+        let seen = Seen::of(&content(&view).body);
+        // Both tiers with their hours and prices, and no way to a checkout.
+        assert_eq!(seen.labels(), ["Sign out"]);
+        assert!(accents(&seen).is_empty() && seen.bars.is_empty());
+        for (tier, comes_with) in [
+            (
+                "Plus",
+                "8 hours of dictation a month \u{b7} \u{20ac}2.50 a month or \u{20ac}24 a year",
+            ),
+            (
+                "Pro",
+                "25 hours of dictation a month \u{b7} \u{20ac}5 a month or \u{20ac}49 a year",
+            ),
+        ] {
+            let detail = detail_of(&view, tier).map(|(detail, _)| detail);
+            assert_eq!(detail.as_deref(), Some(comes_with));
+        }
+        let soon = seen.texts.iter().filter(|text| *text == "Opening soon");
+        assert_eq!(soon.count(), 2);
+        assert!(seen.says(
+            "Subscribing opens shortly. Until then, the models under Models are free to use."
+        ));
+        // Nothing is said of paying by card, or by the year.
+        assert!(!seen.says("You pay by card") && !seen.says("two months"));
+        // The price of a first month keeps its place, after the others.
+        view.pro.offers[0].first = 149;
+        let plus = detail_of(&view, "Plus").map(|(detail, _)| detail);
+        assert!(plus.is_some_and(|plus| plus.ends_with("a year \u{b7} first month \u{20ac}1.49")));
+        // The day the server says it can be, the buttons are back.
+        view.pro.open = true;
+        assert_eq!(Seen::of(&content(&view).body).labels().len(), 5);
+        // The step of the welcome is this page.
+        let mut first = scene("first-run");
+        first.pro = view.pro;
+        first.pro.open = false;
+        let welcome = super::super::welcome::content(Page::WelcomePro, &first);
+        assert!(Seen::of(&welcome.body).says("Opening soon"));
+    }
+
+    #[test]
+    fn a_press_the_server_cannot_take_yet_is_answered_calmly_and_the_plans_stay() {
+        let seen = seen("pro-not-yet");
+        assert_eq!(
+            seen.bars,
+            [(
+                Severity::Info,
+                "Subscribing opens shortly. Nothing was charged. Your free options under Models \
+                 keep working."
+                    .to_owned()
+            )]
+        );
+        // Nothing to try again, no wait, and the plans as they were.
+        assert_eq!(seen.labels(), self::seen("pro-not-subscribed").labels());
+        assert!(seen.progress.is_empty());
+        assert!(!seen.says("could not do that"));
     }
 
     #[test]

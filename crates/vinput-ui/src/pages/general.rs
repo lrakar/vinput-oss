@@ -219,9 +219,15 @@ fn behavior(settings: &Settings) -> [Node; 2] {
                 }))
                 .into(),
             setting(Icon::Volume, "Play a sound when listening starts")
-                .detail("A soft sound tells you when to start speaking")
+                .detail("A soft click as soon as you press the key")
                 .control(toggle(settings.ready_sound, |on| {
                     Action::send(Command::Set(Change::ReadySound(on)))
+                }))
+                .into(),
+            setting(Icon::Volume, "Play a sound when listening stops")
+                .detail("A lower click as soon as you are done")
+                .control(toggle(settings.stop_sound, |on| {
+                    Action::send(Command::Set(Change::StopSound(on)))
                 }))
                 .into(),
         ]),

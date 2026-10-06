@@ -356,6 +356,10 @@ mod tests {
             let monthly = Command::ProSubscribe(tier, ProPlan::Monthly);
             assert!(plans.commands().contains(&monthly), "{tier:?}");
         }
+        // With whatever the page of the account says about a first month.
+        let intro = seen(Page::WelcomePro, &scene("welcome-intro"));
+        assert!(intro.says("first month \u{20ac}1.49") && intro.says("introductory price"));
+        assert!(!plans.says("first month"));
     }
 
     #[test]

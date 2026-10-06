@@ -12,10 +12,11 @@ use crate::audio::{ArmedMicrophone, AudioSource, LevelMeter, Metered, SAMPLE_RAT
 use crate::inject::{SendInputSink, TextSink};
 use crate::session::{Controller, Ended, Failure, Outcome, Target};
 use crate::settings::{Settings, SpeechConfig};
+use crate::sound::{self, Cue};
 use crate::stt::{
     self, Emit, ProviderKind, SessionOptions, SpeechProvider, Transcriber, Transcript,
 };
-use crate::{Error, Result, log, memo, pipeline, sound};
+use crate::{Error, Result, log, memo, pipeline};
 
 /// The most audio that is kept for a recognizer that is not there yet: one
 /// minute, which is 2 MB. The largest local model loads in a few seconds; a
@@ -91,7 +92,10 @@ impl Drop for Closing {
 #[derive(Clone)]
 struct Options {
     languages: Vec<String>,
-    ready_sound: bool,
+    /// Whether a sound says that listening has started, and that it has
+    /// stopped.
+    start_sound: bool,
+    stop_sound: bool,
     /// The configured microphone. For a while after a session its stream is
     /// kept, stopped, so that the next session only has to start it.
     microphone: Arc<ArmedMicrophone>,
@@ -103,7 +107,8 @@ impl Options {
     fn of(settings: &Settings, microphone: Arc<ArmedMicrophone>) -> Self {
         Self {
             languages: settings.languages.clone(),
-            ready_sound: settings.ready_sound,
+            start_sound: settings.ready_sound,
+            stop_sound: settings.stop_sound,
             microphone,
             memo_dir: settings.memo_dir.clone(),
             memo_to_clipboard: settings.memo_to_clipboard,
@@ -166,6 +171,15 @@ impl Controller for Dictation {
         if self.is_active() {
             return;
         }
+        // The sound answers the key press itself, like the indicator: it is
+        // not left to the session's thread, which has a microphone to open
+        // first. Without one, the way to the speakers is still made ready
+        // for the sound of the stop.
+        if self.options.start_sound {
+            sound::play(Cue::Start);
+        } else if self.options.stop_sound {
+            sound::warm();
+        }
         let stop = StopHandle::new();
         let speech = Arc::clone(&self.speech);
         let options = self.options.clone();
@@ -220,6 +234,12 @@ impl Controller for Dictation {
         // go of it here means a new session can start straight away.
         if let Some(active) = self.active.take() {
             active.stop.stop();
+            // After the microphone was told to stop, so that it hears as
+            // little of the sound as can be. A session that had ended by
+            // itself has nothing left to stop.
+            if self.options.stop_sound && !active.ended.load(Ordering::Acquire) {
+                sound::play(Cue::Stop);
+            }
             self.finishing
                 .retain(|(_, ended)| !ended.load(Ordering::Acquire));
             self.finishing.push((active.cancelled, active.ended));
@@ -353,10 +373,9 @@ fn run_session(
         return record_memo(options, stop, meter, id, cancelled);
     }
     let microphone = || listen(options, stop, meter);
-    let ready = || say_ready(options);
     if matches!(target, Target::Capture | Target::Search) {
         let mut sink = Collecting::default();
-        transcribe(speech, &options.languages, microphone, ready, &mut sink)?;
+        transcribe(speech, &options.languages, microphone, &mut sink)?;
         let text = sink.text.trim().to_owned();
         return Ok(Some(if target == Target::Search {
             Outcome::Search { text }
@@ -372,7 +391,7 @@ fn run_session(
         },
         typed: 0,
     };
-    transcribe(speech, &options.languages, microphone, ready, &mut sink)?;
+    transcribe(speech, &options.languages, microphone, &mut sink)?;
     if target == Target::FocusedEnter && sink.typed > 0 {
         sink.type_text("\n")?;
     }
@@ -383,13 +402,6 @@ fn run_session(
 /// is still busy with.
 fn listen(options: &Options, stop: StopHandle, meter: LevelMeter) -> Result<impl AudioSource> {
     Ok(Metered::new(options.microphone.open(stop)?, meter))
-}
-
-/// Says that the microphone is live and it is safe to start speaking.
-fn say_ready(options: &Options) {
-    if options.ready_sound {
-        sound::play_ready();
-    }
 }
 
 /// Recognizes what a microphone hears and hands the text to `sink`, without
@@ -409,15 +421,13 @@ fn say_ready(options: &Options) {
 /// microphone that cannot be opened is reported only once the provider has
 /// answered, should the two ever coincide.
 ///
-/// `ready` tells the user that the microphone is live. A provider that says
-/// no at once (no key, no model) has usually said so by the time the
-/// microphone is open; the session then ends with that error and `ready` is
-/// not called, so nobody is invited to speak to a session that is over.
+/// A provider that says no at once (no key, no model) has usually said so
+/// by the time the microphone is open; the session then ends with that error
+/// without listening to anything.
 fn transcribe<A: AudioSource>(
     speech: &dyn SpeechProvider,
     languages: &[String],
     listen: impl FnOnce() -> Result<A>,
-    ready: impl FnOnce(),
     sink: &mut impl TextSink,
 ) -> Result<()> {
     thread::scope(|scope| {
@@ -425,7 +435,6 @@ fn transcribe<A: AudioSource>(
         // Dropped on every way out of here, which lets go of the microphone.
         let mut microphone = listen()?;
         session.session(false)?;
-        ready();
         pipeline::run_session(&mut microphone, &mut session, sink)
     })
 }
@@ -557,7 +566,6 @@ fn record_memo(
     cancelled: &AtomicBool,
 ) -> Result<Option<Outcome>> {
     let mut microphone = listen(options, stop, meter)?;
-    say_ready(options);
     let mut samples = Vec::new();
     let mut chunk = [0i16; 1600];
     while samples.len() < memo::MAX_SAMPLES {
@@ -799,7 +807,7 @@ mod tests {
         };
         let mut sink = Typed::default();
 
-        let result = transcribe(&provider, &[], || Ok(microphone), || {}, &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
 
         assert!(result.is_ok(), "{result:?}");
         // The microphone was heard before there was anyone to recognize it,
@@ -821,7 +829,7 @@ mod tests {
             gate.open();
         });
 
-        let result = transcribe(&provider, &[], || Ok(microphone), || {}, &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
 
         assert!(result.is_ok(), "{result:?}");
         assert!(loaded.join().is_ok());
@@ -842,7 +850,7 @@ mod tests {
         };
         let mut sink = Typed::default();
 
-        let result = transcribe(&provider, &[], || Ok(microphone), || {}, &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
 
         assert!(matches!(result, Err(Error::Transcription(_))), "{result:?}");
         assert!(released.load(Ordering::SeqCst));
@@ -859,13 +867,7 @@ mod tests {
             gate.open();
         });
 
-        let result = transcribe(
-            &provider,
-            &[],
-            || Ok(microphone),
-            || {},
-            &mut Typed::default(),
-        );
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut Typed::default());
 
         assert!(matches!(result, Err(Error::Transcription(_))), "{result:?}");
         assert!(failed.join().is_ok());
@@ -885,7 +887,7 @@ mod tests {
         };
         let mut sink = Typed::default();
 
-        let result = transcribe(&provider, &[], || Ok(microphone), || {}, &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(provider.heard.fed(), everything(50));
@@ -904,19 +906,17 @@ mod tests {
             &provider,
             &[],
             || Err::<Counted, _>(Error::Audio("no microphone".into())),
-            || {},
             &mut Typed::default(),
         );
         assert!(matches!(result, Err(Error::Audio(_))), "{result:?}");
     }
 
     #[test]
-    fn a_provider_that_says_no_at_once_ends_the_session_before_the_ready_sound() {
+    fn a_provider_that_says_no_at_once_ends_the_session_before_it_listens() {
         // No key, no model: the answer is there before the microphone is.
         let provider = Loading::new(true, false);
         provider.gate.open();
         let (microphone, released) = Counted::new(50, |_| {});
-        let invited = AtomicBool::new(false);
 
         let result = transcribe(
             &provider,
@@ -926,42 +926,11 @@ mod tests {
                 thread::sleep(Duration::from_millis(100));
                 Ok(microphone)
             },
-            || invited.store(true, Ordering::SeqCst),
             &mut Typed::default(),
         );
 
         assert!(matches!(result, Err(Error::Transcription(_))), "{result:?}");
-        assert!(!invited.load(Ordering::SeqCst), "nobody is asked to speak");
         assert!(released.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn the_ready_sound_does_not_wait_for_a_model_that_is_still_loading() {
-        let provider = Loading::new(false, false);
-        let invited = Arc::new(AtomicBool::new(false));
-        let (microphone, _) = {
-            let gate = Arc::clone(&provider.gate);
-            let invited = Arc::clone(&invited);
-            Counted::new(10, move |read| {
-                if read == 5 {
-                    // Heard long before the model has loaded.
-                    assert!(invited.load(Ordering::SeqCst));
-                    gate.open();
-                }
-            })
-        };
-        let said = Arc::clone(&invited);
-
-        let result = transcribe(
-            &provider,
-            &[],
-            || Ok(microphone),
-            move || said.store(true, Ordering::SeqCst),
-            &mut Typed::default(),
-        );
-
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(provider.heard.fed(), everything(10));
     }
 
     #[test]
@@ -1257,7 +1226,7 @@ mod tests {
             cancelled: &cancelled,
         };
         let started = std::time::Instant::now();
-        transcribe(&speech, &[], || Ok(microphone), || {}, &mut sink)?;
+        transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
         assert!(started.elapsed() < Duration::from_secs(5));
         // The stand-in settled "Hello world." when the audio ended.
         assert_eq!(sink.sink.text, "");
@@ -1272,7 +1241,7 @@ mod tests {
         assert_eq!(fake.asked("GET /v1/stream"), 1);
         let (microphone, _) = Counted::new(3, |_| {});
         let mut sink = Collecting::default();
-        transcribe(&speech, &[], || Ok(microphone), || {}, &mut sink)?;
+        transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
         assert_eq!(sink.text, "Hello world.");
         assert!(fake.wait(|seen| seen.len() == 2 && seen[1].events.contains(&"closed")));
         // That one took the connection over and left another in its turn;
@@ -1314,14 +1283,14 @@ mod tests {
                 sink: Collecting::default(),
                 cancelled: &cancelled,
             };
-            transcribe(&speech, &[], || Ok(microphone), || {}, &mut sink)?;
+            transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
             assert_eq!(sink.sink.text, "", "{script:?}");
             // The model did take over, and what it said fell.
             assert_eq!(heard.sessions(), 1, "{script:?}");
             // Not called off, the same dictation is typed, by the model.
             let (microphone, _) = Counted::new(3, |_| {});
             let mut sink = Collecting::default();
-            transcribe(&speech, &[], || Ok(microphone), || {}, &mut sink)?;
+            transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
             assert_eq!(sink.text, "Locally.", "{script:?}");
         }
         Ok(())

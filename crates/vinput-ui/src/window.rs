@@ -135,6 +135,8 @@ pub(crate) struct Host {
     backend: Option<Box<dyn Backend>>,
     inbox: Arc<Mutex<VecDeque<Event>>>,
     edit: Option<Edit>,
+    /// Whether the frame is dressed for a navigation pane.
+    paned: bool,
     menu: Option<Popup>,
     tip: Option<Popup>,
     /// The control the tooltip is, or is about to be, shown for.
@@ -414,6 +416,10 @@ impl Host {
 
     /// Brings the handles in line with the stage after anything happened.
     fn settle(&mut self) {
+        // The welcome has no navigation pane and the pages after it do.
+        if self.stage.frame().pane.is_some() != self.paned {
+            self.dress_frame();
+        }
         if self.stage.take_dirty() {
             self.invalidate();
         }
@@ -560,11 +566,21 @@ impl Host {
 
     /// Dresses the frame for the theme and the display the window is on.
     pub(super) fn redress(&mut self) {
-        let mica = frame::dress(self.hwnd, &self.theme, self.stage.showing(), self.scale);
-        self.stage.set_mica(mica);
+        self.dress_frame();
         // The window has the new icons before the old ones are given back.
         let icons = Icons::give(self.hwnd);
         self.icons = Some(icons);
+    }
+
+    /// Dresses the frame for what the window shows now: the tint reaches
+    /// under the navigation pane and nowhere else, so it comes and goes with
+    /// the pane.
+    fn dress_frame(&mut self) {
+        let pane = self.stage.frame().pane.is_some();
+        let showing = self.stage.showing();
+        let mica = frame::dress(self.hwnd, &self.theme, showing, pane, self.scale);
+        self.stage.set_mica(mica);
+        self.paned = pane;
     }
 
     fn rescale(&mut self, scale: f32) {

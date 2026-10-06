@@ -790,6 +790,15 @@ mod tests {
         assert!(pro(&view).detail.ends_with("\u{b7} from $2.75 a month"));
         view.pro.offers.remove(0);
         assert!(pro(&view).detail.ends_with("\u{b7} from $5 a month"));
+        // A price for the first month is the plans' to say: the line here
+        // has no room for both, and stays what a month costs.
+        for name in ["pro-intro", "pro-intro-signed-out"] {
+            let detail = pro(&scene(name)).detail;
+            assert!(
+                detail.ends_with("\u{b7} from \u{20ac}2.50 a month"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

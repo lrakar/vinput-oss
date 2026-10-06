@@ -61,6 +61,9 @@ const PAYMENT_PACE: Pace = Pace {
 const ASK_EVERY: Duration = Duration::from_secs(20);
 /// How long the prices the server gave are shown before it is asked again.
 const PRICES_FOR: Duration = Duration::from_secs(10 * 60);
+/// The same while no plan can be subscribed to yet: the day it can is
+/// shown by itself, to whoever looks at the page again.
+const SOON_FOR: Duration = Duration::from_secs(60);
 /// How often a wait looks at whether it was called off.
 const STOP_STEP: Duration = Duration::from_millis(100);
 
@@ -429,7 +432,20 @@ impl Pro {
             }
             Report::NoPage(failure) => {
                 self.doing = ProDoing::Nothing;
-                self.problem = Some(words(&failure));
+                // A server that takes no payments yet has refused nothing
+                // that asking again would mend: it is said as news.
+                let soon = matches!(
+                    failure,
+                    Failure::Refused {
+                        code: cloud::Code::Unavailable,
+                        ..
+                    }
+                );
+                self.problem = Some(if soon {
+                    wire::PRO_SOON.to_owned()
+                } else {
+                    words(&failure)
+                });
                 Vec::new()
             }
             Report::PaymentWaitOver => {
@@ -490,7 +506,11 @@ fn words(failure: &Failure) -> String {
         Failure::Unreachable(why) => {
             format!("VinPUT Pro could not be reached. Check your internet connection. ({why})")
         }
-        Failure::Refused { message, .. } => format!("VinPUT Pro could not do that: {message}."),
+        // The server ends some of its sentences itself.
+        Failure::Refused { message, .. } => format!(
+            "VinPUT Pro could not do that: {}.",
+            message.trim_end_matches('.')
+        ),
         Failure::Expired => {
             "The sign-in was not finished in time. Start it again when you are ready.".to_owned()
         }
@@ -633,10 +653,15 @@ impl Host {
     /// server's, asked for now unless they were a little while ago, and the
     /// account is as current as it gets.
     pub(super) fn pro_shown(&mut self) {
+        let kept = if self.pro.prices.open {
+            PRICES_FOR
+        } else {
+            SOON_FOR
+        };
         let due = self
             .pro
             .prices_asked
-            .is_none_or(|asked| asked.elapsed() >= PRICES_FOR);
+            .is_none_or(|asked| asked.elapsed() >= kept);
         if due {
             self.pro.prices_asked = Some(Instant::now());
             // Should the thread not start, the built-in prices stand.
@@ -853,6 +878,7 @@ mod tests {
             tier: Tier::Pro,
             resets_at: 0,
             complimentary: false,
+            intro_eligible: false,
         }
     }
 
@@ -900,6 +926,12 @@ mod tests {
         assert_eq!(
             words(&refused),
             "VinPUT Pro could not do that: billing is not configured."
+        );
+        // A sentence the server ended itself is not ended twice.
+        let ended = Failure::refused(Code::BadRequest, "No such plan. Pick another.");
+        assert_eq!(
+            words(&ended),
+            "VinPUT Pro could not do that: No such plan. Pick another."
         );
         for failure in [Failure::SignedOut, Failure::Expired, refused] {
             assert!(!words(&failure).contains('!'));
@@ -1155,6 +1187,15 @@ mod tests {
                 .as_deref()
                 .is_some_and(|said| said.contains("Choose a plan"))
         );
+        // A server that takes no payments yet: the wait is over at once,
+        // and it is said as the news it is, for a checkout as for the page
+        // of a subscription.
+        assert!(pro.begin_opening());
+        let shortly = "VinPUT Pro checkout opens shortly. Try again later.";
+        let closed = Failure::refused(Code::Unavailable, shortly);
+        assert!(told(&mut pro, vec![Report::NoPage(closed)]).is_empty());
+        assert_eq!(pro.doing, ProDoing::Nothing);
+        assert_eq!(pro.problem.as_deref(), Some(wire::PRO_SOON));
         // Any other refusal is said as it is.
         assert!(pro.begin_opening());
         told(

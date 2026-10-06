@@ -221,6 +221,7 @@ pub(crate) fn apply(
         }
         Change::Autostart(on) => put(&mut settings.autostart, on, Follow::Autostart),
         Change::ReadySound(on) => put(&mut settings.ready_sound, on, Follow::Nothing),
+        Change::StopSound(on) => put(&mut settings.stop_sound, on, Follow::Nothing),
         Change::CheckUpdates(on) => put(&mut settings.check_updates, on, Follow::UpdateTimer),
         // Without a graphics card there is no switch, and what the user
         // wants for a PC that has one stays as it is.
@@ -417,6 +418,7 @@ mod tests {
         let cases = [
             (Change::Autostart(false), Follow::Autostart),
             (Change::ReadySound(false), Follow::Nothing),
+            (Change::StopSound(false), Follow::Nothing),
             (Change::CheckUpdates(false), Follow::UpdateTimer),
             (Change::GraphicsCard(false), Follow::Engine),
             (Change::ApiEnabled(false), Follow::Api),
@@ -432,6 +434,7 @@ mod tests {
             assert_eq!(made(&mut settings, change), Applied::Unchanged);
         }
         assert!(!settings.autostart && !settings.ready_sound && !settings.check_updates);
+        assert!(!settings.stop_sound);
         assert!(!settings.local_gpu && !settings.api_enabled && !settings.memo_to_clipboard);
     }
 

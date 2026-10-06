@@ -98,7 +98,7 @@ fn the_pro_page_draws_in_every_state_of_the_account() {
         pictures.push(bytes);
     }
     // One scene for every state, and no two of them look the same.
-    assert_eq!(pictures.len(), 19);
+    assert_eq!(pictures.len(), 23);
     for (index, picture) in pictures.iter().enumerate() {
         assert!(!pictures[..index].contains(picture), "picture {index}");
     }

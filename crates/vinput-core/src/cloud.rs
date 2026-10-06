@@ -56,17 +56,20 @@ const LISTENS: bool = cfg!(any(debug_assertions, test, feature = "test-instance"
 /// The built-in tiers, for as long as the server has not said: Plus at two
 /// euros fifty a month or twenty-four a year with eight hours, Pro at five
 /// or forty-nine with twenty-five. In cents, and in the order they are
-/// offered.
+/// offered. No price of a first month is among them: that is the server's
+/// alone to promise.
 const BUILT_IN: [Offer; 2] = [
     Offer {
         tier: Tier::Plus,
         monthly: 250,
+        first: 0,
         yearly: 2400,
         cap_seconds: 8 * 3600,
     },
     Offer {
         tier: Tier::Pro,
         monthly: 500,
+        first: 0,
         yearly: 4900,
         cap_seconds: 25 * 3600,
     },
@@ -459,6 +462,9 @@ pub struct AccountInfo {
     /// Whether the server gives this account Pro without a subscription.
     /// An answer that does not say is one that does not.
     pub complimentary: bool,
+    /// Whether the account would pay the price of a first month, as someone
+    /// new does. An answer that does not say is one that would not.
+    pub intro_eligible: bool,
 }
 
 impl AccountInfo {
@@ -509,6 +515,7 @@ fn parse_account(answer: &Value) -> Option<AccountInfo> {
             .unwrap_or_default(),
         resets_at: usage["resets_at"].as_u64().unwrap_or(0),
         complimentary: answer["complimentary"].as_bool().unwrap_or(false),
+        intro_eligible: answer["intro_eligible"].as_bool().unwrap_or(false),
     })
 }
 
@@ -519,6 +526,9 @@ pub struct Offer {
     pub tier: Tier,
     /// What a month costs, in cents.
     pub monthly: u32,
+    /// What the first month costs someone new, in cents; zero where it is
+    /// a month like any other.
+    pub first: u32,
     /// What a year costs, in cents.
     pub yearly: u32,
     /// Seconds of speech a month comes with.
@@ -532,6 +542,9 @@ pub struct Prices {
     pub offers: Vec<Offer>,
     /// The currency, as its three letters in lower case: `eur`.
     pub currency: String,
+    /// Whether a plan can be subscribed to yet. An answer that does not say
+    /// is one from a server where it can.
+    pub open: bool,
 }
 
 impl Default for Prices {
@@ -540,6 +553,7 @@ impl Default for Prices {
         Self {
             offers: BUILT_IN.to_vec(),
             currency: "eur".to_owned(),
+            open: true,
         }
     }
 }
@@ -569,9 +583,15 @@ fn parse_prices(answer: &Value) -> Option<Prices> {
         let cap = [&monthly["cap_seconds"], &answer["cap_seconds"]]
             .into_iter()
             .find_map(Value::as_u64);
+        // A price for the first month alone, and below that of a month:
+        // anything else is not what the app says about it.
+        let intro = &monthly["intro"];
+        let regular = amount(monthly)?;
+        let first = amount(intro).filter(|first| intro["months"] == 1 && *first < regular);
         offers.push(Offer {
             tier,
-            monthly: amount(monthly)?,
+            monthly: regular,
+            first: first.unwrap_or(0),
             yearly: amount(yearly)?,
             cap_seconds: cap.unwrap_or(built_in.cap_seconds),
         });
@@ -579,6 +599,7 @@ fn parse_prices(answer: &Value) -> Option<Prices> {
     (!offers.is_empty()).then(|| Prices {
         offers,
         currency: currency.to_ascii_lowercase(),
+        open: answer["checkout_open"] != false,
     })
 }
 
@@ -1508,6 +1529,7 @@ mod tests {
         let offer = |tier, monthly, yearly, cap_seconds| Offer {
             tier,
             monthly,
+            first: 0,
             yearly,
             cap_seconds,
         };
@@ -1535,6 +1557,7 @@ mod tests {
             Some(Prices {
                 offers: vec![offer(Tier::Pro, 500, 4900, 144_000)],
                 currency: "eur".into(),
+                open: true,
             })
         );
         // Each tier with its own plans and allowance, the smaller first
@@ -1589,6 +1612,82 @@ mod tests {
         ] {
             assert_eq!(parse_prices(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn an_account_is_new_only_when_the_server_says_so() {
+        // Whether the price of a first month is this account's is the
+        // server's to say, and nothing else stands for a yes.
+        for (said, eligible) in [
+            (json!(true), true),
+            (json!(false), false),
+            (json!("yes"), false),
+        ] {
+            let account = parse_account(&json!({
+                "email": "ana@example.com", "entitled": false, "intro_eligible": said
+            }));
+            assert_eq!(
+                account.map(|account| account.intro_eligible),
+                Some(eligible)
+            );
+        }
+    }
+
+    #[test]
+    fn the_checkout_is_open_unless_the_server_says_it_is_not() {
+        assert!(Prices::default().open);
+        for (said, open) in [
+            (Value::Null, true),
+            (json!(true), true),
+            (json!("no"), true),
+            (json!(false), false),
+        ] {
+            let prices = parse_prices(&json!({"checkout_open": said, "plans": [
+                {"plan": "monthly", "amount": 500, "currency": "eur"},
+                {"plan": "yearly", "amount": 4900, "currency": "eur"},
+            ]}));
+            assert_eq!(prices.map(|prices| prices.open), Some(open));
+        }
+    }
+
+    #[test]
+    fn the_price_of_a_first_month_is_the_servers_or_there_is_none() {
+        // Never the app's own promise.
+        assert!(BUILT_IN.iter().all(|offer| offer.first == 0));
+        let said = |plus: Value, pro: Value, yearly: Value| {
+            let plan = |tier: &str, plan: &str, amount: u32, intro: &Value| {
+                json!({"tier": tier, "plan": plan, "amount": amount, "currency": "eur",
+                    "intro": intro})
+            };
+            let prices = parse_prices(&json!({"plans": [
+                plan("plus", "monthly", 250, &plus),
+                plan("plus", "yearly", 2400, &yearly),
+                plan("pro", "monthly", 500, &pro),
+                plan("pro", "yearly", 4900, &yearly),
+            ]}));
+            let offers = prices.map(|prices| prices.offers).unwrap_or_default();
+            // Whatever is said about a first month, the prices stand.
+            assert_eq!(offers.len(), 2);
+            assert!(offers.iter().all(|offer| offer.yearly > offer.monthly));
+            (offers[0].first, offers[1].first)
+        };
+        let intro = |amount: u32, months: u32| json!({"amount": amount, "months": months});
+        assert_eq!(said(intro(149, 1), intro(349, 1), Value::Null), (149, 349));
+        // Of one tier alone; and a year has none, whatever is said of it.
+        assert_eq!(said(Value::Null, intro(349, 1), intro(1900, 1)), (0, 349));
+        // Not for three months, not at the price of a month or above it, not
+        // for nothing, and not in a shape this version does not know.
+        assert_eq!(said(intro(149, 3), intro(500, 1), Value::Null), (0, 0));
+        assert_eq!(said(intro(0, 1), intro(600, 1), Value::Null), (0, 0));
+        assert_eq!(
+            said(
+                json!(149),
+                json!({"amount": "349", "months": 1}),
+                Value::Null
+            ),
+            (0, 0)
+        );
+        assert_eq!(said(json!({"amount": 149}), json!({}), Value::Null), (0, 0));
     }
 
     #[test]
@@ -1671,6 +1770,7 @@ mod tests {
             tier: Tier::Pro,
             resets_at: 0,
             complimentary: false,
+            intro_eligible: false,
         };
         assert_eq!(account, Some(plain.clone()));
         assert!(!plain.at_no_charge());
@@ -1705,6 +1805,7 @@ mod tests {
         assert!(never.is_some_and(|account| account.subscription.is_none()
             && !account.entitled
             && !account.complimentary
+            && !account.intro_eligible
             && !account.over_allowance()));
         // An account the server gives Pro to: at no charge unless a
         // subscription of its own is paying, whatever became of an old one.

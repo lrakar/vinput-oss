@@ -262,6 +262,7 @@ pub(crate) fn open(spec: Spec<'_>, work: Option<Work<'_>>) -> Result<Closed> {
         backend,
         inbox,
         edit: None,
+        paned: false,
         menu: None,
         tip: None,
         tip_for: None,

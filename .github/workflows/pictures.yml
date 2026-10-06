@@ -55,6 +55,8 @@ jobs:
             "models many-models", "settings pro-over-allowance",
             "settings one-language",
             "pro pro-signed-out", "pro pro-signing-in", "pro pro-not-subscribed",
+            "pro pro-intro", "pro pro-intro-signed-out", "welcome-pro welcome-intro",
+            "pro pro-opening-soon", "pro pro-not-yet",
             "pro pro-awaiting-payment", "pro pro-subscribed", "pro pro-complimentary",
             "pro pro-ending",
             "pro pro-over-allowance", "pro pro-plus", "pro pro-plus-used-up",

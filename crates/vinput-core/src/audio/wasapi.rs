@@ -476,7 +476,7 @@ impl Drop for WasapiStream {
 /// Streams are opened on one thread and used on others, and are kept between
 /// sessions when no thread of ours may be running at all. Tying COM to the
 /// lifetime of a thread, as a session used to, would end it under them.
-fn apartment() -> Result<()> {
+pub(crate) fn apartment() -> Result<()> {
     static KEPT: OnceLock<()> = OnceLock::new();
     if KEPT.get().is_none() {
         // SAFETY: the call only counts a use of the multithreaded apartment.
@@ -725,7 +725,7 @@ unsafe fn describe(device: &IMMDevice) -> Option<Microphone> {
 /// # Safety
 ///
 /// COM must be available on the calling thread.
-unsafe fn device_id(device: &IMMDevice) -> Option<String> {
+pub(crate) unsafe fn device_id(device: &IMMDevice) -> Option<String> {
     // SAFETY: the caller has initialized COM. The identifier is freed with
     // the allocator that made it, once copied.
     unsafe {

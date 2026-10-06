@@ -11,18 +11,19 @@ use std::sync::Mutex;
 use vinput_view::{
     Api, Change, Command, Download, Engine, Event, Finder, FoundFile, Google, GoogleCheck,
     GoogleProblem, GoogleService, GoogleStep, Microphone, Model, ModelState, Models, Notice,
-    NoticeKind, PRO_MODEL, Page, Pro, ProDoing, ProPlan, ProTier, ProWho, Release, RunsOn,
-    Settings, Setup, Status, Update, UpdateCheck, View,
+    NoticeKind, PRO_MODEL, PRO_SOON, Page, Pro, ProDoing, ProPlan, ProTier, ProWho, Release,
+    RunsOn, Settings, Setup, Status, Update, UpdateCheck, View,
 };
 
 use crate::{Backend, Listener};
 
 /// The names [`scene`] knows.
-pub const SCENES: [&str; 62] = [
+pub const SCENES: [&str; 67] = [
     "settings",
     "first-run",
     "welcome-signing-in",
     "welcome-plans",
+    "welcome-intro",
     "welcome-downloading",
     "listening",
     "downloading",
@@ -35,8 +36,12 @@ pub const SCENES: [&str; 62] = [
     "long-names",
     "one-language",
     "pro-signed-out",
+    "pro-intro-signed-out",
     "pro-signing-in",
     "pro-not-subscribed",
+    "pro-intro",
+    "pro-opening-soon",
+    "pro-not-yet",
     "pro-awaiting-payment",
     "pro-subscribed",
     "pro-subscribed-elsewhere",
@@ -184,6 +189,7 @@ fn settled() -> View {
             languages: "en-US, sl-SI".to_owned(),
             autostart: true,
             ready_sound: true,
+            stop_sound: true,
             check_updates: true,
             graphics_card: true,
             api_enabled: true,
@@ -278,6 +284,14 @@ fn on_plus(used_seconds: u64) -> Pro {
     }
 }
 
+/// Gives the tiers the price of a first month, as the server does for
+/// whoever is signed out and for an account it says is new.
+fn with_intro(pro: &mut Pro) {
+    for (offer, first) in pro.offers.iter_mut().zip([149, 349]) {
+        offer.first = first;
+    }
+}
+
 /// Takes every model off this PC, so that there is none to carry on with.
 fn without_models(view: &mut View) {
     for model in &mut view.models.list {
@@ -306,6 +320,33 @@ fn dictate_with_pro(view: &mut View) {
     }
     view.status.model = Some("VinPUT Pro".to_owned());
     view.status.runs_on = RunsOn::Online;
+}
+
+/// The scenes of what the server says about subscribing, beside the prices:
+/// a price for the first month, and that no plan can be subscribed to yet.
+/// Returns whether `name` is one of them.
+fn offer_scene(view: &mut View, name: &str) -> bool {
+    match name {
+        // For whoever is signed out, and for an account it says is new.
+        "pro-intro-signed-out" | "pro-intro" => {
+            if name == "pro-intro" {
+                view.pro = signed_in(false, "", ProPlan::Monthly);
+            }
+            with_intro(&mut view.pro);
+        }
+        // No plan can be subscribed to yet: as the server says beforehand,
+        // and as it answers a press it had not said so to.
+        "pro-opening-soon" | "pro-not-yet" => {
+            view.pro = signed_in(false, "", ProPlan::Monthly);
+            if name == "pro-not-yet" {
+                view.pro.problem = Some(PRO_SOON.to_owned());
+            } else {
+                view.pro.open = false;
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// The scenes of the `VinPUT` Pro page, one for every state of the account.
@@ -701,11 +742,15 @@ pub fn scene(name: &str) -> Option<View> {
         }
         // Someone who has just installed, part of the way through the
         // welcome: signing in, picking a plan, downloading a model.
-        "welcome-signing-in" | "welcome-plans" | "welcome-downloading" => {
+        "welcome-signing-in" | "welcome-plans" | "welcome-intro" | "welcome-downloading" => {
             view = scene("first-run")?;
             match name {
                 "welcome-signing-in" => view.pro = signing_in(),
                 "welcome-plans" => view.pro = signed_in(false, "", ProPlan::Monthly),
+                "welcome-intro" => {
+                    view.pro = signed_in(false, "", ProPlan::Monthly);
+                    with_intro(&mut view.pro);
+                }
                 _ => {
                     // The host puts the first model someone downloads to
                     // use at once, and fetches the engine it runs on.
@@ -725,6 +770,7 @@ pub fn scene(name: &str) -> Option<View> {
         }
         "many-models" => view.models.list.extend(crowd()),
         "long-names" => lengthen(&mut view),
+        name if offer_scene(&mut view, name) => {}
         name if pro_scene(&mut view, name) => {}
         name if google_scene(&mut view, name) => {}
         _ => return None,
@@ -894,6 +940,7 @@ fn set(settings: &mut Settings, change: Change) {
         Change::Languages(languages) => settings.languages = languages,
         Change::Autostart(on) => settings.autostart = on,
         Change::ReadySound(on) => settings.ready_sound = on,
+        Change::StopSound(on) => settings.stop_sound = on,
         Change::CheckUpdates(on) => settings.check_updates = on,
         Change::GraphicsCard(on) => settings.graphics_card = on,
         Change::ApiEnabled(on) => settings.api_enabled = on,

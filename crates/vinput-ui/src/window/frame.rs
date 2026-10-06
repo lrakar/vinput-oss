@@ -35,9 +35,23 @@ fn set_attribute<T>(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: &T) -> boo
         .is_ok()
 }
 
-/// Dresses the window frame for the theme. Returns whether Windows now shows
-/// its wallpaper tint (Mica) behind the title bar and the navigation pane.
-pub(super) fn dress(hwnd: HWND, theme: &Theme, showing: &Showing, scale: f32) -> bool {
+/// How far the frame reaches into the window from the left, in units: under
+/// the pane and under the rounded corner of the sheet beside it, where the
+/// tint shows through as well. Without a pane it does not reach in at all:
+/// what Windows itself draws there, the edit control over a field that is
+/// typed in, would let the tint through and stand out from the field.
+fn glass(pane: bool, mica: bool) -> f32 {
+    if pane && mica {
+        metric::PANE + metric::RADIUS_FLYOUT
+    } else {
+        0.0
+    }
+}
+
+/// Dresses the window frame for the theme, with a navigation pane or
+/// without. Returns whether Windows now shows its wallpaper tint (Mica)
+/// behind the title bar and the pane.
+pub(super) fn dress(hwnd: HWND, theme: &Theme, showing: &Showing, pane: bool, scale: f32) -> bool {
     set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL::from(theme.dark));
     let compact = !showing.resizable();
     let wants_mica = !compact && !theme.contrast;
@@ -47,11 +61,8 @@ pub(super) fn dress(hwnd: HWND, theme: &Theme, showing: &Showing, scale: f32) ->
         NO_BACKDROP
     };
     let mica = set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop) && wants_mica;
-    // The frame reaches under the pane and under the rounded corner of the
-    // sheet beside it, where the tint shows through as well.
-    let glass = metric::PANE + metric::RADIUS_FLYOUT;
     let margins = MARGINS {
-        cxLeftWidth: if mica { px(glass, scale) } else { 0 },
+        cxLeftWidth: px(glass(pane, mica), scale),
         ..MARGINS::default()
     };
     // SAFETY: `margins` is valid for the call.
@@ -139,5 +150,19 @@ impl Drop for Icons {
                 let _ = unsafe { DestroyIcon(handle) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tint_reaches_into_the_window_only_under_a_pane() {
+        let under_pane = glass(true, true);
+        assert!((under_pane - (metric::PANE + metric::RADIUS_FLYOUT)).abs() < f32::EPSILON);
+        // The welcome has no pane, and a field of it may lie where one would be.
+        assert!(glass(false, true).abs() < f32::EPSILON);
+        assert!(glass(true, false).abs() < f32::EPSILON);
     }
 }

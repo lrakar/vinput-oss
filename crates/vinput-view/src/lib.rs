@@ -181,6 +181,8 @@ pub struct Settings {
     pub autostart: bool,
     /// Whether a short sound plays when listening starts.
     pub ready_sound: bool,
+    /// Whether a short sound plays when listening stops.
+    pub stop_sound: bool,
     /// Whether Vinput looks for newer versions by itself.
     pub check_updates: bool,
     /// Whether local models run on the graphics card.
@@ -216,6 +218,8 @@ pub enum Change {
     Autostart(bool),
     /// See [`Settings::ready_sound`].
     ReadySound(bool),
+    /// See [`Settings::stop_sound`].
+    StopSound(bool),
     /// See [`Settings::check_updates`].
     CheckUpdates(bool),
     /// See [`Settings::graphics_card`].
@@ -626,6 +630,11 @@ pub enum Download {
 /// The id of the model that is `VinPUT` Pro, in [`Models::list`].
 pub const PRO_MODEL: &str = "vinput-pro";
 
+/// What [`Pro::problem`] says when a plan cannot be subscribed to yet: news
+/// to tell calmly, and nothing that went wrong or that asking again mends.
+pub const PRO_SOON: &str = "Subscribing opens shortly. Nothing was charged. Your free options under \
+                            Models keep working.";
+
 /// `VinPUT` Pro: who is signed in, what they pay for and what they have
 /// used. One flat record: which of it means something follows from
 /// [`Pro::who`] and [`Pro::known`].
@@ -690,6 +699,8 @@ pub struct Pro {
     pub offers: Vec<ProOffer>,
     /// The currency of the prices, as its three letters: `eur`.
     pub currency: String,
+    /// Whether a plan can be subscribed to yet.
+    pub open: bool,
     /// Name of the model on this PC that dictation carries on with when
     /// the month's hours are used up; `None` if no model is downloaded.
     pub spare: Option<String>,
@@ -702,6 +713,10 @@ pub struct ProOffer {
     pub tier: ProTier,
     /// What a month costs, in hundredths of the currency.
     pub monthly: u32,
+    /// What the first month costs whoever is looking, likewise, where that
+    /// is less than a month: zero for a month like any other.
+    #[serde(default)]
+    pub first: u32,
     /// What a year costs, likewise.
     pub yearly: u32,
     /// Seconds of speech a month comes with.
@@ -737,17 +752,20 @@ impl Default for Pro {
                 ProOffer {
                     tier: ProTier::Plus,
                     monthly: 250,
+                    first: 0,
                     yearly: 2400,
                     seconds: 8 * 3600,
                 },
                 ProOffer {
                     tier: ProTier::Pro,
                     monthly: 500,
+                    first: 0,
                     yearly: 4900,
                     seconds: 25 * 3600,
                 },
             ],
             currency: "eur".to_owned(),
+            open: true,
             spare: None,
         }
     }

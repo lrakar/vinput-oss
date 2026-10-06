@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.4.2",
+    "published": "2026-10-06",
+    "notes": [
+      "A soft click when listening starts and another when it stops, each with its own switch in Settings",
+      "A new subscriber pays €3.49 for the first month of Pro or €1.49 for Plus on a monthly plan",
+      "While subscribing is not open yet, the plans say Opening soon instead of failing",
+      "The Try it field in the welcome no longer shows a grey rectangle"
+    ]
+  },
+  {
     "version": "0.4.1",
     "published": "2026-10-06",
     "notes": [

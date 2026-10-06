@@ -42,6 +42,8 @@ pub struct Settings {
     pub autostart: bool,
     /// Whether a short sound plays when Vinput starts listening.
     pub ready_sound: bool,
+    /// Whether a short sound plays when Vinput stops listening.
+    pub stop_sound: bool,
     /// The microphone to listen with, as Windows identifies it. Empty means
     /// the one Windows uses by default, whichever that is at the time.
     pub microphone: String,
@@ -92,6 +94,7 @@ impl Default for Settings {
             languages: vec!["en-US".to_owned()],
             autostart: true,
             ready_sound: true,
+            stop_sound: true,
             microphone: String::new(),
             provider: ProviderKind::default(),
             model: String::new(),
@@ -158,6 +161,7 @@ impl Settings {
                 }
                 "autostart" => settings.autostart = flag(),
                 "ready_sound" => settings.ready_sound = flag(),
+                "stop_sound" => settings.stop_sound = flag(),
                 "microphone" => value.clone_into(&mut settings.microphone),
                 "provider" => {
                     if let Ok(provider) = value.parse() {
@@ -221,7 +225,8 @@ impl Settings {
              hotkey_search = {}\n\
              search_url = {}\n\
              microphone = {}\n\
-             last_local_model = {}\n",
+             last_local_model = {}\n\
+             stop_sound = {}\n",
             self.hotkey,
             optional_hotkey(self.hotkey_enter),
             optional_hotkey(self.hotkey_memo),
@@ -241,6 +246,7 @@ impl Settings {
             self.search_url,
             self.microphone,
             self.last_local_model,
+            self.stop_sound,
         );
         // Written only while it is on: the file of someone who was never
         // owed a welcome, or has had it, says nothing of it.
@@ -461,6 +467,7 @@ mod tests {
             languages: vec!["sl-SI".into(), "en-US".into()],
             autostart: false,
             ready_sound: false,
+            stop_sound: false,
             microphone: r"{0.0.1.00000000}.{6c1f3d2e-0d3a-4c58-9a51-1f0f2b8e7a10}".into(),
             provider: ProviderKind::Local,
             model: "whisper-base".into(),

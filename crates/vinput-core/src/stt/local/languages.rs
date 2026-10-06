@@ -13,6 +13,28 @@ pub(super) fn code_of(name: &str) -> Option<&'static str> {
         .map(|(code, _)| *code)
 }
 
+/// The name of the language with this code as the models of the second
+/// engine write it, `English`, if it is one they were taught. They write
+/// down any other language as the nearest one they know.
+pub(super) fn taught(code: &str) -> Option<String> {
+    let mut taught = crate::models::QWEN_LANGUAGES.split(' ');
+    taught.any(|taught| taught == code).then(|| name(code))
+}
+
+/// What to call the language `language`, a code such as `sl` or `sl-SI`:
+/// `Slovenian`. One without a name here is called as it was written.
+pub(crate) fn name(language: &str) -> String {
+    let code = language.split(['-', '_']).next().unwrap_or_default();
+    let known = LANGUAGES
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(code));
+    let Some((_, name)) = known else {
+        return language.to_owned();
+    };
+    let (first, rest) = name.split_at(1);
+    first.to_ascii_uppercase() + rest
+}
+
 /// Whether text in this language has spaces between its words. Where it has
 /// none, a sentence follows the one before it without one too.
 pub(super) fn spaced(code: &str) -> bool {
@@ -133,6 +155,12 @@ mod tests {
         assert_eq!(code_of("slovenian"), Some("sl"));
         assert_eq!(code_of("sl"), Some("sl"));
         assert_eq!(code_of("klingon"), None);
+        assert_eq!(taught("en").as_deref(), Some("English"));
+        assert_eq!(taught("sl"), None);
+        assert_eq!(taught("auto"), None);
+        assert_eq!(name("sl-SI"), "Slovenian");
+        assert_eq!(name("EN_us"), "English");
+        assert_eq!(name("tlh"), "tlh");
         assert!(spaced("sl"));
         assert!(!spaced("ja"));
     }

@@ -12,8 +12,9 @@
 //! Which provider serves a key press is one number read from memory
 //! ([`Standby::session`]); the clock is looked at only while that number is
 //! set. The model is the one the settings name as last used on this PC, if
-//! it is still here, and otherwise the first in the catalog that is; nothing
-//! is ever downloaded for it. It is loaded ahead when little is left of the
+//! it is still here, and otherwise the first in the catalog that is, but
+//! never one that knows none of the languages the settings name; nothing is
+//! ever downloaded for it. It is loaded ahead when little is left of the
 //! month ([`WARM_BELOW`]) or the hours have run out, the way a chosen local
 //! model is loaded when Vinput starts, and from then on it is let go and
 //! loaded again as any local model is (`stt/local.rs`). No timer runs here.
@@ -34,14 +35,16 @@ const WARM_BELOW: u64 = 5 * 60;
 const ASSUMED: u64 = 3600;
 
 /// Finds the provider to carry on with, given the model last used on this
-/// PC and whether models run on the graphics card; `None` if no model is
-/// on this PC.
-type Find = Box<dyn Fn(&str, bool) -> Option<Arc<Lazy>> + Send + Sync>;
+/// PC, the configured languages and whether models run on the graphics
+/// card; `None` if no model on this PC knows one of the languages.
+type Find = Box<dyn Fn(&str, &[String], bool) -> Option<Arc<Lazy>> + Send + Sync>;
 
 #[derive(Default)]
 struct Local {
     /// The model last used on this PC, as the settings name it.
     model: String,
+    /// The languages the settings name.
+    languages: Vec<String>,
     gpu: bool,
     /// The provider that was found, until it fails or the settings change.
     ready: Option<Arc<Lazy>>,
@@ -80,8 +83,8 @@ fn now() -> u64 {
 }
 
 /// A model that is on this PC, set up when it is first needed.
-fn installed(preferred: &str, gpu: bool) -> Option<Arc<Lazy>> {
-    let id = models::spare(preferred, gpu)?.id;
+fn installed(preferred: &str, languages: &[String], gpu: bool) -> Option<Arc<Lazy>> {
+    let id = models::spare(preferred, languages, gpu)?.id;
     Some(Arc::new(Lazy::new(ProviderKind::Local, move || {
         Ok(Arc::new(LocalSpeech::connect(id, gpu)?))
     })))
@@ -89,7 +92,9 @@ fn installed(preferred: &str, gpu: bool) -> Option<Arc<Lazy>> {
 
 impl Standby {
     /// A standby that carries on with what `find` finds.
-    pub fn new(find: impl Fn(&str, bool) -> Option<Arc<Lazy>> + Send + Sync + 'static) -> Self {
+    pub fn new(
+        find: impl Fn(&str, &[String], bool) -> Option<Arc<Lazy>> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             find: Some(Box::new(find)),
             ..Self::default()
@@ -108,13 +113,14 @@ impl Standby {
         self.local.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Notes the model last used on this PC and whether models run on the
-    /// graphics card, as the settings say.
-    pub fn prefer(&self, model: &str, gpu: bool) {
+    /// Notes the model last used on this PC, the languages and whether
+    /// models run on the graphics card, as the settings say.
+    pub fn prefer(&self, model: &str, languages: &[String], gpu: bool) {
         let mut local = self.local();
-        if local.model != model || local.gpu != gpu {
+        if local.model != model || local.languages != languages || local.gpu != gpu {
             *local = Local {
                 model: model.to_owned(),
+                languages: languages.to_vec(),
                 gpu,
                 ready: None,
             };
@@ -202,7 +208,7 @@ impl Standby {
     fn provider(&self) -> Option<Arc<Lazy>> {
         let mut local = self.local();
         if local.ready.is_none() {
-            local.ready = (self.find.as_ref()?)(&local.model, local.gpu);
+            local.ready = (self.find.as_ref()?)(&local.model, &local.languages, local.gpu);
         }
         local.ready.clone()
     }
@@ -322,7 +328,7 @@ pub(crate) mod tests {
     pub(crate) fn with_model() -> (Arc<Standby>, Arc<Heard>) {
         let heard = Arc::<Heard>::default();
         let model = Arc::clone(&heard);
-        let standby = Standby::new(move |_, _| {
+        let standby = Standby::new(move |_, _, _| {
             let model = Arc::clone(&model);
             Some(Arc::new(Lazy::new(ProviderKind::Local, move || {
                 Ok(Arc::new(Model(Arc::clone(&model))))
@@ -405,7 +411,7 @@ pub(crate) mod tests {
     fn without_a_model_on_this_pc_nothing_takes_over() {
         for standby in [
             Arc::new(Standby::default()),
-            Arc::new(Standby::new(|_, _| None)),
+            Arc::new(Standby::new(|_, _, _| None)),
         ] {
             standby.heard(100, 100, now() + 1000);
             assert!(standby.session(NONE).is_none());
@@ -413,7 +419,7 @@ pub(crate) mod tests {
             assert_eq!(standby.take_served(), None);
         }
         // Nor is the server left out for an hour because of a refusal.
-        let standby = Arc::new(Standby::new(|_, _| None));
+        let standby = Arc::new(Standby::new(|_, _, _| None));
         assert!(standby.take_over(NONE, true).is_none());
         assert_eq!(standby.until(), 0);
     }
@@ -433,27 +439,39 @@ pub(crate) mod tests {
     fn the_model_is_the_one_last_used_and_found_again_when_that_changes() {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let noted = Arc::clone(&asked);
-        let standby = Arc::new(Standby::new(move |model, gpu| {
+        let standby = Arc::new(Standby::new(move |model, languages, gpu| {
             let mut noted = noted.lock().unwrap_or_else(PoisonError::into_inner);
-            noted.push((model.to_owned(), gpu));
+            noted.push((model.to_owned(), languages.join(" "), gpu));
             None
         }));
-        standby.prefer("whisper-base", true);
+        let english = ["en-US".to_owned()];
+        standby.prefer("whisper-base", &english, true);
         standby.heard(100, 100, now() + 1000);
         let _ = standby.session(NONE);
-        standby.prefer("whisper-base", true);
-        standby.prefer("whisper-base", false);
+        standby.prefer("whisper-base", &english, true);
+        standby.prefer("whisper-base", &english, false);
+        let _ = standby.session(NONE);
+        // Other languages may call for another model.
+        standby.prefer("whisper-base", &["sl-SI".to_owned()], false);
         let _ = standby.session(NONE);
         let asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
-        assert!(asked.contains(&("whisper-base".to_owned(), true)));
-        assert_eq!(asked.last(), Some(&("whisper-base".to_owned(), false)));
+        let asked_with =
+            |languages: &str, gpu| ("whisper-base".to_owned(), languages.to_owned(), gpu);
+        assert_eq!(
+            *asked,
+            [
+                asked_with("en-US", true),
+                asked_with("en-US", false),
+                asked_with("sl-SI", false)
+            ]
+        );
     }
 
     #[test]
     fn the_model_is_loaded_ahead_once_when_little_of_the_month_is_left() {
         let loads = Arc::new(AtomicU64::new(0));
         let counted = Arc::clone(&loads);
-        let standby = Arc::new(Standby::new(move |_, _| {
+        let standby = Arc::new(Standby::new(move |_, _, _| {
             let counted = Arc::clone(&counted);
             Some(Arc::new(Lazy::new(ProviderKind::Local, move || {
                 counted.fetch_add(1, Ordering::Relaxed);

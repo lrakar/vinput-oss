@@ -5,6 +5,10 @@
 //! not on this PC, `Cancel` while it downloads. The model in use is the row
 //! that stands out and wears the `In use` badge.
 //!
+//! A model that was not taught a language dictation is set to says so on
+//! its row, before it is downloaded or put to use; if it is the one in use
+//! and knows none of them, a bar says what to do about it.
+//!
 //! `VinPUT` Pro is not a row among them. It is the app's own service, so it
 //! has a card of its own under the title, which stays there while the lists
 //! scroll under it.
@@ -30,6 +34,7 @@ pub fn content(view: &View) -> Content {
     let mut body = Vec::new();
     body.extend(notice_bar(view, Page::Models));
     body.extend(prompt(&models.list));
+    body.extend(wrong_language(&models.list));
     body.extend(engine_failure(&models.engine));
     body.extend(online(view));
     body.extend(on_this_pc(models, view.settings.graphics_card));
@@ -52,6 +57,29 @@ fn prompt(list: &[Model]) -> Option<Node> {
         "Choose a speech model to start dictating. Use an online model, or download one that \
          runs on this PC.",
     ))
+}
+
+/// What to do when the model in use knows none of the languages dictation
+/// is set to: it types, but not what was said.
+fn wrong_language(list: &[Model]) -> Option<Node> {
+    let model = list.iter().find(|model| model.in_use && model.knows_none)?;
+    Some(info_bar(
+        Severity::Caution,
+        format!(
+            "This model does not know {}. Choose another model, or change the languages under \
+             General.",
+            listed(&model.lacks)
+        ),
+    ))
+}
+
+/// Names as a sentence lists them: `Slovenian`, `Slovenian or Croatian`,
+/// `Slovenian, Croatian or Serbian`.
+fn listed(names: &[String]) -> String {
+    match names {
+        [first @ .., last] if !first.is_empty() => format!("{} or {last}", first.join(", ")),
+        _ => names.concat(),
+    }
 }
 
 /// Why the engine that local models need is not here, if its download failed.
@@ -264,16 +292,29 @@ fn google_row(model: &Model, service: GoogleService, ready: bool) -> Node {
 
 /// The line under a model's name, and its color: where it stands if that
 /// needs saying, otherwise what it is.
+///
+/// A model that lacks a language dictation is set to says that first:
+/// quietly if it knows another of them, as a caution if it knows none.
 fn detail_line(model: &Model) -> (String, Tone) {
-    match &model.state {
-        ModelState::Failed { reason } => (reason.clone(), Tone::Critical),
-        ModelState::Installing { done, total } => (
-            format!("Downloading{DOT}{}", so_far(*done, *total)),
-            Tone::Secondary,
-        ),
-        ModelState::Installed => (format!("Downloaded{DOT}{}", facts(model)), Tone::Secondary),
-        ModelState::Online | ModelState::Missing => (facts(model), Tone::Secondary),
+    let line = match &model.state {
+        ModelState::Failed { reason } => return (reason.clone(), Tone::Critical),
+        ModelState::Installing { done, total } => {
+            let line = format!("Downloading{DOT}{}", so_far(*done, *total));
+            return (line, Tone::Secondary);
+        }
+        ModelState::Installed => format!("Downloaded{DOT}{}", facts(model)),
+        ModelState::Online | ModelState::Missing => facts(model),
+    };
+    if model.lacks.is_empty() {
+        return (line, Tone::Secondary);
     }
+    let tone = if model.knows_none {
+        Tone::Caution
+    } else {
+        Tone::Secondary
+    };
+    let lacks = listed(&model.lacks);
+    (format!("Does not know {lacks}{DOT}{line}"), tone)
 }
 
 /// What a model is, on one line: its size, its languages or what it needs,
@@ -497,7 +538,7 @@ mod tests {
         // Nothing online can be used before it is set up, or subscribed to.
         assert_eq!(
             (count("Use"), count("Set up"), count("Download")),
-            (0, 2, 4)
+            (0, 2, 6)
         );
         assert_eq!(pro(&scene("first-run")).labels, ["See plans"]);
     }
@@ -638,7 +679,7 @@ mod tests {
         assert_eq!(Seen::of_setting(row_of(&page, "Mine")).progress, [None]);
         view.models.list.pop();
 
-        view.models.list[6].in_use = false;
+        view.models.list[8].in_use = false;
         view.models.list.push(custom(ModelState::Installed, true));
         let page = content(&view);
         assert_eq!(offers(&page, "Mine"), (vec![], vec![]));
@@ -958,6 +999,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_model_says_which_of_the_languages_it_does_not_know() {
+        const CAUTION: &str = "This model does not know Slovenian. Choose another model, or \
+                               change the languages under General.";
+        let qwen = "Qwen3-ASR 0.6B";
+        // English and Slovenian, and a model for both in use: the ones
+        // that lack Slovenian say so quietly, and nothing is warned of.
+        let page = content(&scene("settings"));
+        let line = row_of(&page, qwen);
+        assert!(line.detail.starts_with("Does not know Slovenian \u{b7} "));
+        assert_eq!(line.detail_tone, Tone::Secondary);
+        assert!(!row_of(&page, "Whisper base").detail.contains("not know"));
+        assert!(Seen::of(&page.body).bars.is_empty());
+        // English alone: nothing to say.
+        let page = content(&scene("first-run"));
+        assert!(!Seen::of(&page.body).says("not know"));
+
+        // Slovenian alone, and one of them in use: its row is a caution,
+        // and a bar says what to do. Dictation is not held back for it.
+        let page = content(&scene("wrong-language"));
+        let line = row_of(&page, qwen);
+        assert!(
+            line.selected
+                && line
+                    .detail
+                    .starts_with("Does not know Slovenian \u{b7} Downloaded")
+        );
+        assert_eq!(line.detail_tone, Tone::Caution);
+        assert_eq!(
+            Seen::of(&page.body).bars,
+            [(Severity::Caution, id(CAUTION))]
+        );
+        // The other one says it before it is downloaded or put to use.
+        let other = row_of(&page, "Qwen3-ASR 1.7B");
+        assert_eq!(other.detail_tone, Tone::Caution);
+        assert_eq!(offers(&page, "Qwen3-ASR 1.7B").0, ["Download"]);
+        assert_eq!(row_of(&page, "Whisper base").detail_tone, Tone::Secondary);
+        // A download under way and one that failed keep their own line.
+        let mut view = scene("wrong-language");
+        view.models.list[3].state = ModelState::Installing { done: 1, total: 2 };
+        let page = content(&view);
+        assert!(
+            row_of(&page, "Qwen3-ASR 1.7B")
+                .detail
+                .starts_with("Downloading")
+        );
+
+        let names = |names: &[&str]| -> Vec<String> { names.iter().map(|name| id(name)).collect() };
+        assert_eq!(listed(&names(&["Slovenian"])), "Slovenian");
+        assert_eq!(
+            listed(&names(&["Slovenian", "Croatian"])),
+            "Slovenian or Croatian"
+        );
+        assert_eq!(
+            listed(&names(&["Slovenian", "Croatian", "Serbian"])),
+            "Slovenian, Croatian or Serbian"
+        );
     }
 
     #[test]

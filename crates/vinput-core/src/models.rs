@@ -2,10 +2,13 @@
 //! this computer.
 //!
 //! A local model is two downloads: the model file itself, and the engine that
-//! runs it, which every local model shares. Both come from the address pinned
-//! here and are checked against the SHA-256 pinned here before they are used.
-//! The engine is a separate program that Vinput starts only while a local
-//! model is selected, so none of it is part of Vinput's own executable.
+//! runs it, which the local models of its kind share. Both come from the
+//! address pinned here and are checked against the SHA-256 pinned here before
+//! they are used. An engine is a separate program that Vinput starts only
+//! while a local model is selected, so none of it is part of Vinput's own
+//! executable. There are two: whisper.cpp for Whisper and Parakeet, and
+//! llama.cpp for the models that are a language model with a part that hears
+//! ([`Runner::Listener`]), which come as two files.
 //!
 //! Besides the catalog pinned here, people can add Whisper models of their
 //! own, from Hugging Face or from a file; see [`custom`].
@@ -41,6 +44,9 @@ pub enum Runner {
     Server,
     /// A program started for each dictation.
     Command,
+    /// A server of the second engine, for a model that comes as two files:
+    /// the one that writes, and this one, which hears.
+    Listener(&'static Download),
 }
 
 impl Runner {
@@ -50,6 +56,16 @@ impl Runner {
         match self {
             Self::Server => "whisper-server.exe",
             Self::Command => "parakeet-cli.exe",
+            Self::Listener(_) => "llama-server.exe",
+        }
+    }
+
+    /// The second file of a model that has one.
+    #[must_use]
+    pub fn second(&self) -> Option<&Download> {
+        match self {
+            Self::Listener(ears) => Some(ears),
+            _ => None,
         }
     }
 }
@@ -68,6 +84,10 @@ pub struct Model {
     /// What the list says beside its place and size: the languages of a local
     /// model, what an online one needs.
     pub detail: &'static str,
+    /// The codes of the languages it knows, with a space between them, if it
+    /// knows only some: `en de fr`. Empty for one that knows them all, as
+    /// far as that matters.
+    pub languages: &'static str,
     /// The file to install and how it is run, for a local model.
     pub local: Option<(Download, Runner)>,
 }
@@ -98,14 +118,61 @@ macro_rules! whisper_model {
     };
 }
 
+// A Qwen3-ASR model of a size, at a revision of its repository: the file
+// that writes and the file that hears, each with its size and checksum.
+macro_rules! qwen_model {
+    ($revision:literal, $size:literal, $bytes:literal, $sha256:literal, $ears_bytes:literal, $ears_sha256:literal) => {
+        (
+            Download {
+                file: concat!("Qwen3-ASR-", $size, "-Q8_0.gguf"),
+                source: Source {
+                    url: concat!(
+                        "https://huggingface.co/ggml-org/Qwen3-ASR-",
+                        $size,
+                        "-GGUF/resolve/",
+                        $revision,
+                        "/Qwen3-ASR-",
+                        $size,
+                        "-Q8_0.gguf"
+                    ),
+                    sha256: $sha256,
+                    bytes: $bytes,
+                },
+            },
+            Runner::Listener(&Download {
+                file: concat!("mmproj-Qwen3-ASR-", $size, "-Q8_0.gguf"),
+                source: Source {
+                    url: concat!(
+                        "https://huggingface.co/ggml-org/Qwen3-ASR-",
+                        $size,
+                        "-GGUF/resolve/",
+                        $revision,
+                        "/mmproj-Qwen3-ASR-",
+                        $size,
+                        "-Q8_0.gguf"
+                    ),
+                    sha256: $ears_sha256,
+                    bytes: $ears_bytes,
+                },
+            }),
+        )
+    };
+}
+
+/// The languages the Qwen3-ASR models were taught. They write down any other
+/// language as the nearest one they know.
+pub(crate) const QWEN_LANGUAGES: &str =
+    "zh en yue ar de fr es pt id it ko ru th vi ja tr hi ms nl sv da fi pl cs fa el hu mk ro";
+
 /// Every model, in the order Settings lists them.
-pub static CATALOG: [Model; 7] = [
+pub static CATALOG: [Model; 9] = [
     Model {
         id: crate::cloud::MODEL_ID,
         provider: ProviderKind::Cloud,
         name: "VinPUT Pro",
         summary: "Online. Types as you speak, in 60+ languages.",
         detail: "Needs a subscription",
+        languages: "",
         local: None,
     },
     Model {
@@ -114,6 +181,7 @@ pub static CATALOG: [Model; 7] = [
         name: "Google Cloud Speech (Chirp 3)",
         summary: "Online. Types as you speak.",
         detail: "Needs a Google Cloud project",
+        languages: "",
         local: None,
     },
     Model {
@@ -122,7 +190,40 @@ pub static CATALOG: [Model; 7] = [
         name: "Google Gemini 3.5 Transcribe",
         summary: "Online. Types as you speak.",
         detail: "Needs a Gemini API key",
+        languages: "",
         local: None,
+    },
+    Model {
+        id: "qwen3-asr-1.7b",
+        provider: ProviderKind::Local,
+        name: "Qwen3-ASR 1.7B",
+        summary: "On this PC. 30 languages, not Slovenian. Accurate, and quick without a graphics card.",
+        detail: "30 languages",
+        languages: QWEN_LANGUAGES,
+        local: Some(qwen_model!(
+            "36a678687ba7d07a74ca70ccb0e36902e005fb80",
+            "1.7B",
+            2_165_034_944,
+            "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57",
+            355_709_344,
+            "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d"
+        )),
+    },
+    Model {
+        id: "qwen3-asr-0.6b",
+        provider: ProviderKind::Local,
+        name: "Qwen3-ASR 0.6B",
+        summary: "On this PC. 30 languages, not Slovenian. Fast on any processor.",
+        detail: "30 languages",
+        languages: QWEN_LANGUAGES,
+        local: Some(qwen_model!(
+            "928ab958557df9aa2ef1c93e0e83c7ad0933fae2",
+            "0.6B",
+            804_749_248,
+            "bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971",
+            214_392_480,
+            "41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d"
+        )),
     },
     Model {
         id: "parakeet-tdt-0.6b-v3",
@@ -130,6 +231,7 @@ pub static CATALOG: [Model; 7] = [
         name: "NVIDIA Parakeet TDT v3",
         summary: "On this PC. 25 European languages. Text arrives when you stop.",
         detail: "25 European languages",
+        languages: "bg hr cs da nl en et fi fr de el hu it lv lt mt pl pt ro sk sl es sv ru uk",
         local: Some((
             pinned!(
                 "https://huggingface.co/ggml-org/parakeet-GGUF/resolve/35156454d1a39de06863303dd209fd2bed6ee079/",
@@ -146,6 +248,7 @@ pub static CATALOG: [Model; 7] = [
         name: "Whisper large-v3 turbo",
         summary: "On this PC. 99 languages, best accuracy. Text arrives when you stop.",
         detail: "99 languages",
+        languages: "",
         local: Some((
             whisper_model!(
                 "ggml-large-v3-turbo.bin",
@@ -161,6 +264,7 @@ pub static CATALOG: [Model; 7] = [
         name: "Whisper large-v3 turbo (compact)",
         summary: "On this PC. A third of the size, close to full accuracy.",
         detail: "99 languages",
+        languages: "",
         local: Some((
             whisper_model!(
                 "ggml-large-v3-turbo-q5_0.bin",
@@ -176,6 +280,7 @@ pub static CATALOG: [Model; 7] = [
         name: "Whisper base",
         summary: "On this PC. Small and fast on any processor, lower accuracy.",
         detail: "99 languages",
+        languages: "",
         local: Some((
             whisper_model!(
                 "ggml-base.bin",
@@ -204,6 +309,14 @@ static ENGINE_VULKAN: Download = pinned!(
     18_208_039,
     "1f2a7800c80e0be4d2267b91ddff0b377977718f5cf0405417d31e58164d89ce"
 );
+// The second engine, llama.cpp, in the one build that runs on the processor
+// and on graphics cards of any make.
+static ENGINE_LISTENER: Download = pinned!(
+    "https://github.com/ggml-org/llama.cpp/releases/download/b11443/",
+    "llama-b11443-bin-win-vulkan-x64.zip",
+    33_337_755,
+    "ff72b620ff1fccefb25e52e79d058b96a6a3e47d80101ba84b57aebc6ef5320a"
+);
 static ENGINE_CUDA: Download = pinned!(
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.2/",
     "whisper-cublas-12.4.0-bin-x64.zip",
@@ -212,6 +325,50 @@ static ENGINE_CUDA: Download = pinned!(
 );
 
 impl Model {
+    /// The files of a local model; none for an online one.
+    pub fn files(&self) -> impl Iterator<Item = &Download> {
+        let local = self.local.as_ref();
+        let second = local.and_then(|(_, runner)| runner.second());
+        local.map(|(file, _)| file).into_iter().chain(second)
+    }
+
+    /// How large its files are together.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.files().map(|file| file.source.bytes).sum()
+    }
+
+    /// Whether every file of it is on this PC. True for an online model.
+    fn has_files(&self) -> bool {
+        self.files().all(is_here)
+    }
+
+    /// Whether it knows `language`, a configured one such as `sl-SI`.
+    #[must_use]
+    pub fn knows(&self, language: &str) -> bool {
+        let code = language.split(['-', '_']).next().unwrap_or_default();
+        let mut known = self.languages.split(' ');
+        self.languages.is_empty() || known.any(|known| known.eq_ignore_ascii_case(code))
+    }
+
+    /// How many of `languages`, the configured ones, it knows: 2 for all of
+    /// them, 1 for some, 0 for none.
+    #[must_use]
+    pub fn reach(&self, languages: &[String]) -> u8 {
+        let known = languages.iter().filter(|code| self.knows(code)).count();
+        u8::from(known > 0) + u8::from(known == languages.len())
+    }
+
+    /// The names of those of `languages`, the configured ones, that it does
+    /// not know: `Slovenian`.
+    #[must_use]
+    pub fn lacks(&self, languages: &[String]) -> Vec<String> {
+        let unknown = languages.iter().filter(|code| !self.knows(code));
+        unknown
+            .map(|code| crate::stt::language_name(code))
+            .collect()
+    }
+
     /// Whether someone added it, rather than it being part of the catalog.
     #[must_use]
     pub fn is_custom(&self) -> bool {
@@ -251,11 +408,14 @@ pub fn by_id(id: &str) -> Option<&'static Model> {
         .find(|entry| entry.id.eq_ignore_ascii_case(id))
 }
 
-/// The engine build to use. On a graphics card that is the Vulkan build,
-/// unless the larger NVIDIA build of an earlier version is already here.
+/// The engine build to use. For Whisper and Parakeet on a graphics card
+/// that is the Vulkan build, unless the larger NVIDIA build of an earlier
+/// version is already here.
 #[must_use]
-pub fn engine(gpu: bool) -> &'static Download {
-    if !gpu {
+pub fn engine(gpu: bool, runner: Runner) -> &'static Download {
+    if runner.second().is_some() {
+        &ENGINE_LISTENER
+    } else if !gpu {
         &ENGINE_CPU
     } else if program_in(&ENGINE_CUDA, Runner::Server).is_some() {
         &ENGINE_CUDA
@@ -286,7 +446,7 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
 /// The path of an engine program, if that engine build is installed.
 #[must_use]
 pub fn engine_program(gpu: bool, runner: Runner) -> Option<PathBuf> {
-    program_in(engine(gpu), runner)
+    program_in(engine(gpu, runner), runner)
 }
 
 /// The engine program to run a model with right now: the build asked for
@@ -297,8 +457,25 @@ pub fn usable_program(gpu: bool, runner: Runner) -> Option<PathBuf> {
     engine_program(gpu, runner).or_else(|| {
         [&ENGINE_CPU, &ENGINE_VULKAN, &ENGINE_CUDA]
             .into_iter()
+            .filter(|_| runner.second().is_none())
             .find_map(|build| program_in(build, runner))
     })
+}
+
+/// Whether the engine build the settings ask for is worth fetching on its
+/// own: `model` of `provider`, the model in use, runs in the first engine,
+/// which has a build for the processor and one for graphics cards, and a
+/// model that could run in it is on this PC. A model that comes as two
+/// files has an engine of one build, which came with it, and an online one
+/// has none.
+#[must_use]
+pub fn wants_engine(provider: ProviderKind, model: &str) -> bool {
+    in_first_engine(provider, model) && any_local_model()
+}
+
+/// Whether `model` of `provider` runs in the first engine.
+fn in_first_engine(provider: ProviderKind, model: &str) -> bool {
+    find(provider, model).is_some_and(|model| model.files().count() == 1)
 }
 
 /// Whether the file of any local model is on this PC.
@@ -306,33 +483,40 @@ pub fn usable_program(gpu: bool, runner: Runner) -> Option<PathBuf> {
 pub fn any_local_model() -> bool {
     all()
         .into_iter()
-        .filter_map(|model| model.local.as_ref())
-        .any(|(file, _)| model_path(file).is_some_and(|path| has_size(&path, file.source.bytes)))
+        .any(|model| model.local.is_some() && model.has_files())
 }
 
-/// The model to carry on with when an online one cannot serve: `preferred`
-/// if it is among `installed`, otherwise the first of them, which in the
-/// order of the catalog is the best.
+/// The model to carry on with when an online one cannot serve, from those
+/// `installed`: one that knows all of `languages`, the configured ones,
+/// before one that knows only some of them, and never one that knows none,
+/// which would type something else than was said. Among equals it is
+/// `preferred`, otherwise the first, which in the order of the catalog is
+/// the best.
 pub fn pick<'a>(
     preferred: &str,
+    languages: &[String],
     installed: impl IntoIterator<Item = &'a Model>,
 ) -> Option<&'a Model> {
-    let mut first = None;
+    let mut best: Option<(u8, &Model)> = None;
     for model in installed {
-        if model.id.eq_ignore_ascii_case(preferred) {
-            return Some(model);
+        let reach = model.reach(languages);
+        let better =
+            |most| reach > most || reach == most && model.id.eq_ignore_ascii_case(preferred);
+        if reach > 0 && best.is_none_or(|(most, _)| better(most)) {
+            best = Some((reach, model));
         }
-        first = first.or(Some(model));
     }
-    first
+    best.map(|(_, model)| model)
 }
 
 /// The model on this PC to carry on with, [`pick`]ed from the local models
-/// that are installed; `None` if none is. Nothing is downloaded for it.
+/// that are installed; `None` if none is, or none that knows a language of
+/// the user's. Nothing is downloaded for it.
 #[must_use]
-pub fn spare(preferred: &str, gpu: bool) -> Option<&'static Model> {
+pub fn spare(preferred: &str, languages: &[String], gpu: bool) -> Option<&'static Model> {
     let local = all().into_iter().filter(|model| model.local.is_some());
-    pick(preferred, local.filter(|model| is_installed(model, gpu)))
+    let installed = local.filter(|model| is_installed(model, gpu));
+    pick(preferred, languages, installed)
 }
 
 /// The path of a program of an engine build, if that build is installed.
@@ -349,31 +533,32 @@ fn has_size(path: &Path, bytes: u64) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.len() == bytes)
 }
 
+/// Whether a model file is on this PC, whole.
+fn is_here(file: &Download) -> bool {
+    model_path(file).is_some_and(|path| has_size(&path, file.source.bytes))
+}
+
 /// Whether everything a model needs is on disk. Always true for online models.
 #[must_use]
 pub fn is_installed(model: &Model, gpu: bool) -> bool {
-    let Some((file, runner)) = &model.local else {
+    let Some((_, runner)) = &model.local else {
         return true;
     };
-    model_path(file).is_some_and(|path| has_size(&path, file.source.bytes))
-        && usable_program(gpu, *runner).is_some()
+    model.has_files() && usable_program(gpu, *runner).is_some()
 }
 
 /// How many bytes installing a model would still download.
 #[must_use]
 pub fn download_size(model: &Model, gpu: bool) -> u64 {
-    let Some((file, runner)) = &model.local else {
+    let Some((_, runner)) = &model.local else {
         return 0;
     };
-    let model_bytes = if model_path(file).is_some_and(|path| has_size(&path, file.source.bytes)) {
-        0
-    } else {
-        file.source.bytes
-    };
+    let missing = model.files().filter(|file| !is_here(file));
+    let model_bytes: u64 = missing.map(|file| file.source.bytes).sum();
     let engine_bytes = if usable_program(gpu, *runner).is_some() {
         0
     } else {
-        engine(gpu).source.bytes
+        engine(gpu, *runner).source.bytes
     };
     model_bytes + engine_bytes
 }
@@ -555,7 +740,7 @@ impl Installer {
             jobs.insert(
                 ENGINE_JOB,
                 Job {
-                    total: engine(gpu).source.bytes,
+                    total: engine(gpu, Runner::Server).source.bytes,
                     running: true,
                     ..Job::default()
                 },
@@ -658,18 +843,17 @@ impl Installer {
     /// which is the case while the model is in use.
     pub fn remove(&self, model: &Model) -> Result<()> {
         locked(&self.jobs).remove(model.id);
-        let Some(path) = model.local.as_ref().and_then(|(file, _)| model_path(file)) else {
-            return Ok(());
-        };
-        let _ = std::fs::remove_file(download::partial(&path));
-        match std::fs::remove_file(&path) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                return Err(Error::Install(format!(
-                    "could not delete {}: {err}. Pick another model, save, and try again.",
-                    path.display()
-                )));
+        for path in model.files().filter_map(model_path) {
+            let _ = std::fs::remove_file(download::partial(&path));
+            match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(Error::Install(format!(
+                        "could not delete {}: {err}. Pick another model, save, and try again.",
+                        path.display()
+                    )));
+                }
+                _ => {}
             }
-            _ => {}
         }
         // A model someone added goes from the list with its file.
         if model.is_custom() {
@@ -702,9 +886,14 @@ fn install(model: &Model, gpu: bool, jobs: &Jobs, engine_lock: &Mutex<()>) -> Re
         fetch_engine(gpu, *runner, engine_lock, &mut |bytes| {
             report(before, bytes)
         })?;
-        before += engine(gpu).source.bytes;
+        before += engine(gpu, *runner).source.bytes;
     }
 
+    if let Some(ears) = runner.second().filter(|ears| !is_here(ears)) {
+        let path = model_path(ears).ok_or_else(no_folder)?;
+        download::fetch(ears.source, &path, &mut |bytes| report(before, bytes))?;
+        before += ears.source.bytes;
+    }
     let path = model_path(file).ok_or_else(no_folder)?;
     if !has_size(&path, file.source.bytes) {
         download::fetch(file.source, &path, &mut |bytes| report(before, bytes))?;
@@ -732,7 +921,7 @@ fn fetch_engine(
     if engine_program(gpu, runner).is_some() {
         return Ok(());
     }
-    let build = engine(gpu);
+    let build = engine(gpu, runner);
     let dir = engine_dir(build).ok_or_else(|| Error::Install("LOCALAPPDATA is not set".into()))?;
     let archive = suffixed(&dir, ".zip");
     download::fetch(build.source, &archive, progress)?;
@@ -815,7 +1004,7 @@ mod tests {
             assert_eq!(find(model.provider, model.id), Some(model));
             assert_eq!(model.local.is_some(), model.provider == ProviderKind::Local);
             assert!(!model.is_custom(), "{} looks like an added model", model.id);
-            if let Some((file, _)) = &model.local {
+            for file in model.files() {
                 assert!(
                     file.source.url.starts_with("https://") && file.source.url.ends_with(file.file)
                 );
@@ -823,11 +1012,106 @@ mod tests {
                 assert!(file.source.bytes > 1_000_000);
             }
         }
-        for build in [&ENGINE_CPU, &ENGINE_VULKAN, &ENGINE_CUDA] {
+        for build in [&ENGINE_CPU, &ENGINE_VULKAN, &ENGINE_CUDA, &ENGINE_LISTENER] {
             assert!(build.source.url.starts_with("https://"));
             assert!(build.source.url.ends_with(build.file));
             assert_eq!(build.source.sha256.len(), 64);
         }
+    }
+
+    fn configured(list: &[&str]) -> Vec<String> {
+        list.iter().map(|code| (*code).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_model_knows_the_languages_it_was_taught() {
+        let model = |id| find(ProviderKind::Local, id).unwrap_or(&CATALOG[0]);
+        let (qwen, parakeet, whisper) = (
+            model("qwen3-asr-0.6b"),
+            model("parakeet-tdt-0.6b-v3"),
+            model("whisper-base"),
+        );
+        let slovenian = configured(&["sl-SI"]);
+        let both = configured(&["sl-SI", "en-US"]);
+        assert_eq!(qwen.languages.split(' ').count(), 29);
+        assert_eq!(parakeet.languages.split(' ').count(), 25);
+        assert_eq!(
+            [qwen, parakeet, whisper].map(|model| model.reach(&slovenian)),
+            [0, 2, 2]
+        );
+        assert_eq!(
+            [qwen, parakeet, whisper].map(|model| model.reach(&both)),
+            [1, 2, 2]
+        );
+        assert_eq!(qwen.reach(&configured(&["EN", "zh_CN", "yue"])), 2);
+        assert_eq!(qwen.lacks(&both), ["Slovenian"]);
+        assert!(qwen.lacks(&configured(&["en-US"])).is_empty());
+        // A language nobody has a name for is named as it was written.
+        assert_eq!(
+            parakeet.lacks(&configured(&["ja-JP", "tlh"])),
+            ["Japanese", "tlh"]
+        );
+        assert!(whisper.lacks(&configured(&["tlh"])).is_empty());
+    }
+
+    #[test]
+    fn the_model_to_carry_on_with_knows_a_language_of_the_user() {
+        let local: Vec<&Model> = CATALOG.iter().filter(|m| m.local.is_some()).collect();
+        let picked = |preferred: &str, languages: &[&str], installed: &[&'static Model]| {
+            pick(preferred, &configured(languages), installed.iter().copied()).map(|m| m.id)
+        };
+        let all = local.as_slice();
+        // Qwen is first in the catalog, and the first for English.
+        assert_eq!(picked("", &["en-US"], all), Some("qwen3-asr-1.7b"));
+        // It cannot do Slovenian: the first that can is taken instead.
+        assert_eq!(picked("", &["sl-SI"], all), Some("parakeet-tdt-0.6b-v3"));
+        // Also when it was the one last used, before the languages changed.
+        assert_eq!(
+            picked("qwen3-asr-0.6b", &["sl-SI"], all),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+        // One that knows both languages before one that knows one of them,
+        assert_eq!(
+            picked("qwen3-asr-0.6b", &["sl-SI", "en-US"], all),
+            Some("parakeet-tdt-0.6b-v3")
+        );
+        // and of those that do, the one last used.
+        assert_eq!(
+            picked("whisper-base", &["sl-SI", "en-US"], all),
+            Some("whisper-base")
+        );
+        assert_eq!(
+            picked("qwen3-asr-0.6b", &["en-US"], all),
+            Some("qwen3-asr-0.6b")
+        );
+        // With nothing better on this PC, half is more than nothing,
+        let qwen = &all[..2];
+        assert_eq!(
+            picked("", &["sl-SI", "en-US"], qwen),
+            Some("qwen3-asr-1.7b")
+        );
+        // but a model that knows none of the languages is no model at all.
+        assert_eq!(picked("qwen3-asr-1.7b", &["sl-SI"], qwen), None);
+        assert_eq!(picked("", &["en-US"], &[]), None);
+    }
+
+    #[test]
+    fn only_a_model_of_the_first_engine_has_another_build_fetched_for_it() {
+        // The switch for the graphics card fetches the build of the first
+        // engine for it. Nothing else runs in that engine.
+        for model in &CATALOG {
+            let first = matches!(&model.local, Some((_, Runner::Server | Runner::Command)));
+            assert_eq!(
+                in_first_engine(model.provider, model.id),
+                first,
+                "{}",
+                model.id
+            );
+        }
+        assert!(!in_first_engine(ProviderKind::Local, "qwen3-asr-0.6b"));
+        assert!(in_first_engine(ProviderKind::Local, "whisper-base"));
+        assert!(!in_first_engine(ProviderKind::Local, ""));
+        assert!(!wants_engine(ProviderKind::Local, "qwen3-asr-0.6b"));
     }
 
     #[test]

@@ -95,6 +95,12 @@ pub trait Controller {
     /// Starts a session whose text goes to `target`. `id` is whatever the
     /// program that asked for it wants to recognize its result by.
     fn start(&mut self, target: Target, id: Option<String>);
+    /// Says whether the key that starts a session, or started the running
+    /// one, is being held down: before every start, and again when a key
+    /// that was only tapped is let go. A dictation is never ended for being
+    /// quiet while its key is held; one that goes on after a tap, or that a
+    /// program started, is ended after the time the settings allow.
+    fn held(&mut self, _held: bool) {}
     /// Asks the running session to finish; it flushes its last words by itself.
     fn stop(&mut self);
     /// Calls off the running session and every stopped one that is still at

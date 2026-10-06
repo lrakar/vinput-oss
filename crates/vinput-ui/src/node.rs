@@ -154,6 +154,8 @@ pub enum Icon {
     Volume,
     /// Updates.
     Sync,
+    /// A length of time.
+    Timer,
     /// Speech models.
     Model,
     /// Something to download.

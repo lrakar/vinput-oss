@@ -37,7 +37,7 @@ jobs:
     env:
       # 2,646,528 bytes when this was set. Raise it in the commit that needs
       # the room, and say there what the bytes buy.
-      BUDGET_BYTES: 3400000
+      BUDGET_BYTES: 3450000
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install

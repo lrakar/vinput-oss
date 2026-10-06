@@ -53,6 +53,7 @@ jobs:
             "models pro-used-up-no-model", "models pro-low-no-model",
             "models pro-payment-problem", "models pro-expired", "models pro-offline",
             "models many-models", "settings pro-over-allowance",
+            "models wrong-language", "welcome-local welcome-other-language",
             "settings one-language",
             "pro pro-signed-out", "pro pro-signing-in", "pro pro-not-subscribed",
             "pro pro-intro", "pro pro-intro-signed-out", "welcome-pro welcome-intro",

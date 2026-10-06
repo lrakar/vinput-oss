@@ -300,7 +300,7 @@ mod tests {
             steps(press(&seen, "Choose a model")),
             (Vec::new(), Some(Page::WelcomeLocal))
         );
-        assert!(seen.says("Free. A download of 148 MB to 1.6 GB"));
+        assert!(seen.says("Free. A download of 148 MB to 2.3 GB"));
         // Nothing is bought, downloaded or chosen by the first page itself.
         assert!(
             seen.commands()
@@ -384,6 +384,19 @@ mod tests {
         }
         // Nothing that runs online is offered here.
         assert!(!seen.says("VinPUT Pro") && !seen.says("Gemini"));
+    }
+
+    #[test]
+    fn the_local_step_says_which_models_do_not_know_the_language() {
+        let seen = seen(Page::WelcomeLocal, &scene("welcome-other-language"));
+        let lacking: Vec<&String> = seen
+            .texts
+            .iter()
+            .filter(|text| text.starts_with("Does not know Slovenian"))
+            .collect();
+        assert_eq!(lacking.len(), 2, "{:?}", seen.texts);
+        // In English there is nothing to say.
+        assert!(!self::seen(Page::WelcomeLocal, &scene("first-run")).says("not know"));
     }
 
     #[test]

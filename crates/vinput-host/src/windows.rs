@@ -322,14 +322,12 @@ impl Host {
 
     /// Fetches the engine build the settings ask for, if a local model is in
     /// use and that build is not here. Until it is, the model runs on the
-    /// build that is; nothing is asked of the user.
+    /// build that is; nothing is asked of the user. A model that comes as
+    /// two files has an engine of one build, which came with it.
     fn ensure_engine(&self) {
-        let local = models::find(self.settings.provider, &self.settings.model)
-            .is_some_and(|model| model.local.is_some());
-        if !local || !models::any_local_model() {
-            return;
+        if models::wants_engine(self.settings.provider, &self.settings.model) {
+            self.installer.ensure_engine(self.settings.use_gpu());
         }
-        self.installer.ensure_engine(self.settings.use_gpu());
     }
 
     /// Brings the entry that starts Vinput with Windows in line with the

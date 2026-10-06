@@ -276,6 +276,7 @@ impl Entry {
             name: leak(self.name.clone()),
             summary: leak(summary),
             detail,
+            languages: if self.english_only { "en" } else { "" },
             local: Some((
                 Download {
                     file,

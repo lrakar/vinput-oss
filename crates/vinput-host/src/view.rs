@@ -173,6 +173,7 @@ fn settings(settings: &Settings, graphics_card: bool) -> wire::Settings {
         autostart: settings.autostart,
         ready_sound: settings.ready_sound,
         stop_sound: settings.stop_sound,
+        stop_after_minutes: settings.stop_after_minutes,
         check_updates: settings.check_updates,
         // What the user wants only counts on a PC that has a card.
         graphics_card: settings.local_gpu && graphics_card,
@@ -201,8 +202,11 @@ fn status(facts: &Facts<'_>) -> wire::Status {
         (None, _) if unlisted.is_none() => wire::RunsOn::Nowhere,
         (None, _) => wire::RunsOn::Online,
         (Some(model), _) if model.local.is_none() => wire::RunsOn::Online,
-        // The graphics card is only at work once its engine is here.
-        (Some(_), Some(card)) if facts.settings.local_gpu && facts.card_engine => {
+        // The graphics card is only at work once its engine is here, which
+        // for a model that comes as two files is the only engine it has.
+        (Some(model), Some(card))
+            if facts.settings.local_gpu && (facts.card_engine || model.files().count() > 1) =>
+        {
             wire::RunsOn::GraphicsCard(card.to_owned())
         }
         (Some(_), _) => wire::RunsOn::Processor,
@@ -217,11 +221,10 @@ fn status(facts: &Facts<'_>) -> wire::Status {
 }
 
 fn model(settings: &Settings, model: &Model, status: &Status) -> wire::Model {
-    let file_bytes = model
-        .local
-        .as_ref()
-        .map_or(0, |(file, _)| file.source.bytes);
+    let file_bytes = model.bytes();
     wire::Model {
+        lacks: model.lacks(&settings.languages),
+        knows_none: model.reach(&settings.languages) == 0,
         id: model.id.to_owned(),
         name: model.name.to_owned(),
         summary: model.summary.to_owned(),
@@ -303,14 +306,16 @@ fn update(facts: &UpdateFacts<'_>) -> wire::Update {
 }
 
 /// Name of the model on this PC that dictation carries on with when the
-/// hours of `VinPUT` Pro are used up, if one is downloaded.
+/// hours of `VinPUT` Pro are used up, if one is downloaded that knows a
+/// language of the settings.
 fn spare(facts: &Facts<'_>) -> Option<&'static str> {
     let here = facts
         .models
         .iter()
         .filter(|(model, status)| model.local.is_some() && matches!(status, Status::Installed));
-    let preferred = &facts.settings.last_local_model;
-    models::pick(preferred, here.map(|(model, _)| *model)).map(|model| model.name)
+    let settings = facts.settings;
+    let here = here.map(|(model, _)| *model);
+    models::pick(&settings.last_local_model, &settings.languages, here).map(|model| model.name)
 }
 
 fn tier(tier: Tier) -> wire::ProTier {
@@ -522,8 +527,8 @@ mod tests {
                 .iter()
                 .map(|model| {
                     let status = match &model.local {
-                        Some((file, _)) => Status::Missing {
-                            bytes: file.source.bytes + 1000,
+                        Some(_) => Status::Missing {
+                            bytes: model.bytes() + 1000,
                         },
                         None => Status::Online,
                     };
@@ -780,6 +785,38 @@ mod tests {
         assert_eq!(build(&all).pro.spare.as_deref(), Some(first.name));
         download(&mut all, last);
         assert_eq!(build(&all).pro.spare.as_deref(), Some(last.name));
+        // Never one that knows none of the languages: the first of the
+        // catalog cannot do Slovenian, the last one can.
+        let slovenian = Settings {
+            languages: vec!["sl-SI".to_owned()],
+            last_local_model: first.id.to_owned(),
+            ..settings.clone()
+        };
+        assert_eq!(first.reach(&slovenian.languages), 0);
+        let mut others = facts(&slovenian);
+        download(&mut others, first);
+        assert_eq!(build(&others).pro.spare, None);
+        download(&mut others, last);
+        assert_eq!(build(&others).pro.spare.as_deref(), Some(last.name));
+        // Its row says which languages it lacks, in words.
+        let row = |view: &wire::View, id: &str| {
+            let found = view.models.list.iter().find(|model| model.id == id);
+            found.map(|model| (model.lacks.clone(), model.knows_none))
+        };
+        let shown = build(&others);
+        assert_eq!(
+            row(&shown, first.id),
+            Some((vec!["Slovenian".to_owned()], true))
+        );
+        assert_eq!(row(&shown, last.id), Some((Vec::new(), false)));
+        let both = Settings {
+            languages: vec!["sl-SI".to_owned(), "en-US".to_owned()],
+            ..slovenian.clone()
+        };
+        assert_eq!(
+            row(&build(&facts(&both)), first.id),
+            Some((vec!["Slovenian".to_owned()], false))
+        );
 
         // While it serves in place of VinPUT Pro, the status says so; the
         // model the settings choose is still VinPUT Pro.
@@ -855,9 +892,18 @@ mod tests {
             view.status.runs_on,
             wire::RunsOn::GraphicsCard(CARD.to_owned())
         );
-        // Until the engine for the card is here, the processor does the work.
+        // Until the engine for the card is here, the processor does the
+        // work, but for a model whose only engine runs on either.
         on_pc.card_engine = false;
-        assert_eq!(build(&on_pc).status.runs_on, wire::RunsOn::Processor);
+        assert_eq!(
+            build(&on_pc).status.runs_on,
+            wire::RunsOn::GraphicsCard(CARD.to_owned())
+        );
+        let one_file = CATALOG.iter().find(|model| model.files().count() == 1);
+        let whisper = choosing(one_file.unwrap_or(&CATALOG[0]));
+        let mut waiting = facts(&whisper);
+        waiting.card_engine = false;
+        assert_eq!(build(&waiting).status.runs_on, wire::RunsOn::Processor);
         on_pc.card_engine = true;
         on_pc.graphics_card = None;
         assert_eq!(build(&on_pc).status.runs_on, wire::RunsOn::Processor);
@@ -886,10 +932,10 @@ mod tests {
     fn each_model_is_listed_with_where_it_stands() {
         let settings = choosing(local());
         let mut facts = facts(&settings);
-        let file_bytes = local()
-            .local
-            .as_ref()
-            .map_or(0, |(file, _)| file.source.bytes);
+        // A model that comes as two files is as large as both.
+        let file_bytes = local().bytes();
+        assert_eq!(local().files().count(), 2);
+        assert!(local().files().all(|file| file.source.bytes < file_bytes));
         let row = |facts: &Facts<'_>| {
             build(facts)
                 .models

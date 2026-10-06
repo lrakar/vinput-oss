@@ -18,6 +18,16 @@
 //! [`dictation`]. A model whose program is started per dictation is
 //! recognized whole when the dictation ends.
 //!
+//! There are two engines with a server. The second one runs the models that
+//! come as two files, and is asked and answers in another form
+//! ([`converse`]). Its models write every stretch as a sentence of its own,
+//! so a dictation is not cut at its pauses for them: it is one stretch,
+//! recognized when it ends, unless it goes on for minutes, when it is cut
+//! at a pause every two or so ([`WHOLE_SAMPLES`]) so that no request grows
+//! without end. Everything else here is the same for both. That engine
+//! answers anyone who can reach its port, so it is started with a key made
+//! up for that start, which every request to it carries ([`listener`]).
+//!
 //! The engine makes words up for audio without speech, so it is handed as
 //! little of that as can be: the quiet at either end of a stretch is cut
 //! away and a stretch with nothing in it is not sent ([`sound`]), what may
@@ -40,12 +50,13 @@
 //! ([`Server::unload_when_idle`]).
 
 mod dictation;
-mod languages;
+pub(crate) mod languages;
 mod pauses;
 mod phantoms;
 mod sound;
 mod stretches;
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -55,6 +66,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 
 use self::dictation::{Care, Dictation, Inference};
@@ -68,8 +82,18 @@ use crate::{Error, Result, log, suspend};
 
 /// How long a model may take to load before the engine is given up on.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long recognizing one dictation may take.
+/// How long recognizing a stretch may take, however short it is.
 const RECOGNIZE_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long recognizing a stretch may take, however long it is: a minute
+/// less than [`IDLE_UNLOAD`], after which an engine that has recorded no
+/// answer is ended whatever it is doing.
+const RECOGNIZE_LIMIT: Duration = Duration::from_secs(IDLE_UNLOAD.as_secs() - 60);
+/// An engine that is handed its dictations whole is not handed more than
+/// about this at once: two minutes, after which the dictation is cut at the
+/// next pause. Held back until the key is let go, half an hour of speech
+/// would be one request that no engine answers in time, and all of it would
+/// be lost with that one.
+const WHOLE_SAMPLES: usize = 120 * SAMPLE_RATE_HZ as usize;
 /// The server is ended after this long without a dictation, to free the
 /// memory the model takes.
 const IDLE_UNLOAD: Duration = Duration::from_secs(10 * 60);
@@ -84,8 +108,9 @@ const IDLE_UNLOAD: Duration = Duration::from_secs(10 * 60);
 const QUIET: Duration = Duration::from_secs(30);
 /// An engine handed to a caller counts as in use for this long if no answer
 /// is recorded: the five seconds a request may take to connect and the time
-/// it may take to be answered. Past that the request has failed on this side
-/// whatever the engine is doing.
+/// most requests may take to be answered. A long recording may take longer
+/// ([`patience`]); its request is then seen as a connection of the engine,
+/// which is not suspended while it has one.
 const LENT: Duration = Duration::from_secs(5 + RECOGNIZE_TIMEOUT.as_secs());
 /// How long the silent first request of a freshly loaded engine may take. It
 /// is made while everyone else waits for the engine, so not the three minutes
@@ -94,6 +119,15 @@ const WARM_UP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Less audio than this cannot hold a word and is not sent to the engine.
 const MIN_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 4;
 const POLL: Duration = Duration::from_millis(100);
+
+/// How long the engine may take over a recording of this many bytes: three
+/// minutes and twice as long as the recording lasts, since a large model on
+/// a processor can be slower than speech, but never past
+/// [`RECOGNIZE_LIMIT`].
+fn patience(wav: usize) -> Duration {
+    let lasts = Duration::from_secs((wav / (2 * SAMPLE_RATE_HZ as usize)) as u64);
+    (RECOGNIZE_TIMEOUT + 2 * lasts).min(RECOGNIZE_LIMIT)
+}
 
 /// A local model, ready to recognize.
 #[derive(Debug)]
@@ -136,10 +170,16 @@ impl LocalSpeech {
         let program = models::usable_program(gpu, *runner).ok_or_else(not_installed)?;
         let model_file = models::model_path(file).ok_or_else(not_installed)?;
         let engine = match runner {
-            Runner::Server => {
+            Runner::Command => Engine::Command(Arc::new(Program {
+                executable: program,
+                model_file,
+                gpu,
+            })),
+            Runner::Server | Runner::Listener(_) => {
                 let server = Arc::new(Server {
                     program,
                     model_file,
+                    ears: runner.second().and_then(models::model_path),
                     name: model.name,
                     gpu,
                     running: Mutex::default(),
@@ -148,11 +188,6 @@ impl LocalSpeech {
                 server.wake()?;
                 Engine::Server(server)
             }
-            Runner::Command => Engine::Command(Arc::new(Program {
-                executable: program,
-                model_file,
-                gpu,
-            })),
         };
         Ok(Self {
             engine,
@@ -217,6 +252,10 @@ enum LocalSession {
         pauses: Pauses,
         stretches: Stretches,
         experience: Arc<Experience>,
+        /// Whether the dictation is one stretch whatever its pauses, as for
+        /// an engine that cannot carry a sentence across a cut, for as long
+        /// as that stretch is not too long for one request.
+        whole: bool,
     },
     /// With a program that is run once: recognized when the dictation ends.
     AtEnd {
@@ -232,11 +271,13 @@ impl LocalSession {
         languages: Vec<String>,
         experience: Arc<Experience>,
     ) -> Result<Self> {
+        let whole = !engine.led();
         let dictation = Dictation::new(engine, languages, experience.language());
         Ok(Self::AtPauses {
             pauses: Pauses::new(),
             stretches: Stretches::start(dictation, Arc::clone(&experience))?,
             experience,
+            whole,
         })
     }
 }
@@ -256,12 +297,19 @@ impl Transcriber for LocalSession {
                 pauses,
                 stretches,
                 experience,
+                whole,
             } => {
                 let ready = stretches.ready()?;
                 // A stretch is cut off only when the engine is free to take
                 // it and quick enough to be done with it soon, so that
                 // nothing is ever waiting behind it when the dictation ends.
-                let may_cut = stretches.idle() && experience.keeps_up();
+                // An engine that gets its dictations whole gets a stretch
+                // only once it is as long as one request may be.
+                let may_cut = if *whole {
+                    pauses.held() >= WHOLE_SAMPLES
+                } else {
+                    stretches.idle() && experience.keeps_up()
+                };
                 if let Some(stretch) = pauses.feed(pcm, may_cut) {
                     send(stretches, &stretch, Care::default(), experience.voice());
                 }
@@ -280,6 +328,7 @@ impl Transcriber for LocalSession {
                 pauses,
                 stretches,
                 experience,
+                ..
             } => {
                 if let Some(rest) = pauses.rest()
                     && rest.samples.len() >= MIN_SAMPLES
@@ -403,6 +452,9 @@ fn spoken_lines(output: &str) -> String {
 struct Server {
     program: PathBuf,
     model_file: PathBuf,
+    /// The file that hears, of a model that comes as two; with it, the
+    /// program is the second engine.
+    ears: Option<PathBuf>,
     name: &'static str,
     gpu: bool,
     running: Mutex<Option<Running>>,
@@ -411,6 +463,9 @@ struct Server {
 struct Running {
     child: Child,
     address: SocketAddr,
+    /// What the second engine asks of whoever makes a request of it; empty
+    /// for the first, which asks for nothing.
+    key: String,
     /// When the engine was last handed out or last answered.
     last_used: Instant,
     /// When [`Server::address`] last handed the engine to a caller. It is in
@@ -609,7 +664,7 @@ impl Drop for Running {
 impl Running {
     /// A process just started as the engine at `address`, with the bell
     /// for the thread that is to look after it.
-    fn of(child: Child, address: SocketAddr) -> (Self, Arc<Bell>) {
+    fn of(child: Child, address: SocketAddr, key: String) -> (Self, Arc<Bell>) {
         let watcher = Arc::new(Bell::default());
         let watching = Arc::clone(&watcher);
         #[cfg(windows)]
@@ -622,6 +677,7 @@ impl Running {
         let engine = Self {
             child,
             address,
+            key,
             last_used: now,
             lent: now,
             asleep: None,
@@ -635,9 +691,9 @@ impl Running {
 }
 
 impl Server {
-    /// The address of the running server, starting it first if it is not
-    /// loaded and resuming it first if it is suspended. Blocks while the
-    /// model loads.
+    /// The address of the running server and the key it asks for, starting
+    /// it first if it is not loaded and resuming it first if it is
+    /// suspended. Blocks while the model loads.
     ///
     /// The engine is running when this returns, and stays so for as long as
     /// the caller may take over a request ([`LENT`]) or until the answer is
@@ -646,7 +702,7 @@ impl Server {
     /// answer then never comes. So nobody may connect to an address obtained
     /// in any other way, and both resuming here and suspending in
     /// [`Server::unload_when_idle`] happen under the lock on `running`.
-    fn address(self: &Arc<Self>) -> Result<SocketAddr> {
+    fn address(self: &Arc<Self>) -> Result<(SocketAddr, String)> {
         self.reach(true)
     }
 
@@ -660,14 +716,14 @@ impl Server {
     }
 
     /// The engine, running; handed out to the caller if `lend`.
-    fn reach(self: &Arc<Self>, lend: bool) -> Result<SocketAddr> {
+    fn reach(self: &Arc<Self>, lend: bool) -> Result<(SocketAddr, String)> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(server) = running.as_mut() {
             if !matches!(server.child.try_wait(), Ok(None)) {
                 log::write("the local engine had stopped; starting it again");
             } else if server.wake() {
                 server.touch(lend);
-                return Ok(server.address);
+                return Ok((server.address, server.key.clone()));
             } else {
                 log::write("starting the local engine again instead");
             }
@@ -676,11 +732,11 @@ impl Server {
         *running = None;
         let (mut server, watcher) = self.start()?;
         server.touch(lend);
-        let address = server.address;
+        let door = (server.address, server.key.clone());
         *running = Some(server);
         drop(running);
         self.unload_when_idle(watcher, PACE);
-        Ok(address)
+        Ok(door)
     }
 
     /// Starts the engine and waits for the model to load. Returns it with
@@ -711,15 +767,20 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // The build at hand may be one for graphics cards while the user
-        // wants the processor.
-        if !self.gpu {
+        let mut key = String::new();
+        if let Some(ears) = &self.ears {
+            key = secret().map_err(|err| failed(err.to_string()))?;
+            let set = std::env::vars_os().map(|(name, _)| name);
+            listener(&mut command, ears, self.gpu, &key, set);
+        } else if !self.gpu {
+            // The build at hand may be one for graphics cards while the user
+            // wants the processor.
             command.arg("-ng");
         }
         engine_folder(&mut command, &self.program);
         hide_console(&mut command);
         let child = command.spawn().map_err(|err| failed(err.to_string()))?;
-        let (mut server, watcher) = Running::of(child, address);
+        let (mut server, watcher) = Running::of(child, address, key);
         // The server listens once the model is loaded.
         let started = Instant::now();
         loop {
@@ -728,10 +789,10 @@ impl Server {
                     "it stopped while loading the model ({status})"
                 )));
             }
-            if TcpStream::connect_timeout(&address, POLL).is_ok() {
+            if self.loaded(address, &server.key) {
                 if self.gpu {
                     let left = LOAD_TIMEOUT.saturating_sub(started.elapsed());
-                    warm_up(address, left.clamp(POLL, WARM_UP_TIMEOUT));
+                    self.warm_up(address, &server.key, left.clamp(POLL, WARM_UP_TIMEOUT));
                 }
                 // Used as of now, not as of before the model loaded, and
                 // not handed out to anyone yet.
@@ -796,10 +857,60 @@ impl Server {
         }
     }
 
+    /// Whether the engine listening at `address` has its model loaded. The
+    /// first engine listens once it has; the second one from the start, and
+    /// says how it is when asked. Neither is waited for longer than [`POLL`]
+    /// while nothing listens there yet: Windows takes a second or two to say
+    /// that nothing does.
+    fn loaded(&self, address: SocketAddr, key: &str) -> bool {
+        let health = || exchange(address, "GET /health", &bearer(key), &[], WARM_UP_TIMEOUT);
+        TcpStream::connect_timeout(&address, POLL).is_ok()
+            && (self.ears.is_none() || matches!(health(), Ok((200, _))))
+    }
+
+    /// Has a freshly loaded engine recognize half a second of silence, so
+    /// that what it only sets up for its first request is set up before a
+    /// dictation asks. On a graphics card that is the programs the card
+    /// runs, which the driver builds the first time they are used: seconds,
+    /// the first time ever. On the processor a first request was measured to
+    /// take as long as any other, so there this would only make loading
+    /// longer and is not done.
+    ///
+    /// Part of loading: whoever waits for the engine waits for this too, and
+    /// the engine is not yet in use while it lasts, for `patience` at the
+    /// most. A failure costs nothing but the head start.
+    fn warm_up(&self, address: SocketAddr, key: &str, patience: Duration) {
+        let silence = wav_bytes(&[0; SAMPLE_RATE_HZ as usize / 2]);
+        let fields = [
+            ("response_format", "json"),
+            ("temperature", "0.0"),
+            ("language", "en"),
+        ];
+        if let Err(err) = self.ask((address, key), &fields, &silence, patience) {
+            log::write(&format!("warming the local engine up failed: {err}"));
+        }
+    }
+
+    /// One request to the engine at `address`, in the form it understands
+    /// and with the `key` it asks for.
+    fn ask(
+        &self,
+        (address, key): (SocketAddr, &str),
+        fields: &[(&str, &str)],
+        wav: &[u8],
+        patience: Duration,
+    ) -> Result<Value> {
+        if self.ears.is_some() {
+            converse((address, key), fields, wav, patience)
+        } else {
+            ask_within(address, fields, wav, patience)
+        }
+    }
+
     /// One request to the engine; its answer, which has the `text`.
     fn infer(self: &Arc<Self>, fields: &[(&str, &str)], wav: &[u8]) -> Result<Value> {
-        let address = self.address()?;
-        let reply = ask(address, fields, wav)?;
+        let (address, key) = self.address()?;
+        let reply = self.ask((address, &key), fields, wav, patience(wav.len()))?;
         if let Some(server) = self
             .running
             .lock()
@@ -816,52 +927,154 @@ impl Inference for Arc<Server> {
     fn infer(&self, fields: &[(&str, &str)], wav: &[u8]) -> Result<Value> {
         Server::infer(self, fields, wav)
     }
+
+    fn led(&self) -> bool {
+        self.ears.is_none()
+    }
 }
 
 /// Posts one recognition request to the engine at `address` and returns its
 /// answer, which has the `text`.
+#[cfg(test)]
 fn ask(address: SocketAddr, fields: &[(&str, &str)], wav: &[u8]) -> Result<Value> {
-    let failed = |what: String| Error::Transcription(format!("the local engine failed: {what}"));
-    let (status, reply) = post(address, "/inference", &multipart(fields, wav))
-        .map_err(|err| failed(err.to_string()))?;
+    ask_within(address, fields, wav, RECOGNIZE_TIMEOUT)
+}
+
+fn failed(what: &dyn std::fmt::Display) -> Error {
+    Error::Transcription(format!("the local engine failed: {what}"))
+}
+
+fn unexpected(status: u16) -> Error {
+    failed(&format_args!("unexpected answer (HTTP {status})"))
+}
+
+/// [`ask`], giving up when the engine sends nothing for `patience`.
+fn ask_within(
+    address: SocketAddr,
+    fields: &[(&str, &str)],
+    wav: &[u8],
+    patience: Duration,
+) -> Result<Value> {
+    let kind = format!("Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n");
+    let form = multipart(fields, wav);
+    let (status, reply) =
+        exchange(address, "POST /inference", &kind, &form, patience).map_err(|err| failed(&err))?;
     let reply: Value = serde_json::from_slice(&reply).unwrap_or_default();
     let error = reply.get("error").and_then(Value::as_str);
     match (status, reply.get("text").is_some(), error) {
         (200, true, _) => Ok(reply),
-        (_, _, Some(error)) => Err(failed(error.to_owned())),
-        _ => Err(failed(format!("unexpected answer (HTTP {status})"))),
+        (_, _, Some(error)) => Err(failed(&error)),
+        _ => Err(unexpected(status)),
     }
 }
 
-/// Has a freshly loaded engine recognize half a second of silence, so that
-/// what it only sets up for its first request is set up before a dictation
-/// asks. On a graphics card that is the programs the card runs, which the
-/// driver builds the first time they are used: seconds, the first time ever.
-/// On the processor a first request was measured to take as long as any
-/// other, so there this would only make loading longer and is not done.
+/// What a model of the second engine writes between the language it heard
+/// and what was said: `language English<asr_text>Hello.`
+const SAID: &str = "<asr_text>";
+
+/// One recognition request to the second engine at `address`, which asks
+/// for `key`, made of the same `fields` as one to the first, and its answer
+/// in the form of the first engine's: the `text`, and the `language` by its
+/// name.
 ///
-/// Part of loading: whoever waits for the engine waits for this too, and the
-/// engine is not yet in use while it lasts, for `patience` at the most. A
-/// failure costs nothing but the head start.
-fn warm_up(address: SocketAddr, patience: Duration) {
-    let silence = wav_bytes(&[0; SAMPLE_RATE_HZ as usize / 2]);
-    let fields = [
-        ("response_format", "json"),
-        ("temperature", "0.0"),
-        ("language", "en"),
-    ];
-    match post_within(
+/// This engine is a language model that is shown the recording and writes
+/// down what it hears. Its answer starts with the language. When the
+/// language is known the answer is started for it, and it goes on in that
+/// language. The text so far is not handed to it: it is taught to take such
+/// text for words to listen for, not for the sentence to carry on.
+fn converse(
+    (address, key): (SocketAddr, &str),
+    fields: &[(&str, &str)],
+    wav: &[u8],
+    patience: Duration,
+) -> Result<Value> {
+    let language = fields.iter().find(|(name, _)| *name == "language");
+    let begun = language
+        .and_then(|(_, code)| languages::taught(code))
+        .map(|name| format!(r#",{{"role":"assistant","content":"language {name}{SAID}"}}"#))
+        .unwrap_or_default();
+    // A model that loses its way repeats itself for as long as it may, so
+    // it may write no more than fits in the recording at any pace of speech.
+    let most = 64 + 16 * wav.len() / (2 * SAMPLE_RATE_HZ as usize);
+    let request = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"input_audio","input_audio":{{"data":"{}","format":"wav"}}}}]}}{begun}],"temperature":0,"max_tokens":{most}}}"#,
+        BASE64.encode(wav)
+    );
+    let (status, reply) = exchange(
         address,
-        "/inference",
-        &multipart(&fields, &silence),
+        "POST /v1/chat/completions",
+        &format!("Content-Type: application/json\r\n{}", bearer(key)),
+        request.as_bytes(),
         patience,
-    ) {
-        Ok((200, _)) => {}
-        Ok((status, _)) => log::write(&format!(
-            "warming the local engine up failed (HTTP {status})"
-        )),
-        Err(err) => log::write(&format!("warming the local engine up failed: {err}")),
+    )
+    .map_err(|err| failed(&err))?;
+    let mut reply: Value = serde_json::from_slice(&reply).unwrap_or_default();
+    let written = reply["choices"][0]["message"]["content"].as_str();
+    let Some(written) = written.filter(|_| status == 200) else {
+        return Err(match reply["error"]["message"].as_str() {
+            Some(error) => failed(&error),
+            None => unexpected(status),
+        });
+    };
+    let (language, text) = written.split_once(SAID).unwrap_or(("", written));
+    let language = language
+        .trim_start_matches("language ")
+        .to_ascii_lowercase();
+    let text = text.to_owned();
+    reply["text"] = text.into();
+    reply["language"] = language.into();
+    Ok(reply)
+}
+
+/// The line of a request that shows the second engine its `key`.
+fn bearer(key: &str) -> String {
+    format!("Authorization: Bearer {key}\r\n")
+}
+
+/// A key for one start of the second engine: 128 bits nobody can guess.
+fn secret() -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| std::io::Error::other("Windows gave no random numbers"))?;
+    Ok(BASE64.encode(bytes))
+}
+
+/// What the second engine is started with besides its model and its port.
+///
+/// One dictation at a time, no page for a browser, and the first graphics
+/// card or none: left to itself this engine spreads a model over every card
+/// it finds.
+///
+/// It takes its settings from the environment as well as from its command
+/// line, under names that start with `LLAMA_`. Of the variables `set` for
+/// Vinput it is handed none of those: they are the user's, for a llama.cpp
+/// of their own, and one of them, a key, would have this engine refuse
+/// every dictation. The one it gets is the `key` of this start. It listens
+/// on this PC only, but there any program can reach its port, and so can a
+/// page in a browser: without the key none of them is answered.
+fn listener(
+    command: &mut Command,
+    ears: &Path,
+    gpu: bool,
+    key: &str,
+    set: impl Iterator<Item = OsString>,
+) {
+    let device = if gpu { "Vulkan0" } else { "none" };
+    command
+        .arg("--mmproj")
+        .arg(ears)
+        .args(["--no-webui", "-np", "1", "--device", device]);
+    // Windows does not tell the names of variables apart by their case.
+    let theirs = |name: &OsString| {
+        name.to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("LLAMA_")
+    };
+    for name in set.filter(theirs) {
+        command.env_remove(name);
     }
+    command.env("LLAMA_API_KEY", key);
 }
 
 /// Runs an engine program from its own folder, where its libraries are.
@@ -896,16 +1109,15 @@ fn multipart(fields: &[(&str, &str)], wav: &[u8]) -> Vec<u8> {
     body
 }
 
-/// Posts a form to the engine and returns the status code and body. The
-/// request is local and one-shot, so it is written by hand on a plain socket.
-fn post(address: SocketAddr, path: &str, body: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
-    post_within(address, path, body, RECOGNIZE_TIMEOUT)
-}
-
-/// [`post`], giving up when the engine sends nothing for `patience`.
-fn post_within(
+/// Makes `request` (`POST /inference`) of the engine with the lines `head`,
+/// which say what kind of body it has and show a key, and returns the
+/// status code and body of the answer, giving up when the engine sends
+/// nothing for `patience`. The request is local and one-shot, so it is
+/// written by hand on a plain socket.
+fn exchange(
     address: SocketAddr,
-    path: &str,
+    request: &str,
+    head: &str,
     body: &[u8],
     patience: Duration,
 ) -> std::io::Result<(u16, Vec<u8>)> {
@@ -913,8 +1125,7 @@ fn post_within(
     stream.set_read_timeout(Some(patience))?;
     write!(
         stream,
-        "POST {path} HTTP/1.1\r\nHost: {address}\r\n\
-         Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n\
+        "{request} HTTP/1.1\r\nHost: {address}\r\n{head}\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
@@ -963,6 +1174,8 @@ fn unchunk(mut content: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::pauses::testing::{PACKET, room, voice};
     use super::*;
 
@@ -1010,8 +1223,7 @@ mod tests {
                 };
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 4096];
-                let ending = format!("--{BOUNDARY}--\r\n");
-                while !request.ends_with(ending.as_bytes()) {
+                while !whole(&request) {
                     match stream.read(&mut chunk) {
                         Ok(read) if read > 0 => request.extend_from_slice(&chunk[..read]),
                         _ => break,
@@ -1024,6 +1236,18 @@ mod tests {
             requests
         });
         Ok((address, server))
+    }
+
+    /// Whether all of a request has arrived: its head, and a body as long
+    /// as the head says.
+    fn whole(request: &[u8]) -> bool {
+        let Some(head) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let length = String::from_utf8_lossy(&request[..head])
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: ")?.parse().ok());
+        request.len() - (head + 4) >= length.unwrap_or(0)
     }
 
     /// What the engine sends back for a recording it heard `text` in.
@@ -1109,6 +1333,52 @@ mod tests {
     }
 
     #[test]
+    fn the_second_engine_is_asked_in_its_form_and_answers_in_the_first_ones() -> Outcome {
+        let written = |content: &str| {
+            let body = json!({"choices": [{"message": {"content": content}}]});
+            answer("200 OK", &body.to_string())
+        };
+        let answers = vec![
+            written("language English<asr_text>Hello there."),
+            written("language None<asr_text>"),
+            answer(
+                "500 Internal Server Error",
+                r#"{"error":{"message":"no room"}}"#,
+            ),
+        ];
+        let (address, engine) = fake_engine(answers, Duration::ZERO)?;
+        let wav = wav_bytes(&[1, 2, 3]);
+        let ask = |language| {
+            let door = (address, "Zm9v");
+            converse(door, &[("language", language)], &wav, RECOGNIZE_TIMEOUT)
+        };
+
+        // A language the model was taught is the one it answers in.
+        let reply = ask("en")?;
+        assert_eq!(reply["text"], "Hello there.");
+        assert_eq!(reply["language"], "english");
+        // One it was not taught is left to it, and silence is no text.
+        let reply = ask("sl")?;
+        assert_eq!(reply["text"], "");
+        assert!(languages::code_of(reply["language"].as_str().unwrap_or_default()).is_none());
+        let failed = ask("auto");
+        assert!(matches!(failed, Err(Error::Transcription(why)) if why.contains("no room")));
+
+        let requests = engine.join().unwrap_or_default();
+        let request = |index: usize| String::from_utf8_lossy(&requests[index]).into_owned();
+        assert!(request(0).starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        // Every request shows the key the engine was started with.
+        for index in 0..3 {
+            assert!(request(index).contains("\r\nAuthorization: Bearer Zm9v\r\n"));
+        }
+        assert!(request(0).contains(&BASE64.encode(&wav)));
+        assert!(request(0).contains("language English<asr_text>"));
+        assert!(!request(1).contains("<asr_text>"));
+        assert!(!request(2).contains("<asr_text>"));
+        Ok(())
+    }
+
+    #[test]
     fn what_the_engine_says_went_wrong_is_the_error() -> Outcome {
         let refusal = answer("400 Bad Request", r#"{"error":"no audio in the file"}"#);
         let (address, _engine) = fake_engine(vec![refusal], Duration::ZERO)?;
@@ -1178,6 +1448,172 @@ mod tests {
         );
         // Each request carries its own stretch, not the dictation so far.
         assert!(requests.iter().all(|request| request.len() < 4 * 32_000));
+        Ok(())
+    }
+
+    #[test]
+    fn an_engine_that_cannot_be_led_is_handed_the_dictation_whole() -> Outcome {
+        struct Unled(SocketAddr);
+
+        impl Inference for Unled {
+            fn infer(&self, fields: &[(&str, &str)], wav: &[u8]) -> Result<Value> {
+                ask(self.0, fields, wav)
+            }
+
+            fn led(&self) -> bool {
+                false
+            }
+        }
+
+        // Quick and free, and there is a pause to cut at: it is not cut,
+        // because the two halves would come back as two sentences.
+        let answers = vec![heard(" We meet on Thursday at ten.")];
+        let (address, engine) = fake_engine(answers, Duration::ZERO)?;
+        let engine_of_session: Arc<dyn Inference> = Arc::new(Unled(address));
+        let mut session =
+            LocalSession::at_pauses(engine_of_session, vec!["en".into()], Arc::default())?;
+        let audio = [voice(3000), room(700), voice(2500)].concat();
+        assert!(speak(&mut session, &audio)?.is_empty());
+        assert_eq!(finish(&mut session)?, ["We meet on Thursday at ten."]);
+        assert_eq!(engine.join().unwrap_or_default().len(), 1);
+
+        // Someone who speaks for minutes on end is not held back whole: at
+        // the first pause after two minutes what was said so far is sent,
+        // so that no request is longer than the engine can answer in time.
+        let answers = vec![heard("The first two minutes."), heard("And the rest.")];
+        let (address, engine) = fake_engine(answers, Duration::ZERO)?;
+        let engine_of_session: Arc<dyn Inference> = Arc::new(Unled(address));
+        let mut session =
+            LocalSession::at_pauses(engine_of_session, vec!["en".into()], Arc::default())?;
+        // Sentences of three seconds with half a second between them.
+        let talk = |sentences| [voice(3000), room(500)].concat().repeat(sentences);
+        let long = [talk(17), room(700), talk(19), room(700)].concat();
+        let mut typed = speak(&mut session, &long)?;
+        typed.extend(speak(&mut session, &[voice(2500), room(400)].concat())?);
+        typed.extend(finish(&mut session)?);
+        assert_eq!(typed.concat(), "The first two minutes. And the rest.");
+        let requests = engine.join().unwrap_or_default();
+        assert_eq!(requests.len(), 2);
+        // The pause after one minute was not one to cut at.
+        let seconds = |request: &Vec<u8>| request.len() / (2 * SAMPLE_RATE_HZ as usize);
+        assert!((125..=128).contains(&seconds(&requests[0])));
+        assert!(seconds(&requests[1]) < 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_long_recording_is_given_longer_but_not_for_ever() {
+        let recording = |seconds: usize| patience(seconds * 2 * SAMPLE_RATE_HZ as usize);
+        assert_eq!(recording(0), RECOGNIZE_TIMEOUT);
+        assert_eq!(recording(60), Duration::from_secs(300));
+        // The longest stretch an engine that takes them whole is handed.
+        assert_eq!(recording(125), Duration::from_secs(430));
+        // An engine that has not answered after ten minutes is ended.
+        assert_eq!(recording(30 * 60), RECOGNIZE_LIMIT);
+        assert!(RECOGNIZE_LIMIT < IDLE_UNLOAD);
+    }
+
+    /// A server of the second engine, or of the first, that is not started.
+    fn unstarted(second: bool) -> Server {
+        Server {
+            program: PathBuf::from("no-such-engine"),
+            model_file: PathBuf::from("no-such-model"),
+            ears: second.then(|| PathBuf::from("no-such-ears")),
+            name: "a test",
+            gpu: false,
+            running: Mutex::default(),
+        }
+    }
+
+    #[test]
+    fn an_engine_that_does_not_listen_yet_is_asked_again_soon() -> Outcome {
+        // A port nothing listens at: Windows takes two seconds to say so.
+        let nowhere = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?.local_addr()?;
+        for second in [false, true] {
+            let asked = Instant::now();
+            assert!(!unstarted(second).loaded(nowhere, "a2V5"));
+            let took = asked.elapsed();
+            assert!(took < Duration::from_secs(1), "{second}: {took:?}");
+        }
+
+        // The second engine listens before its model is loaded, and says
+        // when it is, to whoever shows its key. Each look is a connection
+        // to see that it listens, and one to ask.
+        let nothing = || answer("200 OK", "");
+        let loading = answer(
+            "503 Service Unavailable",
+            r#"{"error":{"message":"Loading"}}"#,
+        );
+        let ready = answer("200 OK", r#"{"status":"ok"}"#);
+        let (address, engine) =
+            fake_engine(vec![nothing(), loading, nothing(), ready], Duration::ZERO)?;
+        let server = unstarted(true);
+        assert!(!server.loaded(address, "a2V5"));
+        assert!(server.loaded(address, "a2V5"));
+        let requests = engine.join().unwrap_or_default();
+        let asked = String::from_utf8_lossy(&requests[3]).into_owned();
+        assert!(asked.starts_with("GET /health HTTP/1.1\r\n"), "{asked}");
+        assert!(asked.contains("\r\nAuthorization: Bearer a2V5\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_second_engine_gets_a_key_of_its_own_and_none_of_the_users_settings() -> Outcome {
+        let mut command = Command::new("no-such-engine");
+        // What someone with a llama.cpp of their own may have set.
+        let set = [
+            "Path",
+            "LLAMA_API_KEY",
+            "llama_arg_ctx_size",
+            "LLAMA_ARG_N_GPU_LAYERS",
+            "LLAMAFILE",
+            "HF_TOKEN",
+        ];
+        let key = secret()?;
+        listener(
+            &mut command,
+            Path::new("ears.gguf"),
+            false,
+            &key,
+            set.into_iter().map(OsString::from),
+        );
+        let text = |value: &std::ffi::OsStr| value.to_string_lossy().to_ascii_uppercase();
+        let mut changed: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    text(name),
+                    value.map(|value| value.to_string_lossy().into()),
+                )
+            })
+            .collect();
+        changed.sort();
+        assert_eq!(
+            changed,
+            [
+                ("LLAMA_API_KEY".to_owned(), Some(key.clone())),
+                ("LLAMA_ARG_CTX_SIZE".to_owned(), None),
+                ("LLAMA_ARG_N_GPU_LAYERS".to_owned(), None),
+            ]
+        );
+        let args: Vec<String> = command.get_args().map(text).collect();
+        assert_eq!(
+            args,
+            [
+                "--MMPROJ",
+                "EARS.GGUF",
+                "--NO-WEBUI",
+                "-NP",
+                "1",
+                "--DEVICE",
+                "NONE"
+            ]
+        );
+        // The key is on no command line, where any program could read it,
+        assert!(!args.contains(&key.to_ascii_uppercase()));
+        // and every start has another.
+        assert_eq!(key.len(), 24);
+        assert_ne!(secret()?, key);
         Ok(())
     }
 
@@ -1291,6 +1727,7 @@ mod tests {
         let server = Arc::new(Server {
             program: PathBuf::from(setting("VINPUT_TEST_ENGINE")?),
             model_file: PathBuf::from(setting("VINPUT_TEST_MODEL")?),
+            ears: std::env::var_os("VINPUT_TEST_EARS").map(PathBuf::from),
             name: "a test",
             gpu: std::env::var_os("VINPUT_TEST_GPU").is_some(),
             running: Mutex::default(),
@@ -1386,7 +1823,7 @@ mod tests {
         /// A stand-in as a loaded engine, handed out just now.
         fn engine() -> std::io::Result<(Running, Arc<Bell>)> {
             let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
-            let (engine, watcher) = Running::of(stand_in()?, address);
+            let (engine, watcher) = Running::of(stand_in()?, address, String::new());
             assert!(engine.may_sleep, "the stand-in is in no job");
             Ok((engine, watcher))
         }
@@ -1397,6 +1834,7 @@ mod tests {
             Arc::new(Server {
                 program: PathBuf::from("no-such-engine"),
                 model_file: PathBuf::from("no-such-model"),
+                ears: None,
                 name: "a test",
                 gpu: false,
                 running: Mutex::new(Some(engine)),
@@ -1575,7 +2013,7 @@ mod tests {
                 assert!(soon(|| asleep(&server)));
                 // The same engine, running, and not a new one: starting one
                 // fails here.
-                assert_eq!(server.address().ok(), Some(address));
+                assert_eq!(server.address().ok().map(|door| door.0), Some(address));
                 assert!(with(&server, |engine| engine.is_some_and(|engine| {
                     engine.asleep.is_none() && engine.child.id() == process
                 })));
@@ -1743,18 +2181,16 @@ mod tests {
             /// One request as `infer` makes it: the time to get the address,
             /// which resumes, the time to the answer after that, and the text.
             fn request(&self) -> Result<(Duration, Duration, String)> {
-                let failed = |err: std::io::Error| Error::Transcription(err.to_string());
                 let fields = [("response_format", "json"), ("language", "en")];
-                let body = multipart(&fields, &self.wav);
                 let started = Instant::now();
-                let address = self.server.address()?;
+                let (address, key) = self.server.address()?;
                 let resumed = started.elapsed();
-                let (status, reply) = post(address, "/inference", &body).map_err(failed)?;
+                let reply =
+                    self.server
+                        .ask((address, &key), &fields, &self.wav, RECOGNIZE_TIMEOUT)?;
                 let answered = started.elapsed().saturating_sub(resumed);
                 answer(&self.server);
-                let reply: Value = serde_json::from_slice(&reply).unwrap_or_default();
                 let text = clean(reply["text"].as_str().unwrap_or_default());
-                assert_eq!(status, 200);
                 assert!(!text.is_empty());
                 Ok((resumed, answered, text))
             }
@@ -1842,6 +2278,7 @@ mod tests {
                 server: Arc::new(Server {
                     program: PathBuf::from(setting("VINPUT_TEST_ENGINE")?),
                     model_file: PathBuf::from(setting("VINPUT_TEST_MODEL")?),
+                    ears: std::env::var_os("VINPUT_TEST_EARS").map(PathBuf::from),
                     name: "a test",
                     gpu: std::env::var_os("VINPUT_TEST_GPU").is_some(),
                     running: Mutex::default(),

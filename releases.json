@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.4.4",
+    "published": "2026-10-06",
+    "notes": [
+      "Two new models that run on this PC: Qwen3-ASR 1.7B and 0.6B, in 30 languages (not Slovenian)",
+      "A dictation left running stops by itself after 30 minutes of silence, never while a key is held",
+      "Settings, General, Stop after silence sets that time",
+      "Models says when a model does not know one of your languages",
+      "When VinPUT Pro carries on with a model on this PC, it picks only one that knows your languages"
+    ]
+  },
+  {
     "version": "0.4.3",
     "published": "2026-10-06",
     "notes": [

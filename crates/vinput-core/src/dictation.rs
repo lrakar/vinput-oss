@@ -8,7 +8,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, Scope};
 
-use crate::audio::{ArmedMicrophone, AudioSource, LevelMeter, Metered, SAMPLE_RATE_HZ, StopHandle};
+use crate::audio::{
+    ArmedMicrophone, AudioSource, LevelMeter, Metered, SAMPLE_RATE_HZ, StopHandle, UntilQuiet,
+};
 use crate::inject::{SendInputSink, TextSink};
 use crate::session::{Controller, Ended, Failure, Outcome, Target};
 use crate::settings::{Settings, SpeechConfig};
@@ -97,19 +99,28 @@ struct Options {
     /// stopped.
     start_sound: bool,
     stop_sound: bool,
+    /// After how many minutes without a sound a dictation stops by itself.
+    stop_after_minutes: u32,
     /// The configured microphone. For a while after a session its stream is
     /// kept, stopped, so that the next session only has to start it.
     microphone: Arc<ArmedMicrophone>,
+    /// Whether the key that started the session is still being held down.
+    /// Whoever holds a key is there, so such a dictation is not ended for
+    /// being quiet; one that goes on after a tap, or was started by a
+    /// program, is.
+    held: Arc<AtomicBool>,
     memo_dir: String,
     memo_to_clipboard: bool,
 }
 
 impl Options {
-    fn of(settings: &Settings, microphone: Arc<ArmedMicrophone>) -> Self {
+    fn of(settings: &Settings, microphone: Arc<ArmedMicrophone>, held: Arc<AtomicBool>) -> Self {
         Self {
+            held,
             languages: settings.languages.clone(),
             start_sound: settings.ready_sound,
             stop_sound: settings.stop_sound,
+            stop_after_minutes: settings.stop_after_minutes,
             microphone,
             memo_dir: settings.memo_dir.clone(),
             memo_to_clipboard: settings.memo_to_clipboard,
@@ -156,7 +167,7 @@ impl Dictation {
         Self {
             speech: stt::connect_in_background(settings),
             speech_config: settings.speech_config(),
-            options: Options::of(settings, microphone),
+            options: Options::of(settings, microphone, Arc::default()),
             meter: LevelMeter::new(),
             failures: Arc::default(),
             outcomes: Arc::default(),
@@ -230,15 +241,23 @@ impl Controller for Dictation {
         }
     }
 
+    fn held(&mut self, held: bool) {
+        self.options.held.store(held, Ordering::Relaxed);
+    }
+
     fn stop(&mut self) {
         // The worker is left to flush and type its last words on its own; letting
         // go of it here means a new session can start straight away.
         if let Some(active) = self.active.take() {
+            // A dictation nobody spoke into has stopped by itself, and
+            // makes the sound of it when its microphone is let go of,
+            // though its last words may still be on their way.
+            let stopped = active.stop.is_stopped();
             active.stop.stop();
             // After the microphone was told to stop, so that it hears as
             // little of the sound as can be. A session that had ended by
             // itself has nothing left to stop.
-            if self.options.stop_sound && !active.ended.load(Ordering::Acquire) {
+            if self.options.stop_sound && !stopped && !active.ended.load(Ordering::Acquire) {
                 sound::play(Cue::Stop);
             }
             self.finishing
@@ -297,7 +316,8 @@ impl Controller for Dictation {
     fn configure(&mut self, settings: &Settings, reconnect: bool) {
         let microphone = Arc::clone(&self.options.microphone);
         microphone.set_microphone(&settings.microphone);
-        self.options = Options::of(settings, microphone);
+        let held = Arc::clone(&self.options.held);
+        self.options = Options::of(settings, microphone, held);
         let speech_config = settings.speech_config();
         if reconnect || speech_config != self.speech_config {
             // Sessions still running keep the provider they started with.
@@ -373,28 +393,63 @@ fn run_session(
     if target == Target::Memo {
         return record_memo(options, stop, meter, id, cancelled);
     }
-    let microphone = || listen(options, stop, meter);
-    if matches!(target, Target::Capture | Target::Search) {
-        let mut sink = Collecting::default();
-        transcribe(speech, &options.languages, microphone, &mut sink)?;
-        let text = sink.text.trim().to_owned();
-        return Ok(Some(if target == Target::Search {
-            Outcome::Search { text }
-        } else {
-            // Sent even when empty, so whoever asked knows the session is over.
-            Outcome::Captured { text, id }
-        }));
-    }
-    let mut sink = Counting {
-        sink: UnlessCancelled {
-            sink: SendInputSink::new(),
-            cancelled,
-        },
-        typed: 0,
+    let alone = AtomicBool::new(false);
+    let microphone = || {
+        let microphone = listen(options, stop.clone(), meter)?;
+        Ok(while_spoken_to(microphone, options, stop, &alone))
     };
-    transcribe(speech, &options.languages, microphone, &mut sink)?;
-    if target == Target::FocusedEnter && sink.typed > 0 {
-        sink.type_text("\n")?;
+    let sink = UnlessCancelled {
+        sink: SendInputSink::new(),
+        cancelled,
+    };
+    dictate(
+        speech,
+        &options.languages,
+        microphone,
+        (target, id),
+        &alone,
+        sink,
+    )
+}
+
+/// Recognizes what `listen` hears and puts the text where `target` says:
+/// typed into `sink`, or returned for the host to pass on.
+///
+/// `alone` says, once the microphone has ended, whether the dictation ended
+/// by itself because nobody spoke into it. Nobody is at the keyboard then,
+/// and whatever has the focus by now is not what the dictation was meant
+/// for. So nothing is done in the user's name: no Enter is pressed after
+/// the text, and no search is opened. Nothing is lost either: the text is
+/// typed, as that of a plain dictation is. A program that asked for the
+/// text is handed it as always.
+fn dictate<A: AudioSource>(
+    speech: &dyn SpeechProvider,
+    languages: &[String],
+    listen: impl FnOnce() -> Result<A>,
+    (target, id): (Target, Option<String>),
+    alone: &AtomicBool,
+    sink: impl TextSink,
+) -> Result<Option<Outcome>> {
+    let mut sink = Counting { sink, typed: 0 };
+    if !matches!(target, Target::Capture | Target::Search) {
+        transcribe(speech, languages, listen, &mut sink)?;
+        if target == Target::FocusedEnter && sink.typed > 0 && !alone.load(Ordering::Acquire) {
+            sink.type_text("\n")?;
+        }
+        return Ok(None);
+    }
+    let mut kept = Collecting::default();
+    transcribe(speech, languages, listen, &mut kept)?;
+    let text = kept.text.trim().to_owned();
+    if target == Target::Capture {
+        // Sent even when empty, so whoever asked knows the session is over.
+        return Ok(Some(Outcome::Captured { text, id }));
+    }
+    if !alone.load(Ordering::Acquire) {
+        return Ok(Some(Outcome::Search { text }));
+    }
+    if !text.is_empty() {
+        sink.type_text(&text)?;
     }
     Ok(None)
 }
@@ -403,6 +458,32 @@ fn run_session(
 /// is still busy with.
 fn listen(options: &Options, stop: StopHandle, meter: LevelMeter) -> Result<impl AudioSource> {
     Ok(Metered::new(options.microphone.open(stop)?, meter))
+}
+
+/// A microphone for a dictation, which is over when it is stopped or when
+/// nobody has spoken into it for as long as the settings allow: one that
+/// was started with a tap and forgotten does not listen for good. It is
+/// then stopped as a key stops it, so the microphone is let go of at once,
+/// whatever the recognizer still has to do; the sound of the stop follows
+/// that, `alone` says how it ended, what was said before is typed, and the
+/// key starts the next one. While the key is held down it is never ended.
+fn while_spoken_to<'a>(
+    microphone: impl AudioSource + 'a,
+    options: &'a Options,
+    stop: StopHandle,
+    alone: &'a AtomicBool,
+) -> impl AudioSource + 'a {
+    let minutes = options.stop_after_minutes;
+    let held = || options.held.load(Ordering::Relaxed);
+    UntilQuiet::new(microphone, minutes, stop, held, move || {
+        alone.store(true, Ordering::Release);
+        log::write(&format!(
+            "nothing was said for {minutes} min: the dictation has ended"
+        ));
+        if options.stop_sound {
+            sound::play(Cue::Stop);
+        }
+    })
 }
 
 /// Recognizes what a microphone hears and hands the text to `sink`, without
@@ -1162,7 +1243,7 @@ mod tests {
         let mut dictation = Dictation {
             speech: Arc::new(Loading::new(false, false)),
             speech_config: settings.speech_config(),
-            options: Options::of(&settings, microphone),
+            options: Options::of(&settings, microphone, Arc::default()),
             meter: LevelMeter::new(),
             failures: Arc::default(),
             outcomes: Arc::default(),
@@ -1313,6 +1394,125 @@ mod tests {
             assert_eq!(sink.text, "Locally.", "{script:?}");
         }
         Ok(())
+    }
+
+    /// A microphone in a still room, heard until it is stopped.
+    struct Still(StopHandle);
+
+    impl AudioSource for Still {
+        fn read(&mut self, buf: &mut [i16]) -> Result<usize> {
+            if self.0.is_stopped() {
+                return Ok(0);
+            }
+            buf.fill(0);
+            Ok(buf.len())
+        }
+    }
+
+    /// Text typed on the thread of a session, as the test sees it.
+    #[derive(Default, Clone)]
+    struct Seen(Arc<Mutex<Vec<String>>>);
+
+    impl TextSink for Seen {
+        fn type_text(&mut self, text: &str) -> Result<()> {
+            let mut seen = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            seen.push(text.to_owned());
+            Ok(())
+        }
+    }
+
+    /// Options that allow a minute without a sound.
+    fn a_minute() -> Options {
+        let settings = Settings {
+            stop_after_minutes: 1,
+            ..Settings::default()
+        };
+        let microphone = Arc::new(ArmedMicrophone::new(&settings.microphone));
+        Options::of(&settings, microphone, Arc::default())
+    }
+
+    /// What a dictation to `target`, of which the recognizer makes "end",
+    /// types and leaves for the host: one that is `forgotten` until it ends
+    /// by itself, or one that is stopped with its key.
+    fn dictated(target: Target, forgotten: bool) -> (Vec<String>, Option<Outcome>) {
+        let provider = Loading::new(false, false);
+        provider.gate.open();
+        let options = a_minute();
+        let stop = StopHandle::new();
+        if !forgotten {
+            stop.stop();
+        }
+        let alone = AtomicBool::new(false);
+        let listen = || Ok(while_spoken_to(Still(stop.clone()), &options, stop, &alone));
+        let seen = Seen::default();
+        let id = Some("my-42".to_owned());
+        let left = dictate(&provider, &[], listen, (target, id), &alone, seen.clone());
+        assert!(left.is_ok(), "{left:?}");
+        assert_eq!(alone.load(Ordering::Acquire), forgotten);
+        let typed = seen
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        (typed, left.ok().flatten())
+    }
+
+    #[test]
+    fn a_dictation_that_ended_by_itself_presses_no_enter_and_opens_no_search() {
+        let end = || vec!["end".to_owned()];
+        let captured = Some(Outcome::Captured {
+            text: "end".to_owned(),
+            id: Some("my-42".to_owned()),
+        });
+        // Stopped with its key, each does what its key is for.
+        assert_eq!(dictated(Target::Focused, false), (end(), None));
+        assert_eq!(
+            dictated(Target::FocusedEnter, false),
+            (vec!["end".to_owned(), "\n".to_owned()], None)
+        );
+        let search = Outcome::Search {
+            text: "end".to_owned(),
+        };
+        assert_eq!(dictated(Target::Search, false), (vec![], Some(search)));
+        assert_eq!(dictated(Target::Capture, false), (vec![], captured.clone()));
+
+        // Forgotten, with nobody there: the text is typed and that is all.
+        assert_eq!(dictated(Target::Focused, true), (end(), None));
+        assert_eq!(dictated(Target::FocusedEnter, true), (end(), None));
+        assert_eq!(dictated(Target::Search, true), (end(), None));
+        // The program that asked for the text still gets it.
+        assert_eq!(dictated(Target::Capture, true), (vec![], captured));
+    }
+
+    #[test]
+    fn a_dictation_is_not_ended_for_being_quiet_while_its_key_is_held() {
+        let mut dictation = Dictation {
+            speech: Arc::new(Loading::new(false, false)),
+            speech_config: Settings::default().speech_config(),
+            options: a_minute(),
+            meter: LevelMeter::new(),
+            failures: Arc::default(),
+            outcomes: Arc::default(),
+            active: None,
+            finishing: Vec::new(),
+            notify: None,
+        };
+        let options = dictation.options.clone();
+        let stop = StopHandle::new();
+        let alone = AtomicBool::new(false);
+        let mut microphone = while_spoken_to(Still(stop.clone()), &options, stop.clone(), &alone);
+        let mut buf = [0i16; 1600];
+        let mut minutes = |minutes: usize| {
+            (0..minutes * 600).all(|_| microphone.read(&mut buf).is_ok_and(|read| read > 0))
+        };
+        // The key is down: three minutes of nothing, and it listens on.
+        dictation.held(true);
+        assert!(minutes(3));
+        assert!(!stop.is_stopped());
+        // Let go after a tap, it goes on by itself, for a minute of nothing.
+        dictation.held(false);
+        assert!(!minutes(2));
+        assert!(stop.is_stopped() && alone.load(Ordering::Acquire));
     }
 
     #[test]

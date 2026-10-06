@@ -117,8 +117,10 @@ pub(super) struct OnDisk {
 }
 
 impl OnDisk {
-    /// Reads it off the folders, and off the installs under way.
-    fn read(installer: &Installer, gpu: bool) -> Self {
+    /// Reads it off the folders, and off the installs under way. `wanted`
+    /// says whether the model in use has an engine with a build of its own
+    /// for `gpu` ([`models::wants_engine`]).
+    fn read(installer: &Installer, gpu: bool, wanted: bool) -> Self {
         Self {
             gpu,
             card_engine: models::engine_program(true, Runner::Server).is_some(),
@@ -126,8 +128,9 @@ impl OnDisk {
                 .into_iter()
                 .map(|model| (model, installer.status(model, gpu)))
                 .collect(),
-            // Without a local model on this PC no engine is needed.
-            engine: if models::any_local_model() {
+            // No engine is fetched on its own for a PC without a local
+            // model, nor for a model that brings the only engine it has.
+            engine: if wanted {
                 installer.engine_state(gpu)
             } else {
                 EngineState::Ready
@@ -209,10 +212,11 @@ impl Host {
     pub(super) fn picture(&mut self) -> wire::View {
         let gpu = self.settings.use_gpu();
         let installer = &self.installer;
-        let on_disk = self
-            .slow
-            .on_disk(gpu, installer.is_busy(), || OnDisk::read(installer, gpu));
         let settings = &self.settings;
+        let on_disk = self.slow.on_disk(gpu, installer.is_busy(), || {
+            let wanted = models::wants_engine(settings.provider, &settings.model);
+            OnDisk::read(installer, gpu, wanted)
+        });
         let updates = &self.updates;
         view::build(&Facts {
             settings,

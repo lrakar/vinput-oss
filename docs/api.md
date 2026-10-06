@@ -102,6 +102,8 @@ Every command but `hello` takes an optional `id`, a string of up to 128 characte
 
 A command that works has no reply of its own: the `state` event that follows, carrying your `id`, is the confirmation. A command that cannot be carried out is answered with an `error` event to you alone. A session started over the API runs until it is stopped, by `stop`, `toggle` or a press of a Vinput hotkey. For push-to-talk, send `start` on key down and `stop` on key up.
 
+A dictation also ends by itself when nothing has been said for the time set under Settings, General, Stop after silence: 30 minutes unless the user chose 1, 5, 15 or 60. This holds for every session started over the API in a mode other than `memo`, however your program means it; only a Vinput hotkey that is held down keeps a silent dictation going. Such an end looks like any other: the `state` event says `idle`, and a `capture` session sends its `dictation` event with what was said before the silence, or `""`. Because nobody may be at the PC by then, a `type-enter` session that ends this way types its text without pressing Enter, and a `search` session types its text instead of opening a search.
+
 While a hotkey is being set in Vinput's settings window (the field that takes the new key has the keyboard), `start`, and a `toggle` that would start a session, are answered with a `settings_open` error; a dictation would otherwise be typed into that field. `stop` and `hello` are never refused. Up to 0.2.5 every command was answered this way for as long as the settings window was open; since 0.3.0 settings take effect as they are made, the hotkeys stay on while the window is open, and so does the API. A client that handles `settings_open` needs no change: it just sees it far less often.
 
 ## Example

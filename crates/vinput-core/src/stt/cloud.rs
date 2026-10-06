@@ -1845,7 +1845,7 @@ mod tests {
         });
         let (account, memory) = fake.account();
         memory.sign_in(&fake);
-        let standby = Arc::new(Standby::new(|_, _| None));
+        let standby = Arc::new(Standby::new(|_, _, _| None));
         let speech = CloudSpeech::with(account, quick(), Arc::clone(&standby))?;
         for _ in 0..2 {
             let (typed, finished) = dictate(&speech, 2);

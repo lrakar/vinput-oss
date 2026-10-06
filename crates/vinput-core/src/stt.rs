@@ -22,6 +22,7 @@ pub use cloud::{CloudSpeech, Timings, measure};
 pub use gemini::{GeminiConfig, GeminiSpeech};
 pub use google::{GoogleConfig, GoogleSession, GoogleSpeech};
 pub use local::LocalSpeech;
+pub(crate) use local::languages::name as language_name;
 pub use standby::Standby;
 
 use crate::settings::Settings;

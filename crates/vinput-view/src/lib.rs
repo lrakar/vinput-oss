@@ -183,6 +183,8 @@ pub struct Settings {
     pub ready_sound: bool,
     /// Whether a short sound plays when listening stops.
     pub stop_sound: bool,
+    /// After how many minutes without a sound a dictation stops by itself.
+    pub stop_after_minutes: u32,
     /// Whether Vinput looks for newer versions by itself.
     pub check_updates: bool,
     /// Whether local models run on the graphics card.
@@ -220,6 +222,9 @@ pub enum Change {
     ReadySound(bool),
     /// See [`Settings::stop_sound`].
     StopSound(bool),
+    /// See [`Settings::stop_after_minutes`]. A time that is not on offer is
+    /// left unmade.
+    StopAfterSilence(u32),
     /// See [`Settings::check_updates`].
     CheckUpdates(bool),
     /// See [`Settings::graphics_card`].
@@ -261,6 +266,7 @@ pub struct Models {
 /// One speech model.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(clippy::struct_excessive_bools, reason = "independent facts")]
 pub struct Model {
     /// What [`Command::UseModel`] and its like name it by.
     pub id: String,
@@ -281,6 +287,11 @@ pub struct Model {
     pub google: Option<GoogleService>,
     /// Whether dictation uses it.
     pub in_use: bool,
+    /// The names of the configured languages it does not know, such as
+    /// `Slovenian`: it would type something else than was said in them.
+    pub lacks: Vec<String>,
+    /// Whether it knows none of the configured languages at all.
+    pub knows_none: bool,
     /// Where it stands.
     pub state: ModelState,
 }

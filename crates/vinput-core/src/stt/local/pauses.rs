@@ -107,6 +107,11 @@ impl Pauses {
         None
     }
 
+    /// How many samples the stretch being spoken has come to.
+    pub(super) fn held(&self) -> usize {
+        self.stretch.len()
+    }
+
     /// What is left when the dictation ends: all of it, unless it follows a
     /// cut and nothing in it was said, however softly.
     pub(super) fn rest(&mut self) -> Option<Rest> {

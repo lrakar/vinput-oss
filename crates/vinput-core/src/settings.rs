@@ -24,6 +24,13 @@ pub const ENV_PROJECT: &str = "VINPUT_GCP_PROJECT";
 const VK_F1: u16 = 0x70;
 const VK_F2: u16 = 0x71;
 
+/// The times a dictation may be given before it stops for want of a sound,
+/// in minutes: what `stop_after_silence` in the file may say.
+pub const STOP_AFTER_MINUTES: [u32; 5] = [1, 5, 15, 30, 60];
+/// The one in use until another is chosen. Long enough to read or think for
+/// a while in the middle of a dictation and find it as it was left.
+pub const DEFAULT_STOP_AFTER_MINUTES: u32 = 30;
+
 /// Everything the user can configure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[expect(clippy::struct_excessive_bools, reason = "independent on/off switches")]
@@ -44,6 +51,9 @@ pub struct Settings {
     pub ready_sound: bool,
     /// Whether a short sound plays when Vinput stops listening.
     pub stop_sound: bool,
+    /// After how many minutes without a sound a dictation stops by itself:
+    /// one of [`STOP_AFTER_MINUTES`].
+    pub stop_after_minutes: u32,
     /// The microphone to listen with, as Windows identifies it. Empty means
     /// the one Windows uses by default, whichever that is at the time.
     pub microphone: String,
@@ -95,6 +105,7 @@ impl Default for Settings {
             autostart: true,
             ready_sound: true,
             stop_sound: true,
+            stop_after_minutes: DEFAULT_STOP_AFTER_MINUTES,
             microphone: String::new(),
             provider: ProviderKind::default(),
             model: String::new(),
@@ -162,6 +173,15 @@ impl Settings {
                 "autostart" => settings.autostart = flag(),
                 "ready_sound" => settings.ready_sound = flag(),
                 "stop_sound" => settings.stop_sound = flag(),
+                "stop_after_silence" => {
+                    if let Some(minutes) = value
+                        .parse()
+                        .ok()
+                        .filter(|minutes| STOP_AFTER_MINUTES.contains(minutes))
+                    {
+                        settings.stop_after_minutes = minutes;
+                    }
+                }
                 "microphone" => value.clone_into(&mut settings.microphone),
                 "provider" => {
                     if let Ok(provider) = value.parse() {
@@ -226,7 +246,8 @@ impl Settings {
              search_url = {}\n\
              microphone = {}\n\
              last_local_model = {}\n\
-             stop_sound = {}\n",
+             stop_sound = {}\n\
+             stop_after_silence = {}\n",
             self.hotkey,
             optional_hotkey(self.hotkey_enter),
             optional_hotkey(self.hotkey_memo),
@@ -247,6 +268,7 @@ impl Settings {
             self.microphone,
             self.last_local_model,
             self.stop_sound,
+            self.stop_after_minutes,
         );
         // Written only while it is on: the file of someone who was never
         // owed a welcome, or has had it, says nothing of it.
@@ -455,6 +477,20 @@ mod tests {
     }
 
     #[test]
+    fn a_dictation_is_stopped_after_one_of_the_times_on_offer_and_half_an_hour_otherwise() {
+        assert_eq!(Settings::default().stop_after_minutes, 30);
+        assert_eq!(Settings::parse("").stop_after_minutes, 30);
+        for minutes in STOP_AFTER_MINUTES {
+            let settings = Settings::parse(&format!("stop_after_silence = {minutes}"));
+            assert_eq!(settings.stop_after_minutes, minutes);
+        }
+        for odd in ["0", "7", "-5", "soon", ""] {
+            let settings = Settings::parse(&format!("stop_after_silence = {odd}"));
+            assert_eq!(settings.stop_after_minutes, 30, "{odd:?}");
+        }
+    }
+
+    #[test]
     fn custom_values_survive_a_round_trip() {
         let settings = Settings {
             hotkey: Hotkey {
@@ -468,6 +504,7 @@ mod tests {
             autostart: false,
             ready_sound: false,
             stop_sound: false,
+            stop_after_minutes: 5,
             microphone: r"{0.0.1.00000000}.{6c1f3d2e-0d3a-4c58-9a51-1f0f2b8e7a10}".into(),
             provider: ProviderKind::Local,
             model: "whisper-base".into(),

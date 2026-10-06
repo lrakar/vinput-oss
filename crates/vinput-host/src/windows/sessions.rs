@@ -31,7 +31,7 @@ use super::{Host, SESSION_ENDED, TICK_MS, TICK_TIMER_ID, hotkeys};
 use crate::indicator::Indicator;
 use crate::win::{is_down, open};
 use vinput_core::api::{ClientId, ErrorCode, Event};
-use vinput_core::session::{Action, Controller, Failure, Outcome, Target};
+use vinput_core::session::{Action, Controller, Failure, Outcome, Target, Trigger};
 use vinput_core::settings::{Settings, data_dir};
 use vinput_core::stt::{GeminiConfig, ProviderKind};
 use vinput_core::{log, models, search};
@@ -149,6 +149,9 @@ impl Host {
                 self.held_vk = held_vk;
                 self.on_screen = !target.types_at_caret();
                 self.session = Some((target, id.clone()));
+                // A key that is down may be held for the whole dictation;
+                // what a program starts runs until it is stopped.
+                controller.held(self.trigger.is_held());
                 controller.start(target, id);
                 // The indicator answers the key press itself: its first
                 // frame is not left to the first tick. The caret is looked
@@ -332,7 +335,7 @@ impl Host {
         }
         if self.trigger.is_held()
             && self.held_vk.is_none_or(|vk| !is_down(vk))
-            && self.trigger.key_up(Instant::now()) == Action::Stop
+            && let_go(&mut self.trigger, Instant::now(), controller)
         {
             self.stop(controller);
             return;
@@ -532,6 +535,18 @@ fn lacking(
     why.map(|why| (Page::Models, why))
 }
 
+/// The key that started the session has come up. Says whether that stops
+/// the session, as it does after the key was held. After a tap the session
+/// goes on with nobody holding it, which the controller is told: from then
+/// on it may end by itself when nothing is said for long.
+fn let_go(trigger: &mut Trigger, now: Instant, controller: &mut dyn Controller) -> bool {
+    if trigger.key_up(now) == Action::Stop {
+        return true;
+    }
+    controller.held(false);
+    false
+}
+
 /// Whether a key press that cannot dictate turns Settings to `page` and
 /// brings it to the front. A window that is not `open` is opened there. One
 /// that is open is turned once: not to the page a press `led` to before,
@@ -589,6 +604,8 @@ mod tests {
         finishing: usize,
         /// Whether what is running was called off.
         cancelled: bool,
+        /// What it was last told of the key being held.
+        held: Option<bool>,
         outcomes: Vec<Outcome>,
         failures: Vec<Failure>,
         notify: Option<Ended>,
@@ -638,6 +655,10 @@ mod tests {
         fn start(&mut self, _target: Target, _id: Option<String>) {
             self.active = true;
             self.cancelled = false;
+        }
+
+        fn held(&mut self, held: bool) {
+            self.held = Some(held);
         }
 
         fn stop(&mut self) {
@@ -843,6 +864,48 @@ mod tests {
         let lacks = lack(&set_up, Some("no"), false, false);
         assert_eq!(lacks.0, None);
         assert!(!lacks.1.any());
+    }
+
+    #[test]
+    fn a_model_that_does_not_know_the_languages_does_not_stand_in_the_way() {
+        // It types something, if not well, and Settings say so on its row:
+        // a press is not turned away for it.
+        let mut qwen = choosing(ProviderKind::Local, "qwen3-asr-0.6b");
+        qwen.languages = vec!["sl-SI".to_owned()];
+        let model = models::find(ProviderKind::Local, &qwen.model);
+        assert!(model.is_some_and(|model| model.reach(&qwen.languages) == 0));
+        assert_eq!(lack(&qwen, None, true, false).0, None);
+    }
+
+    #[test]
+    fn only_a_key_that_is_held_keeps_a_quiet_dictation_from_ending() {
+        let now = Instant::now();
+        let later = |millis| now + std::time::Duration::from_millis(millis);
+        // What `Host::act` tells the controller at a start.
+        let start = |trigger: &Trigger, fake: &mut Fake| fake.held(trigger.is_held());
+
+        // A key goes down: held, as far as anyone knows yet.
+        let (mut trigger, mut fake) = (Trigger::default(), Fake::default());
+        trigger.key_down(now, Target::Focused);
+        start(&trigger, &mut fake);
+        assert_eq!(fake.held, Some(true));
+        // It was only tapped: the dictation goes on by itself.
+        assert!(!let_go(&mut trigger, later(100), &mut fake));
+        assert_eq!(fake.held, Some(false));
+        assert!(trigger.is_running() && !trigger.is_held());
+
+        // Held and let go: that stops it, and it was held to the end.
+        let (mut trigger, mut fake) = (Trigger::default(), Fake::default());
+        trigger.key_down(now, Target::FocusedEnter);
+        start(&trigger, &mut fake);
+        assert!(let_go(&mut trigger, later(5000), &mut fake));
+        assert_eq!(fake.held, Some(true));
+
+        // A program asks for a session: nobody holds anything.
+        let (mut trigger, mut fake) = (Trigger::default(), Fake::default());
+        trigger.start(Target::Capture);
+        start(&trigger, &mut fake);
+        assert_eq!(fake.held, Some(false));
     }
 
     #[test]

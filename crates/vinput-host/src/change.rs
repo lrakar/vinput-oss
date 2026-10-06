@@ -12,7 +12,7 @@ use std::path::Path;
 
 use vinput_core::keys::Hotkey;
 use vinput_core::search;
-use vinput_core::settings::{Settings, parse_languages};
+use vinput_core::settings::{STOP_AFTER_MINUTES, Settings, parse_languages};
 use vinput_view::{Change, Notice, NoticeKind, Page};
 
 const VK_BACK: u16 = 0x08;
@@ -222,6 +222,12 @@ pub(crate) fn apply(
         Change::Autostart(on) => put(&mut settings.autostart, on, Follow::Autostart),
         Change::ReadySound(on) => put(&mut settings.ready_sound, on, Follow::Nothing),
         Change::StopSound(on) => put(&mut settings.stop_sound, on, Follow::Nothing),
+        Change::StopAfterSilence(minutes) if !STOP_AFTER_MINUTES.contains(&minutes) => {
+            Applied::Unchanged
+        }
+        Change::StopAfterSilence(minutes) => {
+            put(&mut settings.stop_after_minutes, minutes, Follow::Nothing)
+        }
         Change::CheckUpdates(on) => put(&mut settings.check_updates, on, Follow::UpdateTimer),
         // Without a graphics card there is no switch, and what the user
         // wants for a PC that has one stays as it is.
@@ -419,6 +425,7 @@ mod tests {
             (Change::Autostart(false), Follow::Autostart),
             (Change::ReadySound(false), Follow::Nothing),
             (Change::StopSound(false), Follow::Nothing),
+            (Change::StopAfterSilence(5), Follow::Nothing),
             (Change::CheckUpdates(false), Follow::UpdateTimer),
             (Change::GraphicsCard(false), Follow::Engine),
             (Change::ApiEnabled(false), Follow::Api),
@@ -435,6 +442,13 @@ mod tests {
         }
         assert!(!settings.autostart && !settings.ready_sound && !settings.check_updates);
         assert!(!settings.stop_sound);
+        assert_eq!(settings.stop_after_minutes, 5);
+        // A time that is not on offer changes nothing.
+        assert_eq!(
+            made(&mut settings, Change::StopAfterSilence(7)),
+            Applied::Unchanged
+        );
+        assert_eq!(settings.stop_after_minutes, 5);
         assert!(!settings.local_gpu && !settings.api_enabled && !settings.memo_to_clipboard);
     }
 

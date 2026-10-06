@@ -230,8 +230,46 @@ fn behavior(settings: &Settings) -> [Node; 2] {
                     Action::send(Command::Set(Change::StopSound(on)))
                 }))
                 .into(),
+            stop_after_row(settings.stop_after_minutes),
         ]),
     ]
+}
+
+/// The times a dictation may be given before it stops for want of a sound,
+/// in minutes.
+const STOP_AFTER: [u32; 5] = [1, 5, 15, 30, 60];
+
+/// The row that says how long a dictation nobody speaks into is left
+/// listening. A time from the settings file that is not on offer is shown
+/// as it is, so that the list never names one that is not in use.
+fn stop_after_row(chosen: u32) -> Node {
+    let mut minutes = STOP_AFTER.to_vec();
+    let selected = minutes
+        .iter()
+        .position(|&offered| offered == chosen)
+        .unwrap_or_else(|| {
+            minutes.push(chosen);
+            minutes.len() - 1
+        });
+    let names = minutes.iter().map(|&minutes| match minutes {
+        1 => "1 minute".to_owned(),
+        60 => "1 hour".to_owned(),
+        minutes => format!("{minutes} minutes"),
+    });
+    setting(Icon::Timer, "Stop after silence")
+        .detail("Ends a forgotten dictation when nothing is said for this long")
+        .control(choice(
+            "stop-after-silence",
+            names.collect::<Vec<_>>(),
+            selected,
+            move |index| match minutes.get(index) {
+                Some(&minutes) if index != selected => {
+                    Action::send(Command::Set(Change::StopAfterSilence(minutes)))
+                }
+                _ => Action::None,
+            },
+        ))
+        .into()
 }
 
 #[cfg(test)]
@@ -274,6 +312,8 @@ mod tests {
             "Languages",
             "Start with Windows",
             "Play a sound when listening starts",
+            "Play a sound when listening stops",
+            "Stop after silence",
         ] {
             let row = setting_row(&nodes, title);
             assert!(row.control.is_some(), "{title} has no control");
@@ -324,7 +364,7 @@ mod tests {
             let page = content(&scene(name));
             let keys = keys(&all(&page.body));
             let unique: HashSet<_> = keys.iter().collect();
-            assert_eq!(keys.len(), 6, "{name}");
+            assert_eq!(keys.len(), 7, "{name}");
             assert_eq!(unique.len(), keys.len(), "{name}: {keys:?}");
         }
     }
@@ -410,6 +450,48 @@ mod tests {
             )
         };
         assert!(on("Start with Windows") && on("Play a sound when listening starts"));
+    }
+
+    #[test]
+    fn the_time_a_silent_dictation_is_given_is_picked_from_a_list() {
+        let stop_after = |minutes: u32| {
+            let mut view = scene("settings");
+            view.settings.stop_after_minutes = minutes;
+            let page = content(&view);
+            let nodes = all(&page.body);
+            match setting_row(&nodes, "Stop after silence").control.as_deref() {
+                Some(Node::Choice {
+                    items,
+                    selected,
+                    action,
+                    ..
+                }) => {
+                    let sent = (0..items.len()).map(|index| command(&action(index)));
+                    (items.clone(), *selected, sent.collect::<Vec<_>>())
+                }
+                _ => (Vec::new(), 0, Vec::new()),
+            }
+        };
+        let picks = |minutes| Some(Command::Set(Change::StopAfterSilence(minutes)));
+        let (items, selected, sent) = stop_after(30);
+        assert_eq!(
+            items,
+            [
+                "1 minute",
+                "5 minutes",
+                "15 minutes",
+                "30 minutes",
+                "1 hour"
+            ]
+        );
+        assert_eq!(selected, 3);
+        // Picking what is picked already sends nothing.
+        assert_eq!(sent, [picks(1), picks(5), picks(15), None, picks(60)]);
+        // A time only the settings file could name is shown as what it is.
+        let (items, selected, sent) = stop_after(7);
+        assert_eq!(items.last().map(String::as_str), Some("7 minutes"));
+        assert_eq!((selected, sent.len()), (5, 6));
+        assert_eq!(sent[5], None);
     }
 
     /// The list of audio inputs: its items, the one picked, and what picking

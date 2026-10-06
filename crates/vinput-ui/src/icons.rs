@@ -24,6 +24,7 @@ pub const fn glyph(icon: Icon) -> char {
         Icon::Power => '\u{E7E8}',
         Icon::Volume => '\u{E767}',
         Icon::Sync => '\u{E895}',
+        Icon::Timer => '\u{E916}',
         Icon::Model => '\u{F158}',
         Icon::Download => '\u{E896}',
         Icon::Chip => '\u{E950}',

@@ -193,8 +193,11 @@ impl Pro {
 
     /// Notes which model on this PC the settings would carry on with.
     pub(super) fn prefer(&self, settings: &Settings) {
-        self.standby
-            .prefer(&settings.last_local_model, settings.use_gpu());
+        self.standby.prefer(
+            &settings.last_local_model,
+            &settings.languages,
+            settings.use_gpu(),
+        );
     }
 
     /// Name of the model on this PC that serves in place of `VinPUT` Pro
@@ -204,7 +207,12 @@ impl Pro {
         if settings.provider != ProviderKind::Cloud || self.standby.until() == 0 {
             return None;
         }
-        models::spare(&settings.last_local_model, settings.use_gpu()).map(|model| model.name)
+        models::spare(
+            &settings.last_local_model,
+            &settings.languages,
+            settings.use_gpu(),
+        )
+        .map(|model| model.name)
     }
 
     /// Why `VinPUT` Pro cannot serve a dictation as things stand, as far as

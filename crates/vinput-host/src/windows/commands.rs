@@ -130,7 +130,10 @@ impl Host {
         controller.configure(&self.settings, false);
         self.ensure_engine();
         match follow {
-            Follow::Nothing => {}
+            // With the switch for the graphics card the models stay as
+            // they are, and the engine for the other way of running them
+            // was asked for above, if the model in use has such an engine.
+            Follow::Nothing | Follow::Engine => {}
             // While a hotkey field has the keys they stay let go of; they
             // are registered as they are then when it gives them back.
             Follow::Hotkeys => {
@@ -157,13 +160,6 @@ impl Host {
                     } else {
                         KillTimer(self.hwnd, UPDATE_TIMER_ID);
                     }
-                }
-            }
-            // The models stay as they are; only the engine for the other
-            // way of running them is fetched, if it is not here yet.
-            Follow::Engine => {
-                if models::any_local_model() {
-                    self.installer.ensure_engine(self.settings.use_gpu());
                 }
             }
         }

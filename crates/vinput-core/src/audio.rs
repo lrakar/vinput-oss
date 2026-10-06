@@ -1,6 +1,7 @@
 //! Audio capture stage.
 
 mod armed;
+mod quiet;
 #[cfg(windows)]
 mod wasapi;
 mod wav;
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub use armed::{Armed, ArmedSource, CaptureBackend, CaptureStream, Changed};
+pub use quiet::UntilQuiet;
 #[cfg(windows)]
 pub use wasapi::{ArmedMicrophone, Wasapi, WasapiSource, WasapiStream, WasapiWatch, microphones};
 #[cfg(windows)]

@@ -30,6 +30,20 @@
 //! was unsure of it, if it only repeats the end of what is typed already or
 //! one phrase over and over, or, where nothing was as loud as the voice, if
 //! it is one of the phrases the engine is known for making up.
+//!
+//! The second engine, for the models that come as two files, answers in the
+//! same form but cannot be led as the first ([`Inference::led`]). Its models
+//! do not carry on from the text so far: each stretch comes back as a
+//! sentence of its own, with a capital and a full stop, so a dictation is
+//! not cut at its pauses for them. And they are surer of what they make up:
+//! told to hear English in a click they write a word or two as if it were
+//! speech, while left open they take a noise for some far language or for
+//! nothing. So with them a stretch that may not be speech is typed only if
+//! they hear a language of the user's in it on their own. Nor do they say
+//! how likely each language is, so with several configured languages what
+//! they take for another one is not recognized a second time: the first
+//! answer is all there is to have. That is also what becomes of a language
+//! they were not taught, which Settings say of such a model.
 
 use std::sync::Arc;
 
@@ -76,6 +90,15 @@ pub(super) trait Inference: Send + Sync {
     /// Makes one request with the form `fields` and the recording `wav`, and
     /// returns the engine's answer, which has a `text`.
     fn infer(&self, fields: &[(&str, &str)], wav: &[u8]) -> Result<Value>;
+
+    /// Whether the engine can be led: handed the text so far, so that a
+    /// sentence cut in two reads as one, and asked again, in a language of
+    /// the user's, for what may not be speech and was taken for another
+    /// language. Not one whose models write every stretch as a sentence of
+    /// its own and, told which language to hear, find words in any sound.
+    fn led(&self) -> bool {
+        true
+    }
 }
 
 /// How much the engine is asked to say besides the text.
@@ -180,6 +203,9 @@ impl Dictation {
         if open["language"].as_str().and_then(code_of) == Some(language) {
             return Ok(Some(open));
         }
+        if !self.engine.led() {
+            return Ok(None);
+        }
         // Speech, taken for another language, as a word or two often are.
         self.ask(wav, language, Detail::Language).map(Some)
     }
@@ -214,6 +240,15 @@ impl Dictation {
         let configured = |code: &str| self.languages.iter().any(|language| language == code);
         if self.languages.is_empty() || detected.is_some_and(configured) {
             return Ok((reply, detected.map(str::to_owned), detected.is_some()));
+        }
+        if !self.engine.led() {
+            // It cannot be asked how likely each language is, so a second
+            // answer would be no better than the first: the same again in a
+            // language it was not taught, a guess in one it was. What is
+            // plainly speech is typed as it heard it, and what may not be
+            // speech is left out.
+            let reply = if self.doubtful { Value::Null } else { reply };
+            return Ok((reply, None, false));
         }
         // Not a language the user speaks. The best guess is the one they
         // spoke a moment ago.
@@ -352,6 +387,8 @@ mod tests {
     struct Scripted {
         answers: Mutex<VecDeque<Value>>,
         asked: Mutex<Vec<Vec<(String, String)>>>,
+        /// Whether it is the second engine, which is not asked twice.
+        sure_of_noise: bool,
     }
 
     impl Inference for Scripted {
@@ -365,6 +402,10 @@ mod tests {
             }
             let answer = self.answers.lock().ok().and_then(|mut all| all.pop_front());
             answer.ok_or_else(|| crate::Error::Transcription("asked once too often".into()))
+        }
+
+        fn led(&self) -> bool {
+            !self.sure_of_noise
         }
     }
 
@@ -559,6 +600,52 @@ mod tests {
         assert_eq!(asked(&engine, 1, "language").as_deref(), Some("sl"));
         assert_eq!(careful(&mut dictation, DOUBTFUL), Some(String::new()));
         assert_eq!(requests(&engine), 4);
+    }
+
+    #[test]
+    fn an_engine_sure_of_noise_is_not_asked_again_in_the_right_language() {
+        let second_engine = |languages: &[&str], answers: Vec<Value>| {
+            let engine = Arc::new(Scripted {
+                answers: Mutex::new(answers.into()),
+                sure_of_noise: true,
+                ..Scripted::default()
+            });
+            let languages = languages.iter().map(|code| (*code).to_owned()).collect();
+            (Dictation::new(engine.clone(), languages, None), engine)
+        };
+        // A click after the last sentence, taken for a word of Spanish: in
+        // English this engine would write "Because he." for it.
+        let click = || json!({"text": "porque", "language": "spanish"});
+        let (mut one, engine) = second_engine(
+            &["en"],
+            vec![click(), json!({"text": "Yes.", "language": "english"})],
+        );
+        assert_eq!(careful(&mut one, DOUBTFUL), Some(String::new()));
+        assert_eq!(requests(&engine), 1);
+        // What it hears as the user's language on its own is typed.
+        assert_eq!(careful(&mut one, DOUBTFUL), Some("Yes.".into()));
+        let (mut several, engine) = second_engine(&["en", "sl"], vec![click()]);
+        assert_eq!(careful(&mut several, DOUBTFUL), Some(String::new()));
+        assert_eq!(requests(&engine), 1);
+        // With several languages, speech it takes for another one, as it
+        // does a language it was not taught, is typed as it heard it: asked
+        // again it would only write the same, or guess.
+        let (mut untaught, engine) = second_engine(
+            &["sl", "en"],
+            vec![json!({"text": "Dobar dan.", "language": "russian"})],
+        );
+        assert_eq!(untaught.stretch(LONG).ok(), Some("Dobar dan.".into()));
+        assert_eq!(asked(&engine, 0, "language").as_deref(), Some("auto"));
+        assert_eq!(requests(&engine), 1);
+        assert_eq!(untaught.language(), None);
+        // What is plainly speech is still recognized in a language of the
+        // user's when the engine took it for another.
+        let (mut plain, engine) = second_engine(
+            &["en"],
+            vec![json!({"text": "Because he said so.", "language": "english"})],
+        );
+        assert_eq!(plain.stretch(LONG).ok(), Some("Because he said so.".into()));
+        assert_eq!(asked(&engine, 0, "language").as_deref(), Some("en"));
     }
 
     #[test]

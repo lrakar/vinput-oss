@@ -18,9 +18,11 @@ use vinput_view::{
 use crate::{Backend, Listener};
 
 /// The names [`scene`] knows.
-pub const SCENES: [&str; 67] = [
+pub const SCENES: [&str; 69] = [
     "settings",
     "first-run",
+    "wrong-language",
+    "welcome-other-language",
     "welcome-signing-in",
     "welcome-plans",
     "welcome-intro",
@@ -101,6 +103,8 @@ fn model(id: &str, name: &str, summary: &str, detail: &str, megabytes: u64) -> M
         custom: false,
         google: None,
         in_use: false,
+        lacks: Vec::new(),
+        knows_none: false,
         state: if megabytes > 0 {
             ModelState::Missing
         } else {
@@ -131,6 +135,20 @@ fn catalog() -> Vec<Model> {
             "Online. Types as you speak.",
             "Needs a Gemini API key",
             0,
+        ),
+        model(
+            "qwen3-asr-1.7b",
+            "Qwen3-ASR 1.7B",
+            "On this PC. 30 languages, not Slovenian. Accurate, and quick without a graphics card.",
+            "30 languages",
+            2404,
+        ),
+        model(
+            "qwen3-asr-0.6b",
+            "Qwen3-ASR 0.6B",
+            "On this PC. 30 languages, not Slovenian. Fast on any processor.",
+            "30 languages",
+            972,
         ),
         model(
             "parakeet-tdt-v3",
@@ -170,9 +188,9 @@ fn catalog() -> Vec<Model> {
 /// every scene but the first run.
 fn settled() -> View {
     let mut list = catalog();
-    list[4].state = ModelState::Installed;
     list[6].state = ModelState::Installed;
-    list[6].in_use = true;
+    list[8].state = ModelState::Installed;
+    list[8].in_use = true;
     View {
         version: "0.3.0".to_owned(),
         status: Status {
@@ -190,6 +208,7 @@ fn settled() -> View {
             autostart: true,
             ready_sound: true,
             stop_sound: true,
+            stop_after_minutes: 30,
             check_updates: true,
             graphics_card: true,
             api_enabled: true,
@@ -675,6 +694,43 @@ fn release() -> Release {
 /// scene has that name; see [`SCENES`].
 #[must_use]
 pub fn scene(name: &str) -> Option<View> {
+    let mut view = staged(name)?;
+    // The models that were not taught Slovenian say so to whoever
+    // dictates in it, as the host has them say it.
+    let languages = &view.settings.languages;
+    let slovenian = languages.contains("sl-SI");
+    for model in &mut view.models.list {
+        if slovenian && model.id.starts_with("qwen3") {
+            model.lacks = vec!["Slovenian".to_owned()];
+            model.knows_none = languages == "sl-SI";
+        }
+    }
+    Some(view)
+}
+
+/// The scenes of someone who dictates in Slovenian alone, which some
+/// models were not taught: with such a model in use, and choosing a model
+/// in the welcome.
+fn language_scene(view: &mut View, name: &str) -> bool {
+    match name {
+        "wrong-language" => {
+            view.models.list[4].state = ModelState::Installed;
+            for (index, model) in view.models.list.iter_mut().enumerate() {
+                model.in_use = index == 4;
+            }
+            view.status.model = Some("Qwen3-ASR 0.6B".to_owned());
+        }
+        "welcome-other-language" => match staged("first-run") {
+            Some(new) => *view = new,
+            None => return false,
+        },
+        _ => return false,
+    }
+    "sl-SI".clone_into(&mut view.settings.languages);
+    true
+}
+
+fn staged(name: &str) -> Option<View> {
     let mut view = settled();
     match name {
         "settings" => {}
@@ -697,11 +753,11 @@ pub fn scene(name: &str) -> Option<View> {
             dictate_with_pro(&mut view);
         }
         "downloading" => {
-            view.models.list[3].state = ModelState::Installing {
+            view.models.list[5].state = ModelState::Installing {
                 done: 412 * MEGABYTE,
                 total: 669 * MEGABYTE,
             };
-            view.models.list[5].state = ModelState::Failed {
+            view.models.list[7].state = ModelState::Failed {
                 reason: "The download stopped: no connection to huggingface.co".to_owned(),
             };
             view.models.engine = Engine::Fetching {
@@ -743,7 +799,7 @@ pub fn scene(name: &str) -> Option<View> {
         // Someone who has just installed, part of the way through the
         // welcome: signing in, picking a plan, downloading a model.
         "welcome-signing-in" | "welcome-plans" | "welcome-intro" | "welcome-downloading" => {
-            view = scene("first-run")?;
+            view = staged("first-run")?;
             match name {
                 "welcome-signing-in" => view.pro = signing_in(),
                 "welcome-plans" => view.pro = signed_in(false, "", ProPlan::Monthly),
@@ -770,6 +826,7 @@ pub fn scene(name: &str) -> Option<View> {
         }
         "many-models" => view.models.list.extend(crowd()),
         "long-names" => lengthen(&mut view),
+        name if language_scene(&mut view, name) => {}
         name if offer_scene(&mut view, name) => {}
         name if pro_scene(&mut view, name) => {}
         name if google_scene(&mut view, name) => {}
@@ -941,6 +998,7 @@ fn set(settings: &mut Settings, change: Change) {
         Change::Autostart(on) => settings.autostart = on,
         Change::ReadySound(on) => settings.ready_sound = on,
         Change::StopSound(on) => settings.stop_sound = on,
+        Change::StopAfterSilence(minutes) => settings.stop_after_minutes = minutes,
         Change::CheckUpdates(on) => settings.check_updates = on,
         Change::GraphicsCard(on) => settings.graphics_card = on,
         Change::ApiEnabled(on) => settings.api_enabled = on,

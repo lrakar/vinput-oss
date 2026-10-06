@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "A key made for the tests and the signature it must produce"
+paths = ['''crates/vinput-core/src/stt/google/token\.rs''']

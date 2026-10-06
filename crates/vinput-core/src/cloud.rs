@@ -1407,7 +1407,7 @@ mod tests {
     #[test]
     fn the_server_is_told_what_this_pc_is_called() {
         let named = |name: &str| device_name(Some(name.to_owned()));
-        assert_eq!(named(" LOVROPC ").as_deref(), Some("LOVROPC"));
+        assert_eq!(named(" ANAPC ").as_deref(), Some("ANAPC"));
         assert_eq!(named("A\u{7}B\nC").as_deref(), Some("ABC"));
         assert_eq!(named("   "), None);
         assert_eq!(device_name(None), None);
@@ -1415,8 +1415,8 @@ mod tests {
         assert_eq!(long.map(|name| name.chars().count()), Some(64));
         // With a name the request says it; without one it has no body.
         let request: Value =
-            serde_json::from_str(&sign_in_request(Some("LOVRO \"PC\""))).unwrap_or_default();
-        assert_eq!(request, json!({"device_name": "LOVRO \"PC\""}));
+            serde_json::from_str(&sign_in_request(Some("ANA \"PC\""))).unwrap_or_default();
+        assert_eq!(request, json!({"device_name": "ANA \"PC\""}));
         assert_eq!(sign_in_request(None), "");
     }
 

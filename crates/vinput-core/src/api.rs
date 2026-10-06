@@ -539,7 +539,7 @@ mod tests {
         );
         assert_eq!(
             printable("  Stream\u{7}\r\nDeck\u{200b}  ", 48),
-            "StreamDeck\u{200b}"
+            "ControlDeck\u{200b}"
         );
         assert_eq!(printable("ab   cd", 3), "ab");
     }

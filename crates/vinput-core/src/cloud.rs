@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 use crate::net::{Request, Target};
 use crate::{log, secrets};
 
-/// Where the server is: the address of the service on Cloud Run. It changes
+/// Where the server is: the address of the service. It changes
 /// only if the service moves, and this is the one place to set it.
 const SERVER: &str = "https://vinput-cloud-739462546923.europe-west1.run.app";
 
@@ -1322,7 +1322,7 @@ mod tests {
 
     #[test]
     fn a_vinput_that_ships_talks_to_its_own_server_and_to_no_other() {
-        // The address of the service on Cloud Run, to the letter.
+        // The address of the service, to the letter.
         assert_eq!(
             SERVER,
             "https://vinput-cloud-739462546923.europe-west1.run.app"

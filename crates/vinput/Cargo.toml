@@ -1,0 +1,27 @@
+[package]
+name = "vinput"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Lightweight Windows background app that types speech into the focused text input"
+repository.workspace = true
+license.workspace = true
+readme = "../../README.md"
+publish.workspace = true
+
+[dependencies]
+vinput-core.workspace = true
+vinput-ui.workspace = true
+
+[target."cfg(windows)".dependencies]
+vinput-host.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"
+
+# Tests run as a separate copy; see the feature in vinput-core/Cargo.toml.
+[dev-dependencies]
+vinput-core = { workspace = true, features = ["test-instance"] }
+
+[lints]
+workspace = true

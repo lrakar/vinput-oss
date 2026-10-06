@@ -1,0 +1,26 @@
+[package]
+name = "vinput-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The Vinput background process on Windows: hotkeys, tray icon, listening indicator, windows and setup"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+vinput-core.workspace = true
+vinput-ui.workspace = true
+vinput-view.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows.workspace = true
+windows-sys.workspace = true
+
+# Tests run as a separate copy; see the feature in vinput-core/Cargo.toml.
+[dev-dependencies]
+vinput-core = { workspace = true, features = ["test-instance"] }
+
+[lints]
+workspace = true

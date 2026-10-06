@@ -1,0 +1,20 @@
+[package]
+name = "vinput-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The Vinput windows: Settings, the update window and setup. Knows the contract in vinput-view and nothing about the engine"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vinput-view.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows.workspace = true
+windows-core.workspace = true
+windows-numerics.workspace = true
+
+[lints]
+workspace = true

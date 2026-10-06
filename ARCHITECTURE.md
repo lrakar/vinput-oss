@@ -1,0 +1,180 @@
+# Vinput architecture
+
+For engineers. What the app does for its user is in [README.md](README.md); the local API is in [docs/api.md](docs/api.md); cutting a release is in [docs/release.md](docs/release.md).
+
+## Crates
+
+One Cargo workspace. The version of every crate is `[workspace.package] version` in the root `Cargo.toml`; lints and the release profile are set there too.
+
+| Crate | What it is | May depend on |
+| --- | --- | --- |
+| `crates/vinput-core` | The engine: microphone, speech providers, typing, voice memos, settings, models and downloads, updates, the local API. No window code. | third-party crates |
+| `crates/vinput-view` | The contract between the engine side and the windows: `View` (everything a window shows), `Event` (host to window), `Command` (window to host). Data only, `serde`. | `serde`, `serde_json` |
+| `crates/vinput-host` | The resident Windows process: message loop, hotkeys, tray icon and menu, listening indicator, install and uninstall, and the host's end of the line to a window process. | `vinput-core`, `vinput-view`, `vinput-ui` (its dialogs only) |
+| `crates/vinput-stand-in` | A test crate: a stand-in for a window process, and the tests that run the line between host and window over real pipes with it. Not part of a release. | `vinput-ui`, `vinput-view`, `vinput-host` (tests) |
+| `crates/vinput-ui` | The windows (Settings and its pages, the update window). Draws a `View`, reports `Command`s. Knows nothing about the engine. | `vinput-view` only |
+| `crates/vinput` | The binary. `main.rs` parses the command line and calls the crates above; `build.rs` embeds the icons and marks the Windows libraries that load on first use. | all of the above |
+
+Two rules keep the split honest: `vinput-ui` never depends on `vinput-core` or `vinput-host`, and `vinput-core` never depends on a window or on `vinput-view`.
+
+## Processes
+
+```text
+vinput.exe --background            resident, one per user
+  main thread        message loop: hotkeys, tray, timers, indicator
+  vinput-api         the local API on \\.\pipe\vinput (single-threaded async runtime)
+  vinput-stt         network thread of an online speech provider, if one is chosen
+  vinput-pro         one per request about the VinPUT Pro account, short-lived
+  vinput-google      one per question the setup of a Google service asks, short-lived
+  vinput-microphone  keeps the last session's microphone stream, stopped, for two minutes; asleep otherwise
+  vinput-dictation   one per running session: microphone -> provider -> typing
+  vinput-recognizer  one per session, short-lived: asks the provider for its session
+  vinput-caret       only while the indicator follows the caret: asks the foreground program where it is
+  vinput-local-stt   one per running session with a local model: posts its stretches to the engine
+  whisper-server     child process, only with a local model; suspended while idle
+
+vinput.exe ui <window>             exists only while a window is open
+  stdin   <- Event,   one JSON object per line   (state to show, page to turn to, close)
+  stdout  -> Command, one JSON object per line   (what the user did)
+```
+
+- The resident process owns all state. A window process keeps none beyond what is being typed: every `Event::State` carries a complete `View` and replaces the one before.
+- Because standard output is the line, nothing in a window process may print to it. Diagnostics go to standard error or the log.
+- A session is `AudioSource -> Transcriber -> TextSink` (`vinput-core/src/pipeline.rs`); each stage is a trait with a fake for tests.
+- Nothing is polled for while idle, and no thread is waited for on the main thread. Every other thread leaves what it has found where the host looks for it and posts a message to the hidden window (the numbers are in `vinput-host/src/windows.rs`). That goes for a session too: the last thing its thread does is put its text, memo or error in place and post `SESSION_ENDED`, so a result is passed on when it exists, not at the next look. The only timers of the main thread are the 33 ms tick while a session is listening (key release, indicator), the one of the indicator while it glows or fades after that, the 250 ms one while a window is open, and the update check every six hours. Three other threads sleep until a time of their own, each only for a while after a dictation and none by polling: `vinput-microphone` until the stream kept ready is closed, two minutes after the session that left it; with Gemini, the network thread until the session prepared ahead is let go after 90 seconds, and with VinPUT Pro until the connection kept ready is; with a local model, `vinput-local-idle` until the engine is suspended, half a minute after its last use, and then until it is ended, ten minutes after its last dictation. Once those have passed nothing in the process is waiting for a time at all.
+- The main thread never waits for the program that is dictated into. Where its caret is, only that program can say (accessibility), so `caret::Watch` asks it on `vinput-caret`, which is started when the indicator appears at the caret and let go of, not joined, when listening ends. The indicator draws from the last answer. A program that hangs keeps that one thread until it answers or is closed, and at most four such threads exist at once; hotkeys, and with them stopping, are never held up.
+- Escape calls a dictation off. It is a hotkey registered with Windows like the others, so there is still no keyboard hook, but it is registered only while a session listens or a stopped one is still at work and was not called off (`Controller::can_cancel`), and unregistered the moment that is no longer so; a registered hotkey is taken from every other program, and Escape belongs to all of them. Calling off sets a flag the session's thread reads: its sink lets text fall from then on, no Enter, search or memo follows, and a failure is not reported. The thread itself still ends when the recognizer has answered, and says so as always; a `capture` session ends with an empty text for the program that waits for it.
+- A quiet setup (`--install --quiet`, `--uninstall --quiet`) is what a package manager runs and waits for. It never shows a window, a failure included; the exit code and the log say how it went. It does not start Vinput on a new install, because the tray program would keep the caller waiting for as long as the user is signed in; it makes the Start menu entry and the startup entry itself (`host::register_installed`). A Vinput it had to stop is started again, and everything setup starts is cut loose from it (`install::spawn_detached`: no handles, a process group of its own, out of the job where Windows allows). A start with `--background` reports a failure the same way, to the log and not in a window.
+- The speech provider is set up once at start, in the background (`stt::connect_in_background`), so that a key press has as little left to do as possible. This is deliberate; do not make it lazy. What is kept ready differs by provider:
+  - Google Cloud keeps its gRPC connection and an access token for as long as it runs, so a press only opens a stream on it.
+  - Gemini has nothing that sessions can share but the TLS settings: every session is a WebSocket of its own. So one whole session is connected and set up ahead, when the provider starts and when the audio of a dictation ends, and the next press takes it over. It is let go after 90 seconds without a press; from then on nothing is connected and no timer runs, and a press connects for itself. The reasons for the numbers, and what happens when a prepared session has died, are at the top of `vinput-core/src/stt/gemini.rs`.
+  - A local model with a server keeps the engine process running with the model loaded, and lets it go after a while without use.
+  - VinPUT Pro keeps an access token in memory, fetched when the provider starts and traded for a new one after a dictation when it would run out within twenty minutes; every dictation is a WebSocket of its own, opened at the press with that token. After an hour without a dictation the next press fetches a token first, and connects while it does. When a dictation ends, one connection to the server is made and kept for 90 seconds, with TLS set up and nothing asked on it yet, so the next press only asks for the WebSocket; after that it is closed, nothing is connected and no timer runs. See the top of `vinput-core/src/stt/cloud.rs`. What Gemini and Pro share (the network thread, TLS, connecting in two steps, the dictation's end of a stream) is `stt/live.rs`.
+  - A provider is let go of on the thread of the message loop, so letting go never waits: the network thread of each is shut down without waiting for a request that is still under way on it (`stt/live.rs`, `Network`).
+- The microphone stays warm for a while after it was used (`audio::ArmedMicrophone`, `vinput-core/src/audio/armed.rs`). Nothing is opened at start. When a session ends, its stream is stopped and emptied the moment capture ends and kept for two minutes, in which a key press only starts it again; after that it is closed, nothing is held on the device, and the next press opens the microphone from nothing as every press once did. It is not kept for good because a stream that merely exists might keep another program from taking the microphone for itself, or keep the device from saving power; neither could be measured, and what is saved is about 20 ms a press. A stopped stream captures nothing and Windows does not show the microphone as in use for it (a test in `audio/wasapi.rs` holds this on a real microphone without ever starting it; like every test there that touches a real device it runs only when asked for with `--ignored`). A kept stream is let go of when Windows reports that a device came, went or became the default, that the PC woke up, or when the microphone setting changes; nothing is kept at all unless Windows has agreed to report this, and a kept stream that was started is compared with the device a session should use, so an unreported change costs at most one session on the old microphone. If a kept stream does not start, the session opens the microphone itself. The `vinput-microphone` thread waits for the two minutes to pass while something is kept and for nothing but a message otherwise, so an idle Vinput is not woken by it. A Bluetooth microphone is never kept, because a headset may leave its music mode for as long as a capture stream exists. When a session is stopped the microphone stops at once, and what it had captured and the session had not read yet (up to the second the buffer holds) is still recognized.
+- A session never waits for the provider before listening. `dictation.rs` asks for the recognizer session on the `vinput-recognizer` thread while the session thread starts the microphone and plays the ready sound (unless the provider has already said no, as without a key or a model: then the session ends with that error and no sound); what is said before the session exists (the provider is still connecting right after start, after another model was chosen, after an engine update) is kept, at most a minute of it, and recognized first.
+- A live microphone hands audio on in the 10 ms packets Windows delivers, without gathering them; `pipeline.rs` says why.
+- A local model lives in `whisper-server`, a child process that `vinput-core/src/stt/local.rs` starts, in a job that ends it with Vinput (`job.rs`). Its life: started (the model loads; on a graphics card one silent request follows, so the driver builds its programs then and not during the first dictation), running while in use, suspended half a minute after its last use, ended after ten minutes without a dictation, started again by the next. A suspended engine keeps the model in memory and does no work at all; left running it wakes the processor sixty to several hundred times a second. `Server::address()` is the only way to the engine: it resumes or starts it before returning, under the same lock the suspending thread takes, because a suspended process still accepts a connection and then never answers. Never connect to an engine address kept from earlier. A key press only has the engine ready (`Server::wake()`), without handing it out, so a press nothing comes of lets it be suspended half a minute later. An engine is suspended only when the record of use says it is free and Windows shows no connection of it open (if Windows cannot say, it is left running), so a request is never cut off. The Win32 side is `vinput-core/src/suspend.rs`.
+- A local model with an engine server recognizes while the user speaks (`vinput-core/src/stt/local.rs` and `stt/local/`). The dictation is cut where the speaker pauses for 0.6 s (`pauses.rs`: nothing near the level of the voice, at least 2 s said), each stretch is one request on the `vinput-local-stt` thread (`stretches.rs`), and its text is typed when it comes back, in order, so the wait after the key is let go is for the last stretch alone. The engine takes one request at a time, so a stretch is cut off only while none is on its way, and only while the engine has been answering within a second and a half; a slower one (a large model on the processor) gets the dictation whole when it ends, as before. The text so far goes along as the engine's prompt. While the dictation goes on, the level of the voice decides only where a cut falls: every sample goes to one stretch or the next, and the only audio left out is dead silence (under the absolute floor in `sound.rs`) after a cut.
+- The engine makes words up for audio without speech ("Thank you." for the room after the last sentence, `*phone rings*` for a click), so it is handed as little of that as can be, in four layers. `sound.rs` cuts the quiet off both ends of every stretch and sends nothing for one without sound. `pauses.rs` sends nothing for what is left after the last pause unless something in it lasts 80 ms within 26 dB of the voice, which the room and the click of the key do not; that also makes the most common ending, a pause and then the key, cost no request at all. A stretch that may not be speech (short, soft, even, far under the level the user spoke at before, or little sound after the last pause) is recognized with the language left open first, because the engine's measure of "no speech" is next to zero whenever it is told the language, and only what passes is taken or asked for again in the language of the dictation (`dictation.rs`, `Care`); such a stretch goes without the prompt and is not typed if the engine was unsure of it or it only repeats itself or the end of the text. Last, `phantoms.rs` takes the names of sounds out of every answer, and drops the phrases the engine is known for making up, but only from a stretch in which nothing was as loud as the voice. The recordings in `stt/local/clips` and the tests beside them hold this, one of them against the engine itself (`--ignored`). A model whose program runs once per dictation (`Runner::Command`) is recognized whole as well.
+- The engine is never asked for language likelihoods on the way (`stt/local/dictation.rs`); that is a second pass over the audio on every request. One configured language is named to it. With several it detects the language and names it in its answer; only if that is not a configured one is the stretch recognized again in a configured one, that once with the likelihoods to choose by. Every stretch is detected afresh until two in a row agree or one language has been heard for eight seconds on end; from there it holds for the rest of the dictation.
+- Downloads, the model lookup, the update check, the Google token request and the questions the setup of a Google service asks Google (`vinput-core/src/stt/check.rs`) are plain HTTPS requests through WinHTTP (`vinput-core/src/net.rs`), made on the thread that needs them. Nothing of them is held while idle. So are the requests about the VinPUT Pro account (`vinput-core/src/cloud.rs`). Its server is the one address in that file: a build that ships talks to no other, whatever its environment says, and opens in the browser only a page of that server for signing in and a page of the payment service for paying. Only the speech streams (gRPC to Google Cloud, a WebSocket to Gemini, one to VinPUT Pro) use the TLS library in the executable.
+
+## Where to change what
+
+| To change | Look in |
+| --- | --- |
+| A speech service, or add one | `vinput-core/src/stt.rs` and `stt/`; a provider implements `SpeechProvider` and gets a `ProviderKind` |
+| VinPUT Pro: sign-in, the session, the account and paying | `vinput-core/src/cloud.rs` (the server's address is `SERVER` there; two processes take turns at trading the token in `cloud/turn.rs`); the audio stream is `stt/cloud.rs`; what the host does with them is `vinput-host/src/windows/pro.rs`, where `Pro::take` is the whole rule book and runs in tests without a server; the page is `vinput-ui/src/pages/pro.rs` |
+| Where the time of a dictation with VinPUT Pro goes | `Timeline` in `stt/cloud.rs`: every dictation notes when its socket was open, its first audio sent, its first guess back, the key let go and the last text back, and writes one line to the log in a build for development, or with `VINPUT_TIMING` set. `vinput pro-timing <wav>` (a build for development only) dictates a file and prints the same, with an access token from `VINPUT_PRO_TOKEN` |
+| How a local model recognizes: pauses, languages, the request, what is not speech | `vinput-core/src/stt/local.rs`, `stt/local/` |
+| Microphone capture, resampling | `vinput-core/src/audio/` |
+| How text is typed | `vinput-core/src/inject/` |
+| Voice memos, MP3 | `vinput-core/src/memo.rs`, `memo/` |
+| A setting | `vinput-core/src/settings.rs` (the file), then `vinput-view` (`Settings`, `Change`) and the page in `vinput-ui` |
+| The model catalog, downloads | `vinput-core/src/models.rs`, `models/`, `download.rs` |
+| Update check and install | `vinput-core/src/update.rs`, `vinput-host/src/install.rs` |
+| The local API | `vinput-core/src/api.rs` (protocol), `api/pipe.rs` (server), `api/client.rs` (client), and `docs/api.md` in the same commit |
+| Calling a dictation off (Escape) | `vinput-core/src/dictation.rs` (`cancel`), `vinput-host/src/windows/sessions.rs` (`Host::cancel`), `hotkeys.rs` (`hold_cancel`) |
+| Hotkeys, tray, indicator | `vinput-host/src/windows/hotkeys.rs`, `tray.rs`, `traymenu.rs`; `menu.rs`, `indicator.rs`, `caret.rs` |
+| What a window command does | `vinput-host/src/windows/commands.rs`, and `change.rs` for the rules of a setting |
+| What the host answers an API client | `vinput-host/src/windows/apiserve.rs` (`decide`), and `docs/api.md` in the same commit |
+| What a window shows or can ask for | `vinput-view/src/lib.rs` first, then both sides |
+| How a window looks | `vinput-ui` only |
+| A command-line command | `vinput/src/main.rs` |
+| Size, profiles, linking | root `Cargo.toml`, `.cargo/config.toml`, `vinput/build.rs`, feature lists in `vinput-core/Cargo.toml` |
+| Any HTTPS request that is not a speech stream | `vinput-core/src/net.rs`; do not add an HTTP client crate |
+| Google sign-in | `vinput-core/src/stt/google/token.rs` |
+| Setting up one's own Google service: the steps, what Google is asked, what it answers | `vinput-core/src/stt/check.rs` (the questions and how an answer is sorted); `vinput-host/src/windows/google.rs` (the steps, the draft, keeping what works); the page is `vinput-ui/src/pages/google.rs` |
+
+## The resident process, module by module
+
+`crates/vinput-host/src/windows.rs` holds `Host`, which owns every Win32 resource and every piece of state, and the numbers of the messages other threads wake it with. Each module under `windows/` adds the part of `Host` it is about; only the thread that runs the loop touches it.
+
+| Module | What it does |
+| --- | --- |
+| `windows/run.rs` | The message loop and the procedure of the hidden window; replays what arrived while the tray menu was open (every message another thread wakes the loop with is in `WAKES`) |
+| `windows/instance.rs` | One Vinput at a time: the mutex, finding the running copy, asking it to show Settings or to exit |
+| `windows/hotkeys.rs` | Registering the hotkeys, asking whether a key is free, letting go of them while Settings captures one |
+| `windows/sessions.rs` | Starting, watching and ending sessions; the indicator, the `state` file, what a session leaves behind. The first frame of the indicator is drawn as the session starts; that a session has ended arrives as `SESSION_ENDED`, and `Ending` says what it comes to |
+| `windows/apiserve.rs` | Carrying out commands of the local API; `decide` is the whole rule book |
+| `windows/tray.rs`, `traymenu.rs` | The icon, tooltip and notifications; the menu and what a pick does |
+| `windows/children.rs` | The window processes: started, told nothing before they are up, shown pictures, let go of |
+| `windows/picture.rs` | Gathering the facts a `View` is drawn from (`view.rs` draws it). What is read off the model and engine folders is kept from one tick of the window timer to the next, and read again after anything the host did or heard, during an install, and every two seconds |
+| `windows/commands.rs` | Every `Command` of a window, carried out |
+| `windows/picker.rs` | The file and folder pickers, each on a thread of its own |
+| `windows/updates.rs` | Update check, download and hand-over to setup |
+| `windows/pro.rs` | VinPUT Pro: every request to its server on a thread of its own, which wakes the loop with `PRO_HEARD`; the wait for a payment made in the browser, which a busy server does not end and which always says when it is over |
+| `windows/google.rs` | The setup of a Google service of one's own: its steps, what was entered and not kept yet, and each question to Google, and the reading of a key file, on a thread of its own, which leaves its answer in a queue and wakes the loop with `GOOGLE_CHECKED`. An answer nobody waits for any more (a newer question, the page left, the window closed) is dropped. Nothing is kept or put to use before the user finishes the setup |
+| `indicator.rs`, `draw.rs` | The listening indicator: a layered window, its phases and where it goes; the picture in it |
+| `caret.rs` | Where the text caret is. The lookup asks the foreground program, so it runs on a thread of its own (`Watch`) and never on the loop's |
+| `link.rs` | The line to one window process: two threads, a queue, never blocks the loop |
+| `change.rs`, `view.rs`, `finder.rs` | Pure rules: one changed setting, drawing a `View`, the search for a model to add |
+| `win.rs` | Small Win32 helpers, and what may be handed to the shell to open |
+
+## A second copy beside the installed one
+
+For trying a build out on a PC where Vinput is installed and running, set the environment variable `VINPUT_INSTANCE` to a short name (ASCII letters, digits and dashes, at most 32). Every name by which a running Vinput is known then ends in `-<name>`: the single-instance mutex, the class and title of the hidden window, the API pipe (`\\.\pipe\vinput-<name>`), the credential-store entry, and the folders `%APPDATA%\Vinput-<name>` and `%LOCALAPPDATA%\Vinput-<name>` (settings, `state`, log, models). Such a copy neither finds nor disturbs the installed one, and it never writes what belongs to the install: no startup entry, no Start menu entry, no setup, update or uninstall. The naming is `vinput-core/src/instance.rs`. Without the variable every name is what it has always been.
+
+```powershell
+$env:VINPUT_INSTANCE = "test"; cargo run -p vinput -- --background
+```
+
+Its hotkeys start out the same as the installed copy's, which holds them; set others in `%APPDATA%\Vinput-test\settings.ini` first, or in its Settings. Stop it with Quit in its tray menu.
+
+A separate copy keeps to itself on the desktop as well (`instance::is_quiet`, the one place this is decided): it shows no tray notification and no error box and plays no sound, the ready sound included. What it would have said goes to its log, `%APPDATA%\Vinput-<name>\vinput.log`. It is there to be tried out and driven by scripts, beside a Vinput whose user must not be told of failures that are not theirs. Its tray icon, its indicator and its windows are as they always are.
+
+Whatever cargo runs from the repository is such a copy without being told. `.cargo/config.toml` sets `VINPUT_INSTANCE` to `dev` for every process cargo starts (`cargo run`, `cargo ui`) unless the variable is set already, so the one-shot commands of the README read and write `%APPDATA%\Vinput-dev` and `%LOCALAPPDATA%\Vinput-dev`, with settings and models of their own. To run one of them over the settings and models of the installed Vinput, set the variable to something that is not a name, such as a dot, and run it through cargo as always: `$env:VINPUT_INSTANCE = "."; cargo run -- models`. Do not start `target\debug\vinput.exe` by hand for that: cargo builds the same file for more than one purpose, and after a `cargo test` it may be the build for tests, which is the copy `tests` whatever it is told (below). `cargo run` always builds the one meant to be run first. Only cargo reads `.cargo/config.toml`: the executable that ships is the same with or without it, and started by itself, as an installed one is, it is the one and only copy.
+
+Tests do not depend on that file. `vinput-core` built for its own tests, or with its feature `test-instance`, which every other crate asks for among its dev-dependencies and nothing asks for among its dependencies, runs as the copy `tests` when the variable names none, or names only the `dev` that cargo gives everything: tests have folders of their own (`%APPDATA%\Vinput-tests`), apart from those of the copy a developer runs, and a name set by hand is still taken. A test binary started in any way therefore never writes to the log, the settings or the `state` file of the installed Vinput, and can show or play nothing. A crate that gains tests and depends on `vinput-core` gets the same dev-dependency.
+
+## Looking at a window
+
+A window runs without the engine over canned data, in a build for development: the executable that ships leaves the canned data, the test card and the taking of pictures out (`vinput_ui::CANNED`), and answers `--mock` and `--picture` with why. The scenes are `SCENES` in `crates/vinput-ui/src/mock.rs`: `settings`, `first-run`, `listening`, `downloading`, `add-model`, `found`, `notice`, `update`, `update-downloading`, one for every state of the VinPUT Pro account, each starting with `pro-`, and one for every step of the setup of a Google service and every answer Google can give, each starting with `google-`. The windows are `settings`, `models`, `add-model`, `google`, `pro`, `advanced`, `about`, `update`.
+
+```bash
+cargo ui models --mock downloading
+```
+
+```bash
+cargo ui models --mock downloading --picture models.png
+```
+
+The first shows the window to click through; the second saves a picture once it has drawn and exits. `.github/workflows/pictures.yml` takes the same pictures on every push that touches `vinput-ui` or `vinput-view`. A new state worth looking at gets a scene, and a line in that workflow.
+
+## What must stay compatible
+
+Installed copies update themselves and other programs talk to them, so these are contracts with the past:
+
+- **`%APPDATA%\Vinput\settings.ini`.** A newer version reads an older file as it is, fills in defaults for keys it adds, and writes back keys it does not know. Never rename a key or give one a new meaning; add a new key. `settings.rs` has a test for this; keep it passing.
+- **`%APPDATA%\Vinput\state`.** Holds the word `listening` or `idle` for tools that poll. Keep the path and the two words. Failing to write it must never affect dictation.
+- **The local API** (`\\.\pipe\vinput`, `docs/api.md`). Additions only: new events, fields, modes, commands and error codes, which both sides must ignore when unknown. `protocol` stays `1` unless an existing client would break.
+- **The update manifest** (`latest.json`: `version`, `notes`, `url`, `sha256`, `bytes`, `published`) and the setup program's name, `VinputSetup-<version>.exe`, which is what makes the executable install instead of run. Released versions read both.
+- **How an update hands over.** A released version starts the setup program it downloaded with `--update` and exits. The setup program is the new version, so what happens next is its own business: it replaces the program and starts it with `--updated`, which shows the About page and a notification, so the user sees that Vinput is back. Keep `--update` meaning "install without asking, then start the new version so that it shows itself"; `--install --quiet` is for tools and starts it in the tray.
+- **Folders.** Settings, log and the model list in `%APPDATA%\Vinput`; models and the engine in `%LOCALAPPDATA%\Vinput`; the program in `%LOCALAPPDATA%\Programs\Vinput`; keys in the Windows credential store, under the names in `vinput-core/src/secrets.rs`, which stay as they are. An update replaces the program folder and nothing else.
+
+The line between the resident process and a window process is not such a contract: both ends are the same executable, so `vinput-view` may change freely as long as both sides change together. Keep its enums in serde's plain form, and lists of plain choices as numbers (`sent_as_number!`): `tag` and `content` are read through a buffer, which costs the executable a second copy of everything under them.
+
+## Working on it
+
+```bash
+cargo fmt --all --check
+```
+
+```bash
+cargo lint
+```
+
+```bash
+cargo test --workspace
+```
+
+```bash
+cargo size
+```
+
+- `cargo lint` is clippy for the whole workspace with warnings as errors, as CI runs it. The lints are in the root `Cargo.toml`: clippy `pedantic`, no `unwrap`, `expect` or `panic`, public items documented, `unsafe_code` denied except in modules that call Win32 and say so with `#![allow(unsafe_code)]` and a `SAFETY` comment on each block.
+- `cargo size` builds the shipping executable into `target\size\release\vinput.exe`. CI fails when it passes the budget in `.github/workflows/ci.yml`; see "How big a release may be" in `docs/release.md`.
+- Do not set a `RUSTFLAGS` environment variable for a build that ships: it replaces the flags in `.cargo/config.toml` that link the C runtime in.
+- Never start a build of `vinput.exe` by itself with no arguments, or with `--background`, `--install`, `--update` or `--uninstall`, on a PC where Vinput is installed and running, unless `VINPUT_INSTANCE` is set (see above): it talks to, replaces or removes the installed copy. Through `cargo run` it is the copy `dev`, which does none of that. One-shot commands (`models`, `check-update`, `transcribe`, `encode`, `ui ... --mock`) are safe. Build into a `--target-dir` of your own when several checkouts build at once.
+- Toolchain pinned in `rust-toolchain.toml`. Windows only: the engine compiles elsewhere, but capture, typing and the host do not exist there.

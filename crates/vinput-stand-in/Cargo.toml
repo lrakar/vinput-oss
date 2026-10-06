@@ -1,0 +1,23 @@
+[package]
+name = "vinput-stand-in"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A stand-in for a Vinput window process, for testing the line to the background process from end to end"
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vinput-ui.workspace = true
+vinput-view.workspace = true
+
+[target."cfg(windows)".dev-dependencies]
+vinput-host.workspace = true
+
+# Tests run as a separate copy; see the feature in vinput-core/Cargo.toml.
+[dev-dependencies]
+vinput-core = { workspace = true, features = ["test-instance"] }
+
+[lints]
+workspace = true

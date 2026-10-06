@@ -1,0 +1,133 @@
+[
+  {
+    "version": "0.4.0",
+    "published": "2026-10-06",
+    "notes": [
+      "VinPUT Pro, a subscription: text appears while you speak, in more than 60 languages, also mixed in one sentence, with nothing to download",
+      "40 hours a month for €6 a month or €59 a year; sign in with Google from Settings",
+      "Manage the subscription in the app or on the account page of the website",
+      "A guided setup for your own Google service under Settings, Models, in place of the fields on Advanced",
+      "Clearer messages when a key or a service is refused; Remove everything on uninstall also signs out"
+    ]
+  },
+  {
+    "version": "0.3.4",
+    "published": "2026-10-06",
+    "notes": [
+      "Escape cancels a dictation: nothing is typed, also while it is still being recognized",
+      "Voice memos are saved at a normal listening volume, however softly the microphone records",
+      "Voice memos play in every player",
+      "Silent install for package managers shows no window and finishes at once"
+    ]
+  },
+  {
+    "version": "0.3.3",
+    "published": "2026-10-06",
+    "notes": [
+      "Local models no longer type \"Thank you.\" or other made-up words after you stop speaking",
+      "Sound names such as *phone rings*, [Music] or (applause) are never typed",
+      "A key pressed by mistake in a quiet room types nothing",
+      "Text appears sooner when you pause before letting go of the key"
+    ]
+  },
+  {
+    "version": "0.3.2",
+    "published": "2026-10-06",
+    "notes": [
+      "After an update VinPUT reopens and shows the new version"
+    ]
+  },
+  {
+    "version": "0.3.1",
+    "published": "2026-10-06",
+    "notes": [
+      "Local models: text appears at each pause while you speak",
+      "Local models answer about a third of a second sooner",
+      "The first words are no longer lost while a model loads",
+      "The idle engine sleeps: nothing runs between dictations",
+      "The indicator appears the moment you press the key"
+    ]
+  },
+  {
+    "version": "0.3.0",
+    "published": "2026-10-06",
+    "notes": [
+      "A new Settings window in the style of Windows 11, light or dark",
+      "Settings take effect as you change them; no Save button",
+      "Half the download, and lighter in the background",
+      "A new listening indicator, and a tidier tray menu",
+      "Dictation keeps working while Settings is open"
+    ]
+  },
+  {
+    "version": "0.2.6",
+    "published": "2026-10-05",
+    "notes": [
+      "The tray menu lists the models you added yourself too"
+    ]
+  },
+  {
+    "version": "0.2.5",
+    "published": "2026-10-05",
+    "notes": [
+      "Custom models: add a Whisper model from Hugging Face or a file",
+      "Audio input: choose the microphone in Settings or the tray",
+      "Tray menu: model, microphone and graphics card at a click",
+      "The tray icon answers clicks however Vinput was started",
+      "Local API: error codes, answers to the sender, limits"
+    ]
+  },
+  {
+    "version": "0.2.4",
+    "published": "2026-10-05",
+    "notes": [
+      "Dictate and search: a key that opens your words as a search",
+      "The graphics card is used by default when the PC has one",
+      "Switching it on or off keeps your downloaded models",
+      "A model you choose is in use at once, and Settings shows it",
+      "The tray icon stays alive after Vinput was ended by force"
+    ]
+  },
+  {
+    "version": "0.2.3",
+    "published": "2026-10-05",
+    "notes": [
+      "Local models run on any graphics card: NVIDIA, AMD or Intel",
+      "The graphics card engine is an 18 MB download, not 670 MB",
+      "Settings names the graphics card and where the model runs"
+    ]
+  },
+  {
+    "version": "0.2.2",
+    "published": "2026-10-05",
+    "notes": [
+      "Models page: what is in use, downloaded or available",
+      "Download, Use and Remove buttons, with progress and disk use",
+      "No model is preselected; the first start opens the list",
+      "Clicking a notification opens the right Settings page",
+      "Check for updates button in Settings; Browse for the memo folder"
+    ]
+  },
+  {
+    "version": "0.2.1",
+    "published": "2026-10-05",
+    "notes": [
+      "Listed as VinPUT under Installed apps, with its icon",
+      "Uninstall also removes companion programs and their startup entries",
+      "Silent uninstall for package managers",
+      "Local models keep to the languages you set",
+      "Documentation and release notes are on the site"
+    ]
+  },
+  {
+    "version": "0.2.0",
+    "published": "2026-10-05",
+    "notes": [
+      "Voice memos: record, save as MP3, paste anywhere",
+      "Speech models that run on your own PC",
+      "Gemini live transcription",
+      "Settings with General and Advanced pages",
+      "Installs and updates itself; no administrator rights"
+    ]
+  }
+]

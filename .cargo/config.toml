@@ -1,0 +1,29 @@
+# Shortcuts for the checks CI runs and for looking at a window.
+#
+#   cargo lint                             what CI lints, with warnings as errors
+#   cargo size                             the shipping executable, in target\size\release
+#   cargo ui settings --mock first-run     a window over canned data
+[alias]
+lint = "clippy --workspace --all-targets --locked -- -D warnings"
+size = "build --release --locked -p vinput --target-dir target/size"
+ui = "run -p vinput -- ui"
+
+# Whatever cargo runs from this folder (`cargo run`, `cargo ui`) runs as the
+# separate copy "dev": its settings, log and models are in
+# %APPDATA%\Vinput-dev and %LOCALAPPDATA%\Vinput-dev, never in the folders of
+# the Vinput installed on this PC, and it shows no notifications and plays no
+# sounds (ARCHITECTURE.md, "A second copy beside the installed one"). Tests
+# take this name for no name and run as the copy "tests"; the name is also
+# `CARGO` in crates/vinput-core/src/instance.rs, and a test keeps the two in
+# step. A VINPUT_INSTANCE of your own takes precedence. This sets a variable
+# for processes cargo starts and nothing else.
+[env]
+VINPUT_INSTANCE = { value = "dev", force = false }
+
+# The C runtime is linked into the executable, so it needs nothing but Windows
+# itself: without this it imports VCRUNTIME140.dll, which a fresh Windows does
+# not have. A RUSTFLAGS environment variable replaces these flags instead of
+# adding to them, so never set one for a build that ships; the release script
+# and CI check the result.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,59 @@
+name: Engine (Vulkan)
+
+# Builds the local speech engine (whisper.cpp) with Vulkan, for graphics cards
+# of any make. Its own releases only have a processor build and an NVIDIA
+# build. Runs when a tag `engine-vulkan-*` is pushed; the archive is the
+# artifact of the run. To publish it, put it under `site/engines` on the
+# `site` branch and pin its size and SHA-256 in crates/vinput-core/src/models.rs.
+on:
+  push:
+    tags: ["engine-vulkan-*"]
+
+permissions:
+  contents: read
+
+env:
+  # The release the other engine builds are pinned to, by commit.
+  WHISPER_TAG: v1.9.2
+  WHISPER_COMMIT: 306c88f4d1286aec1bf96e544632897886af5501
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get the engine source
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$WHISPER_TAG" https://github.com/ggml-org/whisper.cpp src
+          test "$(git -C src rev-parse HEAD)" = "$WHISPER_COMMIT"
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe -OutFile sdk.exe
+          (Get-FileHash sdk.exe -Algorithm SHA256).Hash
+          Start-Process -Wait -FilePath .\sdk.exe -ArgumentList '--root','C:\VulkanSDK','--accept-licenses','--default-answer','--confirm-command','install'
+          if (-not (Test-Path C:\VulkanSDK\Bin\glslc.exe)) { throw 'the Vulkan SDK did not install' }
+          "VULKAN_SDK=C:\VulkanSDK" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S src -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_TESTS=OFF
+          cmake --build build --config Release -j 4
+      - name: Pack
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out\Release | Out-Null
+          Copy-Item build\bin\Release\*.exe, build\bin\Release\*.dll out\Release
+          foreach ($needed in 'whisper-server.exe', 'parakeet-cli.exe') {
+            if (-not (Test-Path "out\Release\$needed")) { throw "$needed was not built" }
+          }
+          Get-ChildItem out\Release | Select-Object Name, Length
+          Compress-Archive -Path out\Release -DestinationPath whisper-vulkan-bin-x64.zip
+          (Get-FileHash whisper-vulkan-bin-x64.zip -Algorithm SHA256).Hash.ToLower()
+          (Get-Item whisper-vulkan-bin-x64.zip).Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-bin-x64
+          path: whisper-vulkan-bin-x64.zip
+          compression-level: 0

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# No RUSTFLAGS here: the variable would replace the flags in
+# .cargo/config.toml, which link the C runtime into the executable. Warnings
+# are errors through `-D warnings` on the clippy line (`cargo lint` locally).
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # Builds the executable that ships, says how big it is and fails when it has
+  # outgrown its budget. See "How big a release may be" in docs/release.md.
+  size:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # 2,646,528 bytes when this was set. Raise it in the commit that needs
+      # the room, and say there what the bytes buy.
+      BUDGET_BYTES: 3400000
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: cargo build --release --locked -p vinput
+      - name: Report the size
+        shell: pwsh
+        run: |
+          $exe = Get-Item target\release\vinput.exe
+          $budget = [long]$env:BUDGET_BYTES
+          $image = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe.FullName))
+          $needsRuntime = $image.IndexOf("VCRUNTIME140", [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+          $left = $budget - $exe.Length
+          @(
+            "### vinput.exe"
+            ""
+            "| | bytes |"
+            "| --- | ---: |"
+            "| Size | $('{0:N0}' -f $exe.Length) |"
+            "| Budget | $('{0:N0}' -f $budget) |"
+            "| Left | $('{0:N0}' -f $left) |"
+            ""
+            "Needs the Visual C++ runtime: $(if ($needsRuntime) { 'yes' } else { 'no' })"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($needsRuntime) {
+            throw "vinput.exe imports VCRUNTIME140.dll; it must start on a PC with nothing but Windows (see .cargo/config.toml)"
+          }
+          if ($left -lt 0) {
+            throw "vinput.exe is $($exe.Length) bytes, $(-$left) over its budget of $budget"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vinput-exe
+          path: target/release/vinput.exe
+          retention-days: 7

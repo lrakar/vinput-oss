@@ -1,0 +1,30 @@
+name: Audit
+
+# Checks the dependencies against the RustSec advisory database and makes sure
+# they all come from crates.io (deny.toml). Runs when the dependencies change
+# and once a week, because an advisory can appear without anything changing
+# here; that is also why it is not part of CI, where it would fail pushes that
+# have nothing to do with it. Needs no secrets.
+on:
+  push:
+    paths:
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    # Reads Cargo.lock only and builds nothing, so it does not need Windows.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories sources

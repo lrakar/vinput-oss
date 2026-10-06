@@ -1,0 +1,23 @@
+# Build output
+/target
+/dist
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*credentials*.json
+*service-account*.json
+/config.local.toml
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Debugging
+*.pdb

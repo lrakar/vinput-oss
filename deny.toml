@@ -1,0 +1,22 @@
+# What `cargo deny check advisories sources` holds the dependencies to. Run by
+# .github/workflows/audit.yml; locally, after `cargo install cargo-deny`:
+#
+#   cargo deny check advisories sources
+
+[graph]
+# Vinput ships for one target; crates only other targets pull in do not count.
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+# A known vulnerability or a yanked version anywhere in the tree fails the
+# check. A crate that has merely lost its maintainer fails it only when the
+# workspace depends on it directly, where replacing it is in our hands.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[sources]
+# Everything comes from crates.io: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"

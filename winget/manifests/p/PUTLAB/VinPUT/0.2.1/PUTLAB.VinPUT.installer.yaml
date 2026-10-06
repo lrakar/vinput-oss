@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+
+PackageIdentifier: PUTLAB.VinPUT
+PackageVersion: 0.2.1
+MinimumOSVersion: 10.0.17763.0
+InstallerType: exe
+Scope: user
+InstallModes:
+- interactive
+- silent
+InstallerSwitches:
+  Interactive: --install
+  Silent: --install --quiet
+  SilentWithProgress: --install --quiet
+UpgradeBehavior: install
+ReleaseDate: 2026-10-05
+AppsAndFeaturesEntries:
+- DisplayName: VinPUT
+  Publisher: PUTLAB
+  DisplayVersion: 0.2.1
+  ProductCode: Vinput
+Installers:
+- Architecture: x64
+  InstallerUrl: https://vinput-dasvcr.web.app/releases/VinputSetup-0.2.1.exe
+  InstallerSha256: FDC823AFFB2A2A5A4ED93B547633494A57C31131286027C245D393BF3EA91127
+ManifestType: installer
+ManifestVersion: 1.12.0

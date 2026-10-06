@@ -1,0 +1,123 @@
+name: Pictures
+
+# Pictures of the windows, for reviewing a change to how they look. Runs
+# only when the windows or what they show change; the pictures are an
+# artifact of the run.
+#
+# Each one is taken by the program itself:
+#
+#   vinput ui <window> --mock <scene> --picture <file.png>
+#
+# shows the window over canned data, saves the picture and exits. The scenes
+# are `SCENES` in crates/vinput-ui/src/mock.rs; the list below pairs each
+# window with the scenes that change what it shows. Add a line when a scene
+# or a window is added.
+on:
+  push:
+    paths:
+      - "crates/vinput-ui/**"
+      - "crates/vinput-view/**"
+      - ".github/workflows/pictures.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pictures-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pictures:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # A debug build: it has a console, so each run below is waited for and
+      # says on standard error why it failed.
+      - run: cargo build --locked -p vinput
+      - name: Take pictures
+        shell: pwsh
+        run: |
+          $shots = @(
+            "settings settings", "settings first-run", "settings listening", "settings notice",
+            "models settings", "models first-run", "models downloading",
+            "models pro-subscribed", "models pro-subscribed-elsewhere",
+            "models pro-complimentary", "models pro-over-allowance",
+            "models pro-payment-problem", "models pro-expired", "models pro-offline",
+            "models many-models", "settings pro-over-allowance",
+            "settings one-language",
+            "pro pro-signed-out", "pro pro-signing-in", "pro pro-not-subscribed",
+            "pro pro-awaiting-payment", "pro pro-subscribed", "pro pro-complimentary",
+            "pro pro-ending",
+            "pro pro-over-allowance", "pro pro-payment-problem", "pro pro-payment-failed",
+            "pro pro-expired", "pro pro-offline", "pro pro-offline-known",
+            "add-model add-model", "add-model found", "add-model notice",
+            "google google-service",
+            "google google-gemini-get", "google google-gemini-enter",
+            "google google-gemini-checking", "google google-gemini-entered",
+            "google google-gemini-works", "google google-gemini-replacing",
+            "google google-gemini-wrong-key", "google google-gemini-no-access",
+            "google google-gemini-billing", "google google-gemini-quota",
+            "google google-gemini-offline", "google google-gemini-other",
+            "google google-gemini-done",
+            "google google-speech-get", "google google-speech-enter",
+            "google google-speech-checking", "google google-speech-works",
+            "google google-speech-key-file", "google google-speech-wrong-key",
+            "google google-speech-no-access", "google google-speech-billing",
+            "google google-speech-quota", "google google-speech-not-found",
+            "google google-speech-no-sign-in", "google google-speech-bad-file",
+            "google google-speech-offline", "google google-speech-done",
+            "advanced settings", "advanced first-run",
+            "about settings", "about update",
+            "update update", "update update-downloading"
+          )
+          $exe = Resolve-Path target\debug\vinput.exe
+          New-Item -ItemType Directory -Force pictures | Out-Null
+          $failed = @()
+          foreach ($shot in $shots) {
+            $window, $scene = $shot.Split(" ")
+            # Relative, so no folder name with a space in it can split the argument.
+            $picture = "pictures\$window--$scene.png"
+            $log = "pictures\$window--$scene.txt"
+            $run = Start-Process $exe -ArgumentList "ui", $window, "--mock", $scene, "--picture", $picture `
+              -PassThru -NoNewWindow -RedirectStandardError $log
+            # Without this the exit code is not there to read afterwards.
+            $null = $run.Handle
+            # A window that never draws must not hold the job.
+            if (-not $run.WaitForExit(60000)) {
+              $run.Kill()
+              $failed += "${shot}: no picture after a minute"
+              continue
+            }
+            $said = (Get-Content $log -Raw -ErrorAction SilentlyContinue)
+            # Until the windows are in the build there is nothing to picture.
+            # Remove this once `vinput ui` shows windows.
+            if ($said -match "no windows yet") {
+              "This build has no windows yet; no pictures were taken." |
+                Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+              exit 0
+            }
+            if ($run.ExitCode -ne 0 -or -not (Test-Path $picture) -or (Get-Item $picture).Length -eq 0) {
+              $failed += "${shot}: $("$said".Trim())"
+              continue
+            }
+            Remove-Item $log
+          }
+          "Took $($shots.Count - $failed.Count) of $($shots.Count) pictures." |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($failed) {
+            $failed | ForEach-Object { "- $_" } | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            throw "some windows could not be pictured:`n$($failed -join "`n")"
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pictures
+          path: pictures
+          if-no-files-found: ignore

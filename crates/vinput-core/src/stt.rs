@@ -158,7 +158,7 @@ impl FromStr for ProviderKind {
 /// be reached.
 pub fn connect(settings: &Settings) -> Result<Arc<dyn SpeechProvider>> {
     if !settings.has_model() {
-        return Err(Error::Transcription(
+        return Err(Error::Setup(
             "no speech model is chosen; pick one under Settings, Models".into(),
         ));
     }

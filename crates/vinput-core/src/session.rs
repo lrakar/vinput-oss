@@ -78,6 +78,10 @@ pub struct Failure {
     /// The speech service the session used, which is where to look for what
     /// to do about it.
     pub provider: ProviderKind,
+    /// Whether it failed for want of something only the user can see to in
+    /// Settings ([`Error::Setup`](crate::Error::Setup)), so that the next
+    /// session would fail the same way.
+    pub setup: bool,
     /// The id the session was started with, if any.
     pub id: Option<String>,
 }

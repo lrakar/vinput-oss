@@ -71,6 +71,7 @@ impl Closing {
                     .push(Failure {
                         message: err.to_string(),
                         provider: self.provider,
+                        setup: matches!(err, Error::Setup(_)),
                         id: self.id.clone(),
                     });
             }
@@ -1054,6 +1055,24 @@ mod tests {
         };
         assert!(failure.message.contains("no microphone"), "{failure:?}");
         assert_eq!(failure.id.as_deref(), Some("my-42"));
+        // Another press may find the microphone back.
+        assert!(!failure.setup);
+    }
+
+    #[test]
+    fn a_session_that_fails_for_want_of_setting_up_says_that_pressing_again_is_no_use() {
+        let (closing, heard, _) = closing();
+        closing.with(Err(Error::Setup("no model is installed".to_owned())));
+        let found = told(&heard);
+        let [failure] = found[0].failures.as_slice() else {
+            return assert_eq!(found[0].failures.len(), 1);
+        };
+        assert!(failure.setup, "{failure:?}");
+        // In the same words as any failure to recognize.
+        assert_eq!(
+            failure.message,
+            "transcription failed: no model is installed"
+        );
     }
 
     #[test]

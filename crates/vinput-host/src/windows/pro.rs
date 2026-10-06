@@ -207,6 +207,37 @@ impl Pro {
         models::spare(&settings.last_local_model, settings.use_gpu()).map(|model| model.name)
     }
 
+    /// Why `VinPUT` Pro cannot serve a dictation as things stand, as far as
+    /// is known without asking: nobody is signed in, the account has no
+    /// subscription that is paid for, or the month's hours are used up and
+    /// no model on this PC carries on. `None` if it can, and while the
+    /// server has not said how the account stands.
+    ///
+    /// What is known may be old: someone may have subscribed in a browser
+    /// since. The page this leads to asks the account when it opens, so
+    /// that is found out there, and the next press finds it known.
+    ///
+    /// This is asked at every key press. With hours left it looks at
+    /// nothing but what is in memory; which model carries on is looked up
+    /// only while one has to.
+    pub(super) fn lacks(&self, settings: &Settings) -> Option<&'static str> {
+        self.lacks_unless(|| self.carrying_with(settings).is_some())
+    }
+
+    /// [`Pro::lacks`], where `carries` says whether a model on this PC
+    /// carries on when the hours are used up.
+    fn lacks_unless(&self, carries: impl FnOnce() -> bool) -> Option<&'static str> {
+        if self.email.is_none() {
+            return Some("Sign in to VinPUT Pro to dictate with it, or use another model.");
+        }
+        if self.standby.until() != 0 {
+            return (!carries()).then_some("This month's VinPUT Pro hours are used up.");
+        }
+        let (info, _) = self.info.as_ref()?;
+        (!info.entitled && !info.complimentary)
+            .then_some("VinPUT Pro needs a subscription. Choose a plan, or use another model.")
+    }
+
     /// What the host knows when it starts, with `email` signed in.
     fn of(email: Option<String>, account: Arc<Account>) -> Self {
         Self {
@@ -884,6 +915,97 @@ mod tests {
 
     fn refused(code: Code) -> Failure {
         Failure::refused(code, "not now")
+    }
+
+    #[test]
+    fn vinput_pro_cannot_serve_signed_out_or_without_a_subscription() {
+        let settings = Settings {
+            provider: ProviderKind::Cloud,
+            model: cloud::MODEL_ID.to_owned(),
+            ..Settings::default()
+        };
+        let lacks =
+            |pro: &Pro, word: &str| pro.lacks(&settings).is_some_and(|why| why.contains(word));
+        // Nobody is signed in: there is nothing to ask the server.
+        assert!(lacks(&pro(None), "Sign in"));
+        // Signed in, and the server has not said yet: a session finds out.
+        let mut pro = pro(Some("ana@example.com"));
+        assert_eq!(pro.lacks(&settings), None);
+        // No subscription that is paid for.
+        told(&mut pro, vec![Report::Info(Ok(info(false)))]);
+        assert!(lacks(&pro, "subscription"));
+        // An account the server gives Pro to needs none.
+        let given = AccountInfo {
+            complimentary: true,
+            ..info(false)
+        };
+        told(&mut pro, vec![Report::Info(Ok(given))]);
+        assert_eq!(pro.lacks(&settings), None);
+        // Subscribed, in the browser: known the next time the account says.
+        told(&mut pro, vec![Report::Info(Ok(info(false)))]);
+        told(&mut pro, vec![Report::Info(Ok(info(true)))]);
+        assert_eq!(pro.lacks(&settings), None);
+        // A server that cannot be reached changes nothing about that.
+        let unreachable = Failure::Unreachable("offline".into());
+        told(&mut pro, vec![Report::Info(Err(unreachable))]);
+        assert_eq!(pro.lacks(&settings), None);
+        // Signed out elsewhere.
+        told(&mut pro, vec![Report::Info(Err(Failure::SignedOut))]);
+        assert!(lacks(&pro, "Sign in"));
+    }
+
+    #[test]
+    fn used_up_hours_stop_vinput_pro_only_when_no_model_on_this_pc_carries_on() {
+        let mut pro = pro(Some("ana@example.com"));
+        let asked = std::cell::Cell::new(0);
+        let lacks = |pro: &Pro, carries: bool| {
+            pro.lacks_unless(|| {
+                asked.set(asked.get() + 1);
+                carries
+            })
+        };
+        // Hours left, or nothing known yet: whether a model is on this PC
+        // is nobody's business, and the disk is not looked at for one.
+        assert_eq!(lacks(&pro, false), None);
+        let mut account = info(true);
+        account.used_seconds = 100;
+        account.resets_at = u64::MAX;
+        told(&mut pro, vec![Report::Info(Ok(account.clone()))]);
+        assert_eq!(lacks(&pro, false), None);
+        assert_eq!(asked.get(), 0);
+        // None left. A model on this PC carries on: a session is started.
+        account.used_seconds = account.cap_seconds;
+        told(&mut pro, vec![Report::Info(Ok(account.clone()))]);
+        assert_eq!(lacks(&pro, true), None);
+        // Without one there is nothing to dictate with.
+        assert!(lacks(&pro, false).is_some_and(|why| why.contains("used up")));
+        assert_eq!(asked.get(), 2);
+        // The same for an account the server gives Pro to.
+        let given = AccountInfo {
+            entitled: false,
+            complimentary: true,
+            ..account.clone()
+        };
+        told(&mut pro, vec![Report::Info(Ok(given))]);
+        assert_eq!(lacks(&pro, true), None);
+        assert!(lacks(&pro, false).is_some());
+        // A server out of reach leaves what was known: the model carries on.
+        let unreachable = Failure::Unreachable("offline".into());
+        told(&mut pro, vec![Report::Info(Err(unreachable))]);
+        assert_eq!(lacks(&pro, true), None);
+        // A tier with more hours, or a new month: Pro again.
+        account.cap_seconds *= 2;
+        told(&mut pro, vec![Report::Info(Ok(account.clone()))]);
+        assert_eq!(lacks(&pro, false), None);
+        // A subscription that is not paid for has no hours to have run out:
+        // it is the subscription that is missing, model or no model.
+        account.used_seconds = account.cap_seconds;
+        account.entitled = false;
+        told(&mut pro, vec![Report::Info(Ok(account))]);
+        assert!(lacks(&pro, true).is_some_and(|why| why.contains("subscription")));
+        // Signed out, the sign-in is.
+        pro.reset();
+        assert!(lacks(&pro, true).is_some_and(|why| why.contains("Sign in")));
     }
 
     /// The reports in the order they arrive, under the sign-in that is

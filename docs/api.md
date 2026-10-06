@@ -69,7 +69,7 @@ A command could not be carried out, or a session failed:
 | `too_many_clients` | 16 programs are connected already. The pipe is closed after it. |
 | `settings_open` | A hotkey is being set in Vinput's settings window, so no session can start right now. Try again in a moment. |
 | `busy` | `start` was sent while a session is running. Nothing changed. |
-| `no_model` | No speech model is chosen, so only `memo` can start. |
+| `no_model` | No speech model can be used as things stand, so only `memo` can start: none is chosen, the chosen one is not downloaded, a Google service of your own has no key or project, or VinPUT Pro is not signed in, has no subscription or has used up its hours with no model on this PC to carry on. The message says which. |
 | `session_failed` | A session started but failed. `message` says why. `id` is that of the session that failed, also when another session has started or ended since. |
 
 Events other than errors about a command go to every connected client, so use an `id` to recognize the results you asked for. A client that falls behind by more than 64 events misses the oldest ones but stays connected.

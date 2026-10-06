@@ -386,10 +386,10 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transcription`] if no project is configured.
+    /// Returns [`Error::Setup`] if no project is configured.
     pub fn google_config(&self) -> Result<GoogleConfig> {
         let project_id = self.project_id.clone().ok_or_else(|| {
-            Error::Transcription(
+            Error::Setup(
                 "no Google Cloud project is set; set Google Cloud Speech up under Settings, Models"
                     .into(),
             )

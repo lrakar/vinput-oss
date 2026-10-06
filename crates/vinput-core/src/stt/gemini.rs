@@ -127,7 +127,7 @@ impl GeminiConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transcription`] if no API key is stored.
+    /// Returns [`Error::Setup`] if no API key is stored.
     pub fn from_settings(settings: &Settings) -> Result<Self> {
         let from_env = || {
             std::env::var(ENV_API_KEY)
@@ -137,7 +137,7 @@ impl GeminiConfig {
         let api_key = secrets::get(secrets::GEMINI_API_KEY)
             .or_else(from_env)
             .ok_or_else(|| {
-                Error::Transcription(
+                Error::Setup(
                     "no Gemini API key is stored; set Google Gemini up under Settings, Models"
                         .into(),
                 )

@@ -25,15 +25,16 @@ use std::time::Instant;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
 
+use super::children::Which;
 use super::tray::{self, About};
 use super::{Host, SESSION_ENDED, TICK_MS, TICK_TIMER_ID, hotkeys};
 use crate::indicator::Indicator;
 use crate::win::{is_down, open};
 use vinput_core::api::{ClientId, ErrorCode, Event};
 use vinput_core::session::{Action, Controller, Failure, Outcome, Target};
-use vinput_core::settings::data_dir;
-use vinput_core::stt::ProviderKind;
-use vinput_core::{log, search};
+use vinput_core::settings::{Settings, data_dir};
+use vinput_core::stt::{GeminiConfig, ProviderKind};
+use vinput_core::{log, models, search};
 use vinput_view::Page;
 
 /// What it comes to for the host that a session has ended.
@@ -134,27 +135,15 @@ impl Host {
         requester: Option<(ClientId, Option<String>)>,
         controller: &mut dyn Controller,
     ) {
+        // Only a voice memo works without a speech model.
+        let lacking = match action {
+            Action::Start { target } if target != Target::Memo => self.lacking(),
+            _ => None,
+        };
+        if let Some((page, why, stay)) = lacking {
+            return self.turn_away(page, why, stay, requester.as_ref());
+        }
         match action {
-            // Only a voice memo works without a speech model.
-            Action::Start { target } if target != Target::Memo && !self.settings.has_model() => {
-                self.trigger.session_ended();
-                let message = "no speech model is chosen";
-                match &requester {
-                    Some((from, id)) => {
-                        self.answer(*from, ErrorCode::NoModel, message, id.as_deref());
-                    }
-                    None => self.send_event(Event::Error {
-                        code: ErrorCode::NoModel,
-                        message,
-                        id: None,
-                    }),
-                }
-                self.tray.warn(
-                    About::Settings(Page::Models),
-                    "Choose a speech model first",
-                    "VinPUT has no speech model yet. Click here to choose one.",
-                );
-            }
             Action::Start { target } => {
                 let id = requester.and_then(|(_, id)| id);
                 self.held_vk = held_vk;
@@ -175,6 +164,101 @@ impl Host {
             Action::Stop => self.stop(controller),
             Action::None => {}
         }
+    }
+
+    /// What stands between a key press and a dictation, as far as is known
+    /// without trying, the page of Settings on which it is seen to, and
+    /// whether a Settings window that is open is left on the page it shows:
+    /// the welcome is not turned away from, nor is whoever watches the
+    /// chosen model being downloaded.
+    ///
+    /// This is asked at every press, so nothing here waits: whether the
+    /// files of a model or the key of a service are there is looked for
+    /// until they are found, and not again while nothing has changed.
+    fn lacking(&self) -> Option<(Page, &'static str, bool)> {
+        let settings = &self.settings;
+        let found = &self.found;
+        let (page, why) = lacking(
+            settings,
+            || self.pro.lacks(settings),
+            |model, gpu| {
+                found.set(found.get() || models::is_installed(model, gpu));
+                found.get()
+            },
+            || {
+                found.set(found.get() || GeminiConfig::from_settings(settings).is_ok());
+                found.get()
+            },
+        )?;
+        let downloading = settings.provider == ProviderKind::Local
+            && models::find(ProviderKind::Local, &settings.model).is_some_and(|model| {
+                matches!(
+                    self.installer.status(model, settings.use_gpu()),
+                    models::Status::Installing { .. }
+                )
+            });
+        if downloading {
+            return Some((page, "The chosen model is still being downloaded.", true));
+        }
+        Some((page, why, page == Page::Welcome))
+    }
+
+    /// Nothing can be dictated as things stand. A session would only fail,
+    /// and fail again at every press after it, so none is started, and no
+    /// sound says that listening has: whoever pressed the key is shown the
+    /// page of Settings on which it is put right. A program that asked
+    /// through the API is told, and the user with a notification, since
+    /// nobody may be at the keyboard.
+    fn turn_away(
+        &mut self,
+        page: Page,
+        why: &str,
+        stay: bool,
+        requester: Option<&(ClientId, Option<String>)>,
+    ) {
+        self.trigger.session_ended();
+        if let Some((from, id)) = requester {
+            self.answer(*from, ErrorCode::NoModel, why, id.as_deref());
+            self.tray
+                .warn(About::Settings(page), "VinPUT cannot dictate yet", why);
+            // No window opens that would ask the account, and what is known
+            // of it may be old: the next start finds what it says now.
+            if page == Page::Pro {
+                self.pro_keep_current();
+            }
+        } else {
+            self.send_event(Event::Error {
+                code: ErrorCode::NoModel,
+                message: why,
+                id: None,
+            });
+            self.show_why(page, why, stay);
+        }
+    }
+
+    /// Opens Settings on `page`, which says why nothing can be dictated. The
+    /// page of the account shows how the account stands by itself, and the
+    /// welcome what there is to choose; the others are told.
+    ///
+    /// A Settings window that is open is turned to the page and brought to
+    /// the front once. Pressed again while it stays open, the key takes
+    /// nothing away from whatever the user is doing: it is said in a
+    /// notification, and that not over and over.
+    fn show_why(&mut self, page: Page, why: &str, stay: bool) {
+        let open = self.windows.is_open(Which::Settings);
+        if !turns(open, self.led_to, page, stay) {
+            return self.tray.warn_of_failure(
+                About::Settings(page),
+                "VinPUT cannot dictate yet",
+                why,
+            );
+        }
+        if !matches!(page, Page::Pro | Page::Welcome) {
+            self.tell(page, why);
+        }
+        self.open_settings(page);
+        self.led_to = Some(page);
+        self.show_state();
     }
 
     /// Passes on what finished sessions left behind: captured text and saved
@@ -226,10 +310,18 @@ impl Host {
             } else {
                 Page::Models
             };
-            // A failure that comes back with every press is not said over
-            // and over.
-            self.tray
-                .warn_of_failure(About::Settings(page), title, &failure.message);
+            if failure.setup {
+                // It would come back with every press until something is
+                // done about it in Settings, which is therefore opened.
+                // What was found on this PC at an earlier press may be gone.
+                self.found.set(false);
+                self.show_why(page, &failure.message, false);
+            } else {
+                // A failure that comes back with every press is not said
+                // over and over.
+                self.tray
+                    .warn_of_failure(About::Settings(page), title, &failure.message);
+            }
         }
     }
 
@@ -398,6 +490,56 @@ impl Host {
     }
 }
 
+/// What stands between a key press and a dictation with these settings, and
+/// the page of Settings on which it is seen to: no model is chosen, the
+/// chosen one is not on this PC, a Google service of one's own has no key or
+/// no project, or `VinPUT` Pro cannot serve, which `pro` says. `None` when a
+/// session is worth starting. Someone new who has chosen nothing yet has the
+/// welcome to choose in.
+///
+/// `installed` says whether a model that runs on this PC is there, and
+/// `keyed` whether the key for Gemini is; neither is asked unless the
+/// settings choose that.
+fn lacking(
+    settings: &Settings,
+    pro: impl FnOnce() -> Option<&'static str>,
+    installed: impl FnOnce(&models::Model, bool) -> bool,
+    keyed: impl FnOnce() -> bool,
+) -> Option<(Page, &'static str)> {
+    if !settings.has_model() {
+        return Some(if settings.owes_welcome() {
+            (
+                Page::Welcome,
+                "Choose what turns your speech into text first.",
+            )
+        } else {
+            (Page::Models, "Choose a speech model to start dictating.")
+        });
+    }
+    let why = match settings.provider {
+        ProviderKind::Cloud => return pro().map(|why| (Page::Pro, why)),
+        ProviderKind::Local => models::find(ProviderKind::Local, &settings.model)
+            .is_none_or(|model| !installed(model, settings.use_gpu()))
+            .then_some("The chosen model is not on this PC. Download it, or use another model."),
+        ProviderKind::Gemini => (!keyed())
+            .then_some("Google Gemini has no API key yet. Set it up, or use another model."),
+        ProviderKind::GoogleCloud => settings
+            .project_id
+            .is_none()
+            .then_some("Google Cloud Speech has no project yet. Set it up, or use another model."),
+        _ => None,
+    };
+    why.map(|why| (Page::Models, why))
+}
+
+/// Whether a key press that cannot dictate turns Settings to `page` and
+/// brings it to the front. A window that is not `open` is opened there. One
+/// that is open is turned once: not to the page a press `led` to before,
+/// and not at all when it is to `stay` on what it shows.
+fn turns(open: bool, led: Option<Page>, page: Page, stay: bool) -> bool {
+    !open || !(stay || led == Some(page))
+}
+
 /// A length for people: `8 s`, `2 min 05 s`.
 #[expect(
     clippy::cast_possible_truncation,
@@ -431,6 +573,7 @@ pub(super) fn publish_state(listening: bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -543,8 +686,183 @@ mod tests {
         Failure {
             message: message.to_owned(),
             provider: ProviderKind::Local,
+            setup: false,
             id: id.map(str::to_owned),
         }
+    }
+
+    /// Settings that choose `model` of `provider`.
+    fn choosing(provider: ProviderKind, model: &str) -> Settings {
+        Settings {
+            provider,
+            model: model.to_owned(),
+            ..Settings::default()
+        }
+    }
+
+    /// What `lacking` looked at besides the settings.
+    #[derive(Default)]
+    struct Looked {
+        account: Cell<bool>,
+        disk: Cell<bool>,
+        key: Cell<bool>,
+    }
+
+    impl Looked {
+        fn any(&self) -> bool {
+            self.account.get() || self.disk.get() || self.key.get()
+        }
+    }
+
+    /// What stands in the way with `settings` when `VinPUT` Pro says `pro`,
+    /// models are on this PC or not as `installed` says, and the key for
+    /// Gemini is there or not as `keyed` says; and what was looked at.
+    fn lack(
+        settings: &Settings,
+        pro: Option<&'static str>,
+        installed: bool,
+        keyed: bool,
+    ) -> (Option<(Page, &'static str)>, Looked) {
+        let looked = Looked::default();
+        let lacks = lacking(
+            settings,
+            || {
+                looked.account.set(true);
+                pro
+            },
+            |_, _| {
+                looked.disk.set(true);
+                installed
+            },
+            || {
+                looked.key.set(true);
+                keyed
+            },
+        );
+        (lacks, looked)
+    }
+
+    fn page_of(lacks: &(Option<(Page, &'static str)>, Looked)) -> Option<Page> {
+        lacks.0.map(|(page, _)| page)
+    }
+
+    #[test]
+    fn without_a_model_a_press_leads_to_the_models_and_starts_nothing() {
+        // Nothing else is looked at: not the account, not the disk.
+        let lacks = lack(&Settings::default(), None, true, true);
+        assert_eq!(page_of(&lacks), Some(Page::Models));
+        assert!(!lacks.1.any());
+        // Pressed again, it is the same answer, as often as it is pressed:
+        // nothing was started that could have changed it.
+        let again = lack(&Settings::default(), None, true, true);
+        assert_eq!(again.0, lacks.0);
+    }
+
+    #[test]
+    fn someone_new_without_a_model_is_led_to_the_welcome() {
+        // The welcome was closed before anything was chosen in it: the key
+        // leads back to it, as the tray icon does.
+        let new = Settings {
+            first_run: true,
+            ..Settings::default()
+        };
+        assert!(new.owes_welcome());
+        let lacks = lack(&new, None, true, true);
+        assert_eq!(page_of(&lacks), Some(Page::Welcome));
+        assert!(!lacks.1.any());
+        // "Set up later" ends the welcome: from then on it is the models.
+        let later = Settings {
+            first_run: false,
+            ..new.clone()
+        };
+        assert_eq!(page_of(&lack(&later, None, true, true)), Some(Page::Models));
+        // With a model chosen the welcome has nothing to do with it.
+        let chosen = Settings {
+            first_run: true,
+            ..choosing(ProviderKind::Gemini, "some-model")
+        };
+        assert_eq!(lack(&chosen, None, true, true).0, None);
+    }
+
+    #[test]
+    fn a_model_that_is_not_on_this_pc_leads_to_the_models() {
+        let local = models::all()
+            .into_iter()
+            .find(|model| model.local.is_some());
+        let Some(model) = local else {
+            return;
+        };
+        let settings = choosing(ProviderKind::Local, model.id);
+        let lacks = lack(&settings, None, false, true);
+        assert_eq!(page_of(&lacks), Some(Page::Models));
+        // Neither the account nor the key of a service has any say in it.
+        assert!(!lacks.1.account.get() && !lacks.1.key.get());
+        // Downloaded, it is dictated with.
+        assert_eq!(lack(&settings, Some("no"), true, false).0, None);
+        // One the list no longer has cannot be on this PC either.
+        let gone = choosing(ProviderKind::Local, "banana");
+        assert_eq!(page_of(&lack(&gone, None, true, true)), Some(Page::Models));
+    }
+
+    #[test]
+    fn vinput_pro_that_cannot_serve_leads_to_its_own_page() {
+        let settings = choosing(ProviderKind::Cloud, vinput_core::cloud::MODEL_ID);
+        let why = "VinPUT Pro needs a subscription.";
+        let lacks = lack(&settings, Some(why), true, true);
+        assert_eq!(lacks.0, Some((Page::Pro, why)));
+        // With a subscription, or while the server has not said, a session
+        // is started: what the server answers decides.
+        let served = lack(&settings, None, false, false);
+        assert_eq!(served.0, None);
+        // Only what the host knows of the account is looked at, which is in
+        // memory: nothing on the disk, no key.
+        for looked in [lacks.1, served.1] {
+            assert!(looked.account.get() && !looked.disk.get() && !looked.key.get());
+        }
+    }
+
+    #[test]
+    fn a_google_service_without_its_key_or_project_leads_to_the_models() {
+        // Gemini needs its key.
+        let gemini = choosing(ProviderKind::Gemini, "some-model");
+        let lacks = lack(&gemini, None, true, false);
+        assert_eq!(page_of(&lacks), Some(Page::Models));
+        assert!(lacks.0.is_some_and(|(_, why)| why.contains("Gemini")));
+        assert!(!lacks.1.account.get() && !lacks.1.disk.get());
+        assert_eq!(lack(&gemini, Some("no"), false, true).0, None);
+        // Google Cloud Speech needs its project, which the settings name.
+        let speech = choosing(ProviderKind::GoogleCloud, "some-model");
+        let lacks = lack(&speech, None, true, true);
+        assert_eq!(page_of(&lacks), Some(Page::Models));
+        assert!(!lacks.1.any());
+        let set_up = Settings {
+            project_id: Some("my-project".to_owned()),
+            ..speech
+        };
+        // Whether its credentials work is found out by the session.
+        let lacks = lack(&set_up, Some("no"), false, false);
+        assert_eq!(lacks.0, None);
+        assert!(!lacks.1.any());
+    }
+
+    #[test]
+    fn a_press_that_cannot_dictate_brings_settings_up_once() {
+        // No window: it is opened on the page, whatever the page.
+        for page in [Page::Models, Page::Pro, Page::Welcome] {
+            assert!(turns(false, None, page, false));
+            assert!(turns(false, Some(page), page, true));
+        }
+        // An open one is turned to the page and brought to the front.
+        assert!(turns(true, None, Page::Pro, false));
+        // Pressed again, it is left where the user has it: no second
+        // window, and nothing taken from whatever has the keyboard.
+        assert!(!turns(true, Some(Page::Pro), Page::Pro, false));
+        // Something else is in the way now: that is shown.
+        assert!(turns(true, Some(Page::Pro), Page::Models, false));
+        // The welcome, and a download that is being watched, are not
+        // turned away from at all.
+        assert!(!turns(true, None, Page::Welcome, true));
+        assert!(!turns(true, Some(Page::Pro), Page::Models, true));
     }
 
     /// Two capture sessions of an API client, "a" and then "b", both

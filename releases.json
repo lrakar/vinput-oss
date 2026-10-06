@@ -1,5 +1,14 @@
 [
   {
+    "version": "0.4.3",
+    "published": "2026-10-06",
+    "notes": [
+      "Pressing the dictation key with nothing set up to recognize speech opens Settings at the right page",
+      "No start click is played when a press cannot dictate",
+      "After a new install, that press opens the welcome"
+    ]
+  },
+  {
     "version": "0.4.2",
     "published": "2026-10-06",
     "notes": [

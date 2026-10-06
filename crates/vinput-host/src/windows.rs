@@ -28,6 +28,7 @@
     reason = "Win32 structure sizes, flags and coordinates are small values in fixed-width fields"
 )]
 
+use std::cell::Cell;
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 
@@ -174,6 +175,15 @@ struct Host {
     pro: Pro,
     /// The setup of a Google service of one's own.
     google: Google,
+    /// The page a key press that could not dictate turned Settings to. Until
+    /// that window closes, no press turns it there or brings it to the front
+    /// again.
+    led_to: Option<Page>,
+    /// Whether what the chosen model needs on this PC, its files or the key
+    /// of its service, was there when a key press last looked. What is
+    /// there is not looked for at every press: only again once the settings
+    /// have changed or a session has failed for want of it.
+    found: Cell<bool>,
 }
 
 impl Host {
@@ -258,6 +268,8 @@ impl Host {
             updates: Updates::default(),
             pro: Pro::new(&settings),
             google: Google::default(),
+            led_to: None,
+            found: Cell::new(false),
             settings,
         };
         // Clears a stale "listening" left behind if a previous copy was killed.
@@ -357,6 +369,7 @@ impl Host {
     }
 
     fn persist(&mut self) {
+        self.found.set(false);
         self.pro.prefer(&self.settings);
         // With a model chosen the welcome has done what it was for.
         if self.settings.has_model() {

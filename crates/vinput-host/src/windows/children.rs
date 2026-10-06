@@ -272,6 +272,7 @@ impl Host {
         match which {
             Which::Settings => {
                 self.stop_capturing();
+                self.led_to = None;
                 self.notice = None;
                 self.finder.clear();
                 self.google_close();

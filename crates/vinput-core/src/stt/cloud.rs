@@ -220,7 +220,21 @@ fn read_message(text: &str) -> Update {
 
 /// A failure in words for the person who dictated: what happened and, where
 /// there is something to do about it, where.
+///
+/// Whatever only the account can put right (nobody signed in, no subscription
+/// that is paid for, the month's hours used up) is [`Error::Setup`]: the
+/// next dictation would be refused the same way. Everything else may pass.
 fn explain(failure: &Failure) -> Error {
+    let lasting = matches!(
+        failure,
+        Failure::SignedOut
+            | Failure::Expired
+            | Failure::Stopped
+            | Failure::Refused {
+                code: Code::Unauthorized | Code::SubscriptionRequired | Code::QuotaExceeded,
+                ..
+            }
+    );
     let why = match failure {
         Failure::SignedOut => {
             format!("this PC is not signed in to VinPUT Pro; sign in under {WHERE}")
@@ -246,7 +260,11 @@ fn explain(failure: &Failure) -> Error {
         Failure::Unreachable(why) => format!("VinPUT Pro could not be reached: {why}"),
         Failure::Expired | Failure::Stopped => "VinPUT Pro is not signed in".to_owned(),
     };
-    Error::Transcription(why)
+    if lasting {
+        Error::Setup(why)
+    } else {
+        Error::Transcription(why)
+    }
 }
 
 fn lost(doing: &str, err: &WsError) -> Error {
@@ -1401,6 +1419,27 @@ mod tests {
         }
         assert!(refused(Code::TooManyRequests).contains("try again"));
         assert!(refused(Code::UpstreamFailed).ends_with(": x"));
+        // Only the account can put these right: pressing the key again is
+        // no use, and the host opens Settings instead.
+        let lasting = |failure: &Failure| matches!(explain(failure), Error::Setup(_));
+        for code in [
+            Code::SubscriptionRequired,
+            Code::QuotaExceeded,
+            Code::Unauthorized,
+        ] {
+            assert!(lasting(&Failure::refused(code, "x")), "{code:?}");
+        }
+        assert!(lasting(&Failure::SignedOut));
+        // What may pass by the next press is tried again at the next press.
+        for code in [
+            Code::TooManyRequests,
+            Code::UpstreamFailed,
+            Code::Unavailable,
+            Code::Internal,
+        ] {
+            assert!(!lasting(&Failure::refused(code, "x")), "{code:?}");
+        }
+        assert!(!lasting(&Failure::Unreachable("offline".into())));
     }
 
     fn pieces(sizes: &[usize]) -> Sent {
@@ -1616,7 +1655,7 @@ mod tests {
         let (typed, finished) = dictate(&speech, 2);
         assert_eq!(typed, "So far. ");
         assert!(
-            matches!(&finished, Err(Error::Transcription(why)) if why.contains("allowance is used up")),
+            matches!(&finished, Err(Error::Setup(why)) if why.contains("allowance is used up")),
             "{finished:?}"
         );
         Ok(())
@@ -1812,7 +1851,7 @@ mod tests {
             let (typed, finished) = dictate(&speech, 2);
             assert_eq!(typed, "");
             assert!(
-                matches!(&finished, Err(Error::Transcription(why)) if why.ends_with(WHERE)),
+                matches!(&finished, Err(Error::Setup(why)) if why.ends_with(WHERE)),
                 "{finished:?}"
             );
         }
@@ -1830,7 +1869,7 @@ mod tests {
         let (typed, finished) = dictate(&speech, 2);
         assert_eq!(typed, "So far. ");
         assert!(
-            matches!(&finished, Err(Error::Transcription(why)) if why.contains("was signed out of VinPUT Pro")),
+            matches!(&finished, Err(Error::Setup(why)) if why.contains("was signed out of VinPUT Pro")),
             "{finished:?}"
         );
         // The token in memory is not trusted any more: the next request
@@ -1865,7 +1904,7 @@ mod tests {
             let (typed, finished) = dictate(&speech, 2);
             assert_eq!(typed, "");
             assert!(
-                matches!(&finished, Err(Error::Transcription(why)) if why.contains(expected)),
+                matches!(&finished, Err(Error::Transcription(why) | Error::Setup(why)) if why.contains(expected)),
                 "{expected}: {finished:?}"
             );
         }
@@ -1888,7 +1927,7 @@ mod tests {
         fake.change(|state| state.account["usage"]["seconds"] = json!(144_000));
         let (_, finished) = dictate(&speech, 1);
         assert!(
-            matches!(&finished, Err(Error::Transcription(why)) if why.contains("allowance is used up")),
+            matches!(&finished, Err(Error::Setup(why)) if why.contains("allowance is used up")),
             "{finished:?}"
         );
         Ok(())
@@ -2085,7 +2124,7 @@ mod tests {
         let (account, memory) = fake.account();
         let refused = CloudSpeech::connect(Arc::clone(&account), Arc::default());
         assert!(
-            matches!(&refused, Err(Error::Transcription(why)) if why.contains("sign in under Settings, VinPUT Pro")),
+            matches!(&refused, Err(Error::Setup(why)) if why.contains("sign in under Settings, VinPUT Pro")),
             "{refused:?}"
         );
         // Signed out while the provider runs: the dictation says so.
@@ -2100,7 +2139,7 @@ mod tests {
         // The token fetched at the start may still be in memory; the
         // server refuses it, and the refresh token after it.
         assert!(
-            matches!(&finished, Err(Error::Transcription(why)) if why.contains("not signed in")),
+            matches!(&finished, Err(Error::Setup(why)) if why.contains("not signed in")),
             "{finished:?}"
         );
         assert!(memory.refresh_token().is_none());
@@ -2124,7 +2163,7 @@ mod tests {
         let (typed, finished) = dictate(&speech, 1);
         assert_eq!(typed, "");
         assert!(
-            matches!(&finished, Err(Error::Transcription(why)) if why.contains("was signed out of VinPUT Pro")),
+            matches!(&finished, Err(Error::Setup(why)) if why.contains("was signed out of VinPUT Pro")),
             "{finished:?}"
         );
         // One new token was tried, and then the session was let go of.

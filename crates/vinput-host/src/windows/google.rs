@@ -232,6 +232,7 @@ impl Host {
             Setup::Finish => self.google_finish(controller),
             Setup::RemoveKey => {
                 secrets::delete(secrets::GEMINI_API_KEY);
+                self.found.set(false);
                 self.google.call_off();
                 self.google.replacing = false;
                 self.slow.make_stale();

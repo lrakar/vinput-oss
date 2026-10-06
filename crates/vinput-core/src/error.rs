@@ -13,6 +13,10 @@ pub enum Error {
     Audio(String),
     /// The speech-to-text service failed or returned something unusable.
     Transcription(String),
+    /// Nothing can be recognized until the user has done something about it
+    /// in Settings: chosen or downloaded a model, signed in, subscribed.
+    /// Pressing the key again would only fail again.
+    Setup(String),
     /// Typing text into the focused window failed.
     Injection(String),
     /// Recording or saving a voice memo failed.
@@ -27,7 +31,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Audio(msg) => write!(f, "audio capture failed: {msg}"),
-            Self::Transcription(msg) => write!(f, "transcription failed: {msg}"),
+            Self::Transcription(msg) | Self::Setup(msg) => write!(f, "transcription failed: {msg}"),
             Self::Injection(msg) => write!(f, "text injection failed: {msg}"),
             Self::Memo(msg) => write!(f, "voice memo failed: {msg}"),
             Self::Install(msg) => write!(f, "install failed: {msg}"),

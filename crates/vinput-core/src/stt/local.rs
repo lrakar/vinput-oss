@@ -119,10 +119,10 @@ impl LocalSpeech {
     /// installed, or if its engine does not start.
     pub fn connect(model_id: &str, gpu: bool) -> Result<Self> {
         let model = models::find(ProviderKind::Local, model_id).ok_or_else(|| {
-            Error::Transcription(format!("{model_id:?} is not a local model Vinput knows"))
+            Error::Setup(format!("{model_id:?} is not a local model Vinput knows"))
         })?;
         let not_installed = || {
-            Error::Transcription(format!(
+            Error::Setup(format!(
                 "{} is not installed; open Settings, select it and press Install",
                 model.name
             ))
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn an_unknown_or_missing_model_says_what_to_do() {
         let unknown = LocalSpeech::connect("banana", false);
-        assert!(matches!(&unknown, Err(Error::Transcription(why)) if why.contains("banana")));
+        assert!(matches!(&unknown, Err(Error::Setup(why)) if why.contains("banana")));
         assert!(LocalSpeech::model("whisper-base").is_some());
     }
 

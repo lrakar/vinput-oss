@@ -683,6 +683,11 @@ pub mod metric {
     pub const PAGE_BOTTOM: f32 = 24.0;
     /// The widest a page gets.
     pub const PAGE_MAX: f32 = 1000.0;
+    /// The widest a page of the welcome gets: a column to read, in the
+    /// middle of the window.
+    pub const WELCOME_MAX: f32 = 640.0;
+    /// The room over the title of the welcome.
+    pub const WELCOME_TOP: f32 = 48.0;
     /// The room around a small window's content.
     pub const DIALOG_PAD: f32 = 24.0;
     /// The room between the heading of a small window and what is under it.

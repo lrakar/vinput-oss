@@ -136,7 +136,7 @@ impl Host {
     ) -> bool {
         match item {
             MENU_QUIT => return true,
-            MENU_SETTINGS => self.open_settings(Page::General),
+            MENU_SETTINGS => self.open_home(),
             MENU_AUTOSTART => self.toggle_autostart(),
             MENU_MEMOS => self.open_memo_folder(),
             MENU_UPDATE => self.open_update_window(),

@@ -40,6 +40,9 @@ pub fn window_name(surface: Surface) -> &'static str {
         Surface::Settings(Page::Pro) => "pro",
         Surface::Settings(Page::Advanced) => "advanced",
         Surface::Settings(Page::About) => "about",
+        Surface::Settings(Page::Welcome) => "welcome",
+        Surface::Settings(Page::WelcomePro) => "welcome-pro",
+        Surface::Settings(Page::WelcomeLocal) => "welcome-local",
         Surface::Update => "update",
     }
 }

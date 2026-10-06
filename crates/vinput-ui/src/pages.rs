@@ -17,6 +17,7 @@ pub mod google;
 pub mod models;
 pub mod pro;
 pub mod update;
+pub mod welcome;
 
 use vinput_view::{Page, View};
 
@@ -52,5 +53,6 @@ pub fn content(page: Page, view: &View) -> Content {
         Page::Pro => pro::content(view),
         Page::Advanced => advanced::content(view),
         Page::About => about::content(view),
+        Page::Welcome | Page::WelcomePro | Page::WelcomeLocal => welcome::content(page, view),
     }
 }

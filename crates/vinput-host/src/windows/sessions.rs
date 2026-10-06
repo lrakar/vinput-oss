@@ -330,6 +330,7 @@ impl Host {
             Ending::Waiting => "Vinput could not finish",
         };
         self.report(title, left.outcomes, &left.failures);
+        self.pro_after_session();
         self.hold_cancel_key(controller);
     }
 
@@ -376,7 +377,8 @@ impl Host {
         if !listening {
             self.held_vk = None;
         }
-        self.tray.show(listening, &tray::tooltip(&self.settings));
+        let tip = tray::tooltip(&self.settings, self.pro.carrying_with(&self.settings));
+        self.tray.show(listening, &tip);
     }
 
     /// Opens a web search for what was said in the default browser. Silence

@@ -210,7 +210,7 @@ impl Host {
         if hwnd.is_null() {
             return Err(last_error("creating the hidden window"));
         }
-        let tray = match Tray::add(hwnd, &tray::tooltip(&settings)) {
+        let tray = match Tray::add(hwnd, &tray::tooltip(&settings, None)) {
             Ok(tray) => tray,
             Err(err) => {
                 // SAFETY: the window was created above and is destroyed once.
@@ -256,7 +256,7 @@ impl Host {
                 .flatten(),
             installer: Installer::new(),
             updates: Updates::default(),
-            pro: Pro::new(),
+            pro: Pro::new(&settings),
             google: Google::default(),
             settings,
         };
@@ -288,6 +288,12 @@ impl Host {
             unsafe { PostMessageW(window as HWND, ENGINE_READY, 0, 0) };
         });
         self.ensure_engine();
+        // Whoever dictates with VinPUT Pro is asked about once, so that a
+        // month whose hours are used up is known before the first key
+        // press and costs it nothing.
+        if self.settings.provider == vinput_core::stt::ProviderKind::Cloud {
+            self.pro_ask(false);
+        }
         // Setup programs of earlier updates have done their work, and so has
         // the program the last one put aside.
         update::clean_up();
@@ -351,6 +357,11 @@ impl Host {
     }
 
     fn persist(&mut self) {
+        self.pro.prefer(&self.settings);
+        // With a model chosen the welcome has done what it was for.
+        if self.settings.has_model() {
+            self.settings.first_run = false;
+        }
         if let Err(err) = self.settings.save() {
             log::write(&err.to_string());
             self.tray

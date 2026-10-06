@@ -211,6 +211,18 @@ impl Host {
         self.open_window(Surface::Settings(page));
     }
 
+    /// Shows the Settings window where someone who asks for it without
+    /// naming a page starts: on the welcome while that is owed, which it
+    /// never is after an update, and on the General page otherwise.
+    pub(super) fn open_home(&mut self) {
+        let page = if self.settings.owes_welcome() {
+            Page::Welcome
+        } else {
+            Page::General
+        };
+        self.open_settings(page);
+    }
+
     /// Brings the window for `surface` to the front if its process is
     /// running, and starts that process otherwise. There is never more than
     /// one of each window.
@@ -410,6 +422,9 @@ mod tests {
             Page::Pro,
             Page::Advanced,
             Page::About,
+            Page::Welcome,
+            Page::WelcomePro,
+            Page::WelcomeLocal,
         ] {
             assert_eq!(Which::of(Surface::Settings(page)), Which::Settings);
         }

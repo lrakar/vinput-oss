@@ -263,7 +263,7 @@ mod tests {
         assert!(matches!(&copy.action, Action::Copy(copied) if copied == text));
         assert_eq!(
             setting_row(&nodes, "Connected programs").detail,
-            "Stream Deck"
+            "Control Deck"
         );
         assert_eq!(
             command(&setting_row(&nodes, "Documentation").action),

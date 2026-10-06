@@ -18,24 +18,30 @@
 //! that is busy or cannot be reached for a moment does not end that wait,
 //! and whatever does end it leaves the page as it was before. Besides that
 //! the account is asked when a window opens and now and then while one is
-//! open, and never while none is.
+//! open. While none is, it is asked twice at most: once when Vinput starts
+//! with Pro as the chosen model, and once after a dictation that a model on
+//! this PC had to serve because the month's hours are used up. Both are to
+//! know until when that is so (`vinput-core/src/stt/standby.rs`), which is
+//! said once, in a notification, and not with every dictation.
 #![allow(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+use super::tray::About;
 use super::{Host, PRO_HEARD};
 use crate::view::{ProDoing, ProFacts};
 use crate::win::{is_page, open};
-use vinput_core::cloud::{self, Account, AccountInfo, Failure, Plan, Prices, Reason, SignIn};
+use vinput_core::cloud::{self, Account, AccountInfo, Failure, Plan, Prices, Reason, SignIn, Tier};
 use vinput_core::session::Controller;
-use vinput_core::stt::ProviderKind;
+use vinput_core::settings::Settings;
+use vinput_core::stt::{ProviderKind, Standby};
 use vinput_core::{log, models};
 use vinput_view::{self as wire, Page};
 
@@ -160,12 +166,42 @@ pub(super) struct Pro {
     prices: Prices,
     /// When the server was last asked for the prices.
     prices_asked: Option<Instant>,
+    /// The model on this PC that dictation carries on with when the
+    /// month's hours are used up, and whether it does.
+    standby: Arc<Standby>,
+    /// Until when it is not said again that the hours are used up, in
+    /// seconds since 1970.
+    told_until: u64,
 }
 
+/// For how long at least it is not said again that the hours are used up.
+const TOLD_FOR: u64 = 24 * 3600;
+
 impl Pro {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(settings: &Settings) -> Self {
         let account = cloud::shared();
-        Self::of(account.signed_in_as(), account)
+        let pro = Self {
+            standby: Standby::shared(),
+            ..Self::of(account.signed_in_as(), account)
+        };
+        pro.prefer(settings);
+        pro
+    }
+
+    /// Notes which model on this PC the settings would carry on with.
+    pub(super) fn prefer(&self, settings: &Settings) {
+        self.standby
+            .prefer(&settings.last_local_model, settings.use_gpu());
+    }
+
+    /// Name of the model on this PC that serves in place of `VinPUT` Pro
+    /// right now, because the month's hours are used up; `None` while Pro
+    /// serves, which is all that is looked at then.
+    pub(super) fn carrying_with(&self, settings: &Settings) -> Option<&'static str> {
+        if settings.provider != ProviderKind::Cloud || self.standby.until() == 0 {
+            return None;
+        }
+        models::spare(&settings.last_local_model, settings.use_gpu()).map(|model| model.name)
     }
 
     /// What the host knows when it starts, with `email` signed in.
@@ -183,6 +219,8 @@ impl Pro {
             asked: None,
             prices: Prices::default(),
             prices_asked: None,
+            standby: Arc::default(),
+            told_until: 0,
         }
     }
 
@@ -203,6 +241,7 @@ impl Pro {
             doing: self.doing,
             problem: self.problem.as_deref(),
             prices: &self.prices,
+            carrying: self.standby.until() != 0,
         }
     }
 
@@ -242,6 +281,7 @@ impl Pro {
             stop.store(true, Ordering::Relaxed);
         }
         self.payment.store(true, Ordering::Relaxed);
+        self.standby.clear();
         self.email = None;
         self.info = None;
         self.doing = ProDoing::Nothing;
@@ -422,6 +462,14 @@ impl Pro {
             self.email = Some(info.email.clone());
         }
         let paid = self.doing == ProDoing::AwaitingPayment && info.entitled;
+        // With hours left, dictation is served by VinPUT Pro; with none,
+        // by the model on this PC until they are counted anew.
+        if info.entitled || info.complimentary {
+            self.standby
+                .heard(info.used_seconds, info.cap_seconds, info.resets_at);
+        } else {
+            self.standby.clear();
+        }
         self.info = Some((info, Instant::now()));
         if !paid {
             return Vec::new();
@@ -448,6 +496,18 @@ fn words(failure: &Failure) -> String {
         }
         Failure::Stopped => String::new(),
     }
+}
+
+/// What is said when the hours of the month are used up and dictation has
+/// carried on with `model`. `whole` says whether everything that was said
+/// reached it.
+fn carrying_on(model: &str, whole: bool) -> String {
+    let mut text =
+        format!("Dictation carries on with {model}, on this PC, until the new month starts.");
+    if !whole {
+        text.push_str(" What was said just before the switch may be missing.");
+    }
+    text
 }
 
 /// Sleeps for `time` unless `stop` is set first. Says whether it was.
@@ -494,11 +554,11 @@ fn await_payment(
     send(Report::PaymentWaitOver);
 }
 
-/// The page to open for a subscription to `plan`: its checkout, or for
-/// someone who has a subscription already, also one that is not paid for,
-/// the page on which that is managed.
-fn page_for(account: &Account, plan: Plan) -> Report {
-    match account.checkout(plan) {
+/// The page to open for a subscription to `plan` of `tier`: its checkout,
+/// or for someone who has a subscription already, also one that is not
+/// paid for, the page on which that is managed.
+fn page_for(account: &Account, tier: Tier, plan: Plan) -> Report {
+    match account.checkout(tier, plan) {
         Ok(url) => Report::Checkout(url),
         Err(Failure::Refused {
             reason: Reason::AlreadySubscribed,
@@ -606,20 +666,53 @@ impl Host {
         }
     }
 
-    /// Opens the checkout for `plan` in the browser. Someone who has a
-    /// subscription already, also one that is not paid for, gets the page
-    /// on which it is managed instead.
-    pub(super) fn pro_subscribe(&mut self, plan: wire::ProPlan) {
+    /// Opens the checkout for `plan` of `tier` in the browser. Someone who
+    /// has a subscription already, also one that is not paid for, gets the
+    /// page on which it is managed instead.
+    pub(super) fn pro_subscribe(&mut self, tier: wire::ProTier, plan: wire::ProPlan) {
         if !self.pro.begin_opening() {
             return;
         }
+        let tier = match tier {
+            wire::ProTier::Pro => Tier::Pro,
+            wire::ProTier::Plus => Tier::Plus,
+        };
         let plan = match plan {
             wire::ProPlan::Monthly => Plan::Monthly,
             wire::ProPlan::Yearly => Plan::Yearly,
         };
         self.pro_start(Box::new(move |account, reporter| {
-            reporter.send(page_for(account, plan));
+            reporter.send(page_for(account, tier, plan));
         }));
+    }
+
+    /// A session has ended. If the model on this PC served it, because the
+    /// hours of the month are used up, that is said, once for a month and
+    /// not with every dictation, and the account is asked until when.
+    pub(super) fn pro_after_session(&mut self) {
+        let Some(whole) = self.pro.standby.take_served() else {
+            return;
+        };
+        let known = self.pro.info.as_ref();
+        if !known.is_some_and(|(info, _)| info.over_allowance()) {
+            self.pro.asked = None;
+            self.pro_ask(false);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if now < self.pro.told_until {
+            return;
+        }
+        self.pro.told_until = self.pro.standby.until().max(now + TOLD_FOR);
+        let model = self.pro.carrying_with(&self.settings);
+        self.tray.inform(
+            About::Settings(Page::Pro),
+            "VinPUT Pro hours used up",
+            &carrying_on(model.unwrap_or("a model on this PC"), whole),
+        );
+        self.refresh_tip();
+        self.show_state();
     }
 
     /// Opens the page on which the subscription is managed in the browser.
@@ -676,6 +769,8 @@ impl Host {
                 self.pro_do(effect, controller);
             }
         }
+        // The account may have said that the hours are used up, or back.
+        self.refresh_tip();
         self.show_state();
     }
 
@@ -755,6 +850,7 @@ mod tests {
             }),
             used_seconds: 0,
             cap_seconds: 144_000,
+            tier: Tier::Pro,
             resets_at: 0,
             complimentary: false,
         }
@@ -1215,17 +1311,85 @@ mod tests {
     fn the_prices_are_the_built_in_ones_until_the_server_says() {
         let mut pro = pro(None);
         assert_eq!(pro.facts().prices, &Prices::default());
-        let said = Prices {
-            monthly: 700,
-            yearly: 6900,
-            currency: "eur".into(),
-            cap_seconds: 72_000,
-        };
+        let mut said = Prices::default();
+        said.offers[0].monthly = 350;
         // Whoever is signed in by the time they arrive: prices are everyone's.
         assert!(
             pro.take(pro.session + 5, Report::Prices(said.clone()))
                 .is_empty()
         );
         assert_eq!(pro.facts().prices, &said);
+    }
+
+    #[test]
+    fn used_up_hours_hand_dictation_to_this_pc_and_hours_that_are_back_hand_it_back() {
+        let mut pro = pro(Some("ana@example.com"));
+        assert!(!pro.facts().carrying);
+        let session = pro.session;
+        // Hours left: VinPUT Pro serves.
+        let mut account = info(true);
+        account.used_seconds = 100;
+        account.resets_at = u64::MAX;
+        assert!(
+            pro.take(session, Report::Info(Ok(account.clone())))
+                .is_empty()
+        );
+        assert!(!pro.facts().carrying);
+        // None left: the model on this PC does, and that is all that
+        // changes. Nothing is to be done besides: no other model is chosen,
+        // nothing is set up again, the settings are not touched.
+        account.used_seconds = account.cap_seconds;
+        assert!(
+            pro.take(session, Report::Info(Ok(account.clone())))
+                .is_empty()
+        );
+        assert!(pro.facts().carrying);
+        assert_eq!(pro.standby.until(), u64::MAX);
+        // A tier with more hours, or a new month: Pro again, by itself.
+        account.cap_seconds *= 2;
+        assert!(
+            pro.take(session, Report::Info(Ok(account.clone())))
+                .is_empty()
+        );
+        assert!(!pro.facts().carrying);
+        // An account that cannot use Pro has no hours to have run out, and
+        // neither has nobody.
+        account.used_seconds = account.cap_seconds;
+        account.entitled = false;
+        pro.take(session, Report::Info(Ok(account.clone())));
+        assert!(!pro.facts().carrying);
+        account.complimentary = true;
+        pro.take(session, Report::Info(Ok(account)));
+        assert!(pro.facts().carrying);
+        pro.reset();
+        assert!(!pro.facts().carrying);
+    }
+
+    #[test]
+    fn which_model_carries_on_is_looked_up_only_while_one_does() {
+        let pro = pro(Some("ana@example.com"));
+        let mut settings = Settings {
+            provider: ProviderKind::Cloud,
+            model: cloud::MODEL_ID.to_owned(),
+            ..Settings::default()
+        };
+        // Hours left: no name, and no look at the disk for one.
+        assert_eq!(pro.carrying_with(&settings), None);
+        pro.standby.heard(10, 10, u64::MAX);
+        // Another model chosen: its hours are nobody's business.
+        settings.provider = ProviderKind::Local;
+        assert_eq!(pro.carrying_with(&settings), None);
+    }
+
+    #[test]
+    fn what_is_said_when_the_hours_run_out_names_the_model_and_what_may_be_missing() {
+        assert_eq!(
+            carrying_on("Whisper base", true),
+            "Dictation carries on with Whisper base, on this PC, until the new month starts."
+        );
+        let partly = carrying_on("Whisper base", false);
+        assert!(partly.ends_with("What was said just before the switch may be missing."));
+        // Short enough for a notification.
+        assert!(partly.chars().count() < 200);
     }
 }

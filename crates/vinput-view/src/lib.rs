@@ -67,6 +67,23 @@ pub enum Page {
     Advanced,
     /// Version, updates and links.
     About,
+    /// What someone who has just installed sees first: the two ways to
+    /// dictate, a subscription or a model on this PC. Like the two pages
+    /// after it, it is shown without the navigation pane.
+    Welcome,
+    /// The account and the plans of `VinPUT` Pro, as a step of the welcome.
+    WelcomePro,
+    /// The models that run on this PC, as a step of the welcome.
+    WelcomeLocal,
+}
+
+impl Page {
+    /// Whether this is a page of the welcome a new user is shown, which
+    /// has the window to itself.
+    #[must_use]
+    pub fn is_welcome(self) -> bool {
+        matches!(self, Self::Welcome | Self::WelcomePro | Self::WelcomeLocal)
+    }
 }
 
 /// Which window a window process shows.
@@ -137,6 +154,9 @@ pub enum RunsOn {
     Processor,
     /// On this graphics card.
     GraphicsCard(String),
+    /// On this PC, with the model of this name, in place of `VinPUT` Pro
+    /// while the month's hours are used up.
+    Spare(String),
 }
 
 /// The settings a user can change. Hotkeys are text such as `F1` or
@@ -639,6 +659,8 @@ pub struct Pro {
     pub status: String,
     /// What is paid for, if it is a plan this version knows.
     pub plan: Option<ProPlan>,
+    /// The tier in effect, or the one of a subscription that is not.
+    pub tier: ProTier,
     /// When the period that is paid for ends, in seconds since 1970; zero
     /// if the server did not say. So are the dates below.
     pub period_end: u64,
@@ -664,14 +686,26 @@ pub struct Pro {
     /// Why the server could not be asked, or what it said, in words for the
     /// user. What is shown under it is then what was known before.
     pub problem: Option<String>,
+    /// The tiers that can be subscribed to, the smaller first.
+    pub offers: Vec<ProOffer>,
+    /// The currency of the prices, as its three letters: `eur`.
+    pub currency: String,
+    /// Name of the model on this PC that dictation carries on with when
+    /// the month's hours are used up; `None` if no model is downloaded.
+    pub spare: Option<String>,
+}
+
+/// One tier of `VinPUT` Pro on offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProOffer {
+    /// Which tier.
+    pub tier: ProTier,
     /// What a month costs, in hundredths of the currency.
     pub monthly: u32,
     /// What a year costs, likewise.
     pub yearly: u32,
-    /// The currency of the prices, as its three letters: `eur`.
-    pub currency: String,
-    /// Seconds of speech a month of a new subscription comes with.
-    pub plan_seconds: u64,
+    /// Seconds of speech a month comes with.
+    pub seconds: u64,
 }
 
 impl Default for Pro {
@@ -687,6 +721,7 @@ impl Default for Pro {
             complimentary: false,
             status: String::new(),
             plan: None,
+            tier: ProTier::Pro,
             period_end: 0,
             ends: false,
             ends_at: 0,
@@ -698,13 +733,38 @@ impl Default for Pro {
             checked_minutes: None,
             doing: ProDoing::Nothing,
             problem: None,
-            monthly: 600,
-            yearly: 5900,
+            offers: vec![
+                ProOffer {
+                    tier: ProTier::Plus,
+                    monthly: 250,
+                    yearly: 2400,
+                    seconds: 8 * 3600,
+                },
+                ProOffer {
+                    tier: ProTier::Pro,
+                    monthly: 500,
+                    yearly: 4900,
+                    seconds: 25 * 3600,
+                },
+            ],
             currency: "eur".to_owned(),
-            plan_seconds: 144_000,
+            spare: None,
         }
     }
 }
+
+/// The tiers of `VinPUT` Pro: the same recognition, with more or fewer
+/// hours a month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProTier {
+    /// The larger allowance.
+    #[default]
+    Pro,
+    /// The smaller one.
+    Plus,
+}
+
+sent_as_number!(ProTier: Pro, Plus);
 
 /// Whether anyone is signed in to `VinPUT` Pro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -837,8 +897,8 @@ pub enum Command {
     ProSignIn,
     /// Stop waiting for a sign-in, or for a payment.
     ProCancel,
-    /// Open the checkout for this plan in the browser.
-    ProSubscribe(ProPlan),
+    /// Open the checkout for this plan of this tier in the browser.
+    ProSubscribe(ProTier, ProPlan),
     /// Open the page on which the subscription is managed in the browser.
     ProManage,
     /// Ask the server again how the account stands.
@@ -848,6 +908,9 @@ pub enum Command {
     ProShown,
     /// Sign out of `VinPUT` Pro.
     ProSignOut,
+    /// The welcome is over, with or without a model chosen: it is not
+    /// shown again.
+    WelcomeDone,
     /// The window was closed.
     Closed,
 }
@@ -937,15 +1000,16 @@ mod tests {
             Command::Set(Change::Hotkey("Ctrl+Shift+Space".to_owned())),
             Command::Set(Change::Autostart(false)),
             Command::AddModel(2),
-            Command::ProSubscribe(ProPlan::Yearly),
+            Command::ProSubscribe(ProTier::Plus, ProPlan::Yearly),
             Command::Google(Setup::Open(GoogleService::Speech)),
             Command::Google(Setup::Key("typed".to_owned())),
             Command::Google(Setup::Step(GoogleStep::Enter)),
             Command::Google(Setup::Close),
             Command::Google(Setup::Replace),
-            Command::ProSubscribe(ProPlan::Monthly),
+            Command::ProSubscribe(ProTier::Pro, ProPlan::Monthly),
             Command::ProSignIn,
             Command::ProShown,
+            Command::WelcomeDone,
             Command::Closed,
         ] {
             let line = command.to_line();
@@ -1005,6 +1069,12 @@ mod tests {
                 plan,
                 email: "ana@example.com".to_owned(),
                 status: "past_due".to_owned(),
+                tier: if plan.is_some() {
+                    ProTier::Plus
+                } else {
+                    ProTier::Pro
+                },
+                spare: plan.map(|_| "Whisper base".to_owned()),
                 complimentary: who == ProWho::SignedIn,
                 grace_until: 1_794_097_014,
                 checked_minutes: Some(7),
@@ -1013,7 +1083,7 @@ mod tests {
             };
             let line = serde_json::to_string(&pro).unwrap_or_default();
             assert!(
-                !line.contains("SignedIn") && !line.contains("Yearly"),
+                !line.contains("SignedIn") && !line.contains("Yearly") && !line.contains("Plus"),
                 "{line}"
             );
             assert_eq!(serde_json::from_str::<Pro>(&line).ok(), Some(pro));
@@ -1025,7 +1095,18 @@ mod tests {
             Some(ProDoing::Nothing)
         );
         assert_eq!(serde_json::from_str::<Pro>("{}").ok(), Some(Pro::default()));
-        assert_eq!((Pro::default().monthly, Pro::default().yearly), (600, 5900));
+        let offers = Pro::default().offers;
+        let offers = offers.iter();
+        let offers: Vec<_> = offers
+            .map(|offer| (offer.tier, offer.monthly, offer.yearly, offer.seconds))
+            .collect();
+        assert_eq!(
+            offers,
+            [
+                (ProTier::Plus, 250, 2400, 28_800),
+                (ProTier::Pro, 500, 4900, 90_000)
+            ]
+        );
     }
 
     #[test]

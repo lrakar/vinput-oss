@@ -98,7 +98,7 @@ fn the_pro_page_draws_in_every_state_of_the_account() {
         pictures.push(bytes);
     }
     // One scene for every state, and no two of them look the same.
-    assert_eq!(pictures.len(), 14);
+    assert_eq!(pictures.len(), 19);
     for (index, picture) in pictures.iter().enumerate() {
         assert!(!pictures[..index].contains(picture), "picture {index}");
     }
@@ -111,7 +111,10 @@ fn the_models_page_draws_the_card_of_pro_in_every_state_and_theme() {
         "settings",
         "pro-subscribed",
         "pro-subscribed-elsewhere",
+        "pro-plus",
         "pro-over-allowance",
+        "pro-used-up-no-model",
+        "pro-low-no-model",
         "pro-payment-problem",
         "pro-expired",
         "pro-offline",

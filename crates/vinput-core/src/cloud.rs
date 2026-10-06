@@ -53,11 +53,24 @@ pub const ENV_URL: &str = "VINPUT_CLOUD_URL";
 /// Whether this build listens to [`ENV_URL`].
 const LISTENS: bool = cfg!(any(debug_assertions, test, feature = "test-instance"));
 
-/// The built-in prices, in cents, and the allowance, for as long as the
-/// server has not said: six euros a month, fifty-nine a year, forty hours.
-const MONTHLY_CENTS: u32 = 600;
-const YEARLY_CENTS: u32 = 5900;
-const CAP_SECONDS: u64 = 40 * 3600;
+/// The built-in tiers, for as long as the server has not said: Plus at two
+/// euros fifty a month or twenty-four a year with eight hours, Pro at five
+/// or forty-nine with twenty-five. In cents, and in the order they are
+/// offered.
+const BUILT_IN: [Offer; 2] = [
+    Offer {
+        tier: Tier::Plus,
+        monthly: 250,
+        yearly: 2400,
+        cap_seconds: 8 * 3600,
+    },
+    Offer {
+        tier: Tier::Pro,
+        monthly: 500,
+        yearly: 4900,
+        cap_seconds: 25 * 3600,
+    },
+];
 
 /// The id of the model, and the name of the provider, in the settings file.
 pub const MODEL_ID: &str = "vinput-pro";
@@ -370,6 +383,38 @@ impl Plan {
     }
 }
 
+/// The tiers there are: the same recognition, with more or fewer hours a
+/// month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tier {
+    /// The larger allowance. What an answer that names no tier means.
+    #[default]
+    Pro,
+    /// The smaller one.
+    Plus,
+}
+
+impl Tier {
+    /// The server's name for it.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Pro => "pro",
+            Self::Plus => "plus",
+        }
+    }
+
+    /// The tier `said` names; one that names none is Pro, and one this
+    /// version does not know is none.
+    fn said(said: &Value) -> Option<Self> {
+        match said.as_str() {
+            None | Some("pro") => Some(Self::Pro),
+            Some("plus") => Some(Self::Plus),
+            Some(_) => None,
+        }
+    }
+}
+
 /// A subscription, which may be one that has ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
@@ -403,8 +448,11 @@ pub struct AccountInfo {
     pub subscription: Option<Subscription>,
     /// Seconds of audio recognized this month.
     pub used_seconds: u64,
-    /// Seconds a month comes with.
+    /// Seconds a month comes with, on the tier in effect.
     pub cap_seconds: u64,
+    /// The tier in effect, or the one of a subscription that is not: Pro
+    /// for an answer that names none, and for an account that is given it.
+    pub tier: Tier,
     /// When the count starts again, in seconds since 1970; zero if the
     /// server did not say.
     pub resets_at: u64,
@@ -454,49 +502,83 @@ fn parse_account(answer: &Value) -> Option<AccountInfo> {
         }),
         used_seconds: usage["seconds"].as_u64().unwrap_or(0),
         cap_seconds: usage["cap_seconds"].as_u64().unwrap_or(0),
+        tier: [&answer["tier"], &subscription["tier"]]
+            .into_iter()
+            .find(|tier| tier.is_string())
+            .and_then(Tier::said)
+            .unwrap_or_default(),
         resets_at: usage["resets_at"].as_u64().unwrap_or(0),
         complimentary: answer["complimentary"].as_bool().unwrap_or(false),
     })
 }
 
-/// What the plans cost and what a month comes with.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Prices {
+/// One tier on offer: what it costs and what a month of it comes with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offer {
+    /// Which tier.
+    pub tier: Tier,
     /// What a month costs, in cents.
     pub monthly: u32,
     /// What a year costs, in cents.
     pub yearly: u32,
-    /// The currency, as its three letters in lower case: `eur`.
-    pub currency: String,
     /// Seconds of speech a month comes with.
     pub cap_seconds: u64,
+}
+
+/// What the tiers cost and what a month of each comes with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prices {
+    /// The tiers that can be subscribed to, the smaller first.
+    pub offers: Vec<Offer>,
+    /// The currency, as its three letters in lower case: `eur`.
+    pub currency: String,
 }
 
 impl Default for Prices {
     /// What is shown until the server has said.
     fn default() -> Self {
         Self {
-            monthly: MONTHLY_CENTS,
-            yearly: YEARLY_CENTS,
+            offers: BUILT_IN.to_vec(),
             currency: "eur".to_owned(),
-            cap_seconds: CAP_SECONDS,
         }
     }
 }
 
+/// Reads the plans. One that names no tier is of Pro, and one that names no
+/// allowance has the one the answer names for all; a tier is on offer when
+/// both its plans are. A server from before there were tiers offers Pro.
 fn parse_prices(answer: &Value) -> Option<Prices> {
     let plans = answer["plans"].as_array()?;
-    let plan = |name: &str| plans.iter().find(|plan| plan["plan"] == name);
-    let amount = |plan: &Value| u32::try_from(plan["amount"].as_u64()?).ok();
-    let (monthly, yearly) = (plan(Plan::Monthly.id())?, plan(Plan::Yearly.id())?);
-    let currency = monthly["currency"].as_str()?;
-    // Two plans in two currencies are not something to show side by side.
-    (yearly["currency"] == currency && currency.len() == 3).then_some(())?;
-    Some(Prices {
-        monthly: amount(monthly)?,
-        yearly: amount(yearly)?,
+    let currency = plans.first()?["currency"].as_str()?;
+    // Plans in two currencies are not something to show side by side.
+    let one = plans.iter().all(|plan| plan["currency"] == currency);
+    (one && currency.len() == 3).then_some(())?;
+    let mut offers = Vec::new();
+    for built_in in BUILT_IN {
+        let tier = built_in.tier;
+        let plan = |plan: Plan| {
+            let mut of_tier = plans
+                .iter()
+                .filter(|entry| Tier::said(&entry["tier"]) == Some(tier));
+            of_tier.find(|entry| entry["plan"] == plan.id())
+        };
+        let amount = |plan: &Value| u32::try_from(plan["amount"].as_u64()?).ok();
+        let (Some(monthly), Some(yearly)) = (plan(Plan::Monthly), plan(Plan::Yearly)) else {
+            continue;
+        };
+        let cap = [&monthly["cap_seconds"], &answer["cap_seconds"]]
+            .into_iter()
+            .find_map(Value::as_u64);
+        offers.push(Offer {
+            tier,
+            monthly: amount(monthly)?,
+            yearly: amount(yearly)?,
+            cap_seconds: cap.unwrap_or(built_in.cap_seconds),
+        });
+    }
+    (!offers.is_empty()).then(|| Prices {
+        offers,
         currency: currency.to_ascii_lowercase(),
-        cap_seconds: answer["cap_seconds"].as_u64().unwrap_or(CAP_SECONDS),
     })
 }
 
@@ -1110,15 +1192,16 @@ impl Account {
             .ok_or_else(|| Failure::Unreachable("the server's answer could not be read".into()))
     }
 
-    /// The page on which to subscribe to `plan`, to open in the browser.
+    /// The page on which to subscribe to `plan` of `tier`, to open in the
+    /// browser.
     ///
     /// # Errors
     ///
     /// Returns why there is none. Someone who has a subscription already is
     /// refused with [`Reason::AlreadySubscribed`]; theirs is managed in the
     /// [`portal`](Self::portal).
-    pub fn checkout(&self, plan: Plan) -> Result<String, Failure> {
-        let body = json!({ "plan": plan.id() }).to_string();
+    pub fn checkout(&self, tier: Tier, plan: Plan) -> Result<String, Failure> {
+        let body = json!({ "plan": plan.id(), "tier": tier.id() }).to_string();
         let answer = self.authorized("/v1/billing/checkout", Some(&body))?;
         self.page(&answer)
     }
@@ -1422,28 +1505,73 @@ mod tests {
 
     #[test]
     fn the_prices_are_read_or_else_the_built_in_ones_stand() {
+        let offer = |tier, monthly, yearly, cap_seconds| Offer {
+            tier,
+            monthly,
+            yearly,
+            cap_seconds,
+        };
         let built_in = Prices::default();
         assert_eq!(
-            (built_in.monthly, built_in.yearly, built_in.cap_seconds),
-            (600, 5900, 144_000)
+            built_in.offers,
+            [
+                offer(Tier::Plus, 250, 2400, 28_800),
+                offer(Tier::Pro, 500, 4900, 90_000)
+            ]
         );
         assert_eq!(built_in.currency, "eur");
+        // A server from before there were tiers: its two plans are those of
+        // Pro, with the allowance it names for all.
         let said = parse_prices(&json!({
             "plans": [
                 {"plan": "yearly", "amount": 4900, "currency": "EUR", "interval": "year"},
                 {"plan": "monthly", "amount": 500, "currency": "EUR", "interval": "month"},
-                {"plan": "lifetime", "amount": 1, "currency": "eur", "interval": "ever"},
+                {"plan": "lifetime", "amount": 1, "currency": "EUR", "interval": "ever"},
             ],
-            "cap_seconds": 180_000,
+            "cap_seconds": 144_000,
         }));
         assert_eq!(
             said,
             Some(Prices {
-                monthly: 500,
-                yearly: 4900,
+                offers: vec![offer(Tier::Pro, 500, 4900, 144_000)],
                 currency: "eur".into(),
-                cap_seconds: 180_000,
             })
+        );
+        // Each tier with its own plans and allowance, the smaller first
+        // whatever the order they come in; a plan that names no allowance
+        // has the one named for all, and a tier this version does not know
+        // is left out.
+        let plan = |tier: &str, plan: &str, amount: u32, cap: Value| {
+            json!({"tier": tier, "plan": plan, "amount": amount, "currency": "eur",
+                "cap_seconds": cap})
+        };
+        let said = parse_prices(&json!({
+            "plans": [
+                plan("pro", "monthly", 600, json!(72_000)),
+                plan("pro", "yearly", 5900, json!(72_000)),
+                plan("plus", "monthly", 300, Value::Null),
+                plan("plus", "yearly", 2900, Value::Null),
+                plan("max", "monthly", 900, json!(1)),
+                plan("max", "yearly", 9900, json!(1)),
+            ],
+            "cap_seconds": 30_000,
+        }));
+        assert_eq!(
+            said.map(|prices| prices.offers),
+            Some(vec![
+                offer(Tier::Plus, 300, 2900, 30_000),
+                offer(Tier::Pro, 600, 5900, 72_000)
+            ])
+        );
+        // A tier with one of its plans missing is not on offer.
+        let said = parse_prices(&json!({"plans": [
+            plan("pro", "monthly", 600, json!(72_000)),
+            plan("pro", "yearly", 5900, json!(72_000)),
+            plan("plus", "monthly", 300, json!(28_800)),
+        ]}));
+        assert_eq!(
+            said.map(|prices| prices.offers),
+            Some(vec![offer(Tier::Pro, 600, 5900, 72_000)])
         );
         // Half an answer is none.
         for bad in [
@@ -1475,6 +1603,25 @@ mod tests {
             refresh,
             json!({"grant_type": "refresh_token", "refresh_token": "r\"1"})
         );
+    }
+
+    #[test]
+    fn the_tier_of_an_account_is_read_and_pro_where_none_is_named() {
+        // The tier is the one in effect, or else the one of the
+        // subscription; an answer that names none, or one this version does
+        // not know, is Pro.
+        let tier = |top: Value, subscription: Value| {
+            parse_account(&json!({
+                "email": "a@example.com", "entitled": true, "tier": top,
+                "subscription": {"status": "active", "tier": subscription},
+            }))
+            .map(|account| account.tier)
+        };
+        assert_eq!(tier(json!("plus"), json!("plus")), Some(Tier::Plus));
+        assert_eq!(tier(Value::Null, json!("plus")), Some(Tier::Plus));
+        assert_eq!(tier(json!("pro"), json!("plus")), Some(Tier::Pro));
+        assert_eq!(tier(Value::Null, Value::Null), Some(Tier::Pro));
+        assert_eq!(tier(json!("max"), Value::Null), Some(Tier::Pro));
     }
 
     #[test]
@@ -1521,6 +1668,7 @@ mod tests {
             }),
             used_seconds: 5210,
             cap_seconds: 144_000,
+            tier: Tier::Pro,
             resets_at: 0,
             complimentary: false,
         };
@@ -1781,8 +1929,12 @@ mod tests {
         let (account, memory) = fake.account();
         memory.sign_in(&fake);
         assert_eq!(
-            account.checkout(Plan::Yearly).as_deref(),
-            Ok("https://checkout.stripe.com/c/pay/yearly")
+            account.checkout(Tier::Pro, Plan::Yearly).as_deref(),
+            Ok("https://checkout.stripe.com/c/pay/pro-yearly")
+        );
+        assert_eq!(
+            account.checkout(Tier::Plus, Plan::Monthly).as_deref(),
+            Ok("https://checkout.stripe.com/c/pay/plus-monthly")
         );
         assert_eq!(
             account.portal().as_deref(),
@@ -1796,7 +1948,7 @@ mod tests {
             });
             assert!(
                 matches!(
-                    account.checkout(Plan::Monthly),
+                    account.checkout(Tier::Pro, Plan::Monthly),
                     Err(Failure::Refused {
                         reason: Reason::AlreadySubscribed,
                         ..
@@ -1841,10 +1993,14 @@ mod tests {
         assert_eq!(account.prices(), Ok(Prices::default()));
         fake.change(|server| {
             server.plans["plans"][0]["amount"] = json!(700);
-            server.plans["cap_seconds"] = json!(72_000);
+            server.plans["plans"][0]["cap_seconds"] = json!(90_000);
         });
         let prices = account.prices().map_err(|err| err.to_string())?;
-        assert_eq!((prices.monthly, prices.cap_seconds), (700, 72_000));
+        let pro = prices
+            .offers
+            .last()
+            .map(|pro| (pro.monthly, pro.cap_seconds));
+        assert_eq!(pro, Some((700, 90_000)));
         // A server that does not know the route yet: the caller falls back.
         fake.change(|server| server.faults = vec![("GET /v1/plans", 404, "not_found")]);
         assert!(account.prices().is_err());

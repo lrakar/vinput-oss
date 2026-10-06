@@ -68,6 +68,15 @@ pub struct Settings {
     /// The web search a dictated search opens, with `%s` for what was said;
     /// see [`crate::search`].
     pub search_url: String,
+    /// The model on this PC that was in use when an online one was chosen
+    /// in its place; empty if none was. It is what `VinPUT` Pro carries on
+    /// with when the month's hours are used up, if it is still here.
+    pub last_local_model: String,
+    /// Whether the welcome is still to be shown: set when Vinput starts
+    /// without a settings file, which only someone who has just installed
+    /// it does, and cleared once they have chosen a model or said later.
+    /// A file that does not say has it off, so an update never shows it.
+    pub first_run: bool,
     /// Lines with keys this version does not know, kept so that saving does
     /// not throw away what another version or program wrote.
     pub extra: Vec<(String, String)>,
@@ -94,6 +103,8 @@ impl Default for Settings {
             memo_to_clipboard: true,
             check_updates: true,
             search_url: search::DEFAULT_TEMPLATE.to_owned(),
+            last_local_model: String::new(),
+            first_run: false,
             extra: Vec::new(),
         }
     }
@@ -179,6 +190,8 @@ impl Settings {
                         value.clone_into(&mut settings.search_url);
                     }
                 }
+                "last_local_model" => value.clone_into(&mut settings.last_local_model),
+                "first_run" => settings.first_run = flag(),
                 _ => settings.extra.push((key.to_owned(), value.to_owned())),
             }
         }
@@ -207,7 +220,8 @@ impl Settings {
              check_updates = {}\n\
              hotkey_search = {}\n\
              search_url = {}\n\
-             microphone = {}\n",
+             microphone = {}\n\
+             last_local_model = {}\n",
             self.hotkey,
             optional_hotkey(self.hotkey_enter),
             optional_hotkey(self.hotkey_memo),
@@ -226,7 +240,16 @@ impl Settings {
             optional_hotkey(self.hotkey_search),
             self.search_url,
             self.microphone,
+            self.last_local_model,
         );
+        // Written only while it is on: the file of someone who was never
+        // owed a welcome, or has had it, says nothing of it.
+        if self.first_run {
+            text.push_str(
+                "first_run = true
+",
+            );
+        }
         for (key, value) in &self.extra {
             text.push_str(key);
             text.push_str(" = ");
@@ -242,12 +265,32 @@ impl Settings {
         Some(data_dir()?.join("settings.ini"))
     }
 
-    /// Loads the settings file, or defaults if it does not exist or cannot be read.
+    /// Loads the settings file, or defaults if it cannot be read. Without a
+    /// file this is the first start after a new install, and the settings
+    /// say so ([`Settings::first_run`]).
     #[must_use]
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map_or_else(Self::default, |text| Self::parse(&text))
+        Self::path().map_or_else(Self::default, |path| Self::load_from(&path))
+    }
+
+    /// The settings in the file at `path`, as [`load`](Self::load) reads them.
+    fn load_from(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text),
+            // Only a file that is not there says "new here". One that is
+            // there and cannot be read belongs to someone who has settings.
+            Err(err) => Self {
+                first_run: err.kind() == std::io::ErrorKind::NotFound,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// Whether the welcome is to be shown: this is a new install, and no
+    /// model was chosen yet.
+    #[must_use]
+    pub fn owes_welcome(&self) -> bool {
+        self.first_run && !self.has_model()
     }
 
     /// Writes the settings file, creating its folder if needed. The file is
@@ -429,6 +472,8 @@ mod tests {
             memo_to_clipboard: false,
             check_updates: false,
             search_url: "https://duckduckgo.com/?q=%s".into(),
+            last_local_model: "whisper-base".into(),
+            first_run: true,
             extra: vec![("future_key".into(), "kept".into())],
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
@@ -552,6 +597,52 @@ mod tests {
                 .as_deref(),
             Some("my-project")
         );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn only_a_start_without_a_settings_file_owes_a_welcome() {
+        let folder = std::env::temp_dir().join(format!("vinput-welcome-{}", std::process::id()));
+        let path = folder.join("settings.ini");
+        let _ = std::fs::remove_dir_all(&folder);
+
+        // A new install: no file, so the welcome is owed, and the file
+        // that is then written keeps saying so until it is over.
+        let fresh = Settings::load_from(&path);
+        assert!(fresh.first_run && fresh.owes_welcome());
+        assert!(fresh.save_to(&path).is_ok());
+        assert!(Settings::load_from(&path).owes_welcome());
+
+        // Once a model is chosen nothing is owed, whatever the file says.
+        let mut chosen = fresh.clone();
+        "whisper-base".clone_into(&mut chosen.model);
+        assert!(!chosen.owes_welcome());
+
+        // Someone who has settings is never new: not with a file of an
+        // older version, with or without a model, nor with an empty one.
+        for old in [
+            "hotkey = F5
+provider = google-cloud
+model = chirp_3
+",
+            "hotkey = F5
+model = 
+",
+            "",
+        ] {
+            assert!(std::fs::write(&path, old).is_ok());
+            let settings = Settings::load_from(&path);
+            assert!(!settings.first_run && !settings.owes_welcome(), "{old:?}");
+            // And saving such a file does not start to say anything of it.
+            assert!(!settings.serialize().contains("first_run"));
+        }
+
+        // After the welcome the line is gone from the file.
+        let mut done = fresh;
+        done.first_run = false;
+        assert!(done.save_to(&path).is_ok());
+        assert!(!Settings::load_from(&path).first_run);
+        assert!(std::fs::read_to_string(&path).is_ok_and(|text| !text.contains("first_run")));
         let _ = std::fs::remove_dir_all(&folder);
     }
 

@@ -102,8 +102,11 @@ pub fn run(settings: Settings, controller: &mut dyn Controller, launch: Launch) 
     match launch {
         Launch::Background => {}
         Launch::Settings => {
-            // A new user has a model to choose before anything else works.
-            let page = if host.settings.has_model() {
+            // Someone who has just installed is welcomed. Anyone else
+            // without a model has one to choose before anything works.
+            let page = if host.settings.owes_welcome() {
+                Page::Welcome
+            } else if host.settings.has_model() {
                 Page::General
             } else {
                 Page::Models
@@ -146,7 +149,7 @@ pub fn run(settings: Settings, controller: &mut dyn Controller, launch: Launch) 
                         return Ok(());
                     }
                 }
-                Some(TrayEvent::Open) => host.open_settings(Page::General),
+                Some(TrayEvent::Open) => host.open_home(),
                 Some(TrayEvent::Notification) => host.on_notification_click(),
                 None => {}
             },
@@ -159,7 +162,7 @@ pub fn run(settings: Settings, controller: &mut dyn Controller, launch: Launch) 
                     return Ok(());
                 }
             }
-            OPEN_SETTINGS => host.open_settings(Page::General),
+            OPEN_SETTINGS => host.open_home(),
             API_COMMAND => host.on_api_command(controller),
             UPDATE_CHECKED => host.on_update_checked(),
             // The model in use moves to the engine that has just arrived.

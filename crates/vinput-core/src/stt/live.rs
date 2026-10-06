@@ -165,6 +165,9 @@ pub(super) struct Session {
     /// `None` once `finish` has ended the audio.
     audio: Option<UnboundedSender<Vec<u8>>>,
     results: std_mpsc::Receiver<Result<Transcript>>,
+    /// Whether the audio last fed was not taken, because the task had let
+    /// go of the stream by then.
+    pub(super) unsent: bool,
     /// Dropped with the session, which tells its task to stop at once: after
     /// a failure to type, say, nothing more is wanted from the service.
     _alive: oneshot::Sender<()>,
@@ -181,6 +184,7 @@ pub(super) fn session(what: &'static str, piece: usize) -> (Session, Client) {
         piece: piece.max(2),
         audio: Some(audio_tx),
         results: result_rx,
+        unsent: false,
         _alive: alive,
     };
     let client = Client {
@@ -194,6 +198,11 @@ pub(super) fn session(what: &'static str, piece: usize) -> (Session, Client) {
 impl Session {
     fn closed(&self) -> Error {
         Error::Transcription(format!("the {} closed unexpectedly", self.what))
+    }
+
+    /// The transcripts the task left behind that were not handed on yet.
+    pub(super) fn rest(&mut self) -> impl Iterator<Item = Transcript> + '_ {
+        self.results.try_iter().flatten()
     }
 }
 
@@ -217,6 +226,7 @@ impl Transcriber for Session {
         for piece in pcm.chunks(self.piece / 2) {
             sent &= audio.send(bytes_of(piece)).is_ok();
         }
+        self.unsent = !sent;
         // Hand back the first final transcript that is ready, else the
         // newest interim. What was settled before a failure is typed before
         // the failure is reported.

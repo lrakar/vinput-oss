@@ -310,6 +310,31 @@ pub fn any_local_model() -> bool {
         .any(|(file, _)| model_path(file).is_some_and(|path| has_size(&path, file.source.bytes)))
 }
 
+/// The model to carry on with when an online one cannot serve: `preferred`
+/// if it is among `installed`, otherwise the first of them, which in the
+/// order of the catalog is the best.
+pub fn pick<'a>(
+    preferred: &str,
+    installed: impl IntoIterator<Item = &'a Model>,
+) -> Option<&'a Model> {
+    let mut first = None;
+    for model in installed {
+        if model.id.eq_ignore_ascii_case(preferred) {
+            return Some(model);
+        }
+        first = first.or(Some(model));
+    }
+    first
+}
+
+/// The model on this PC to carry on with, [`pick`]ed from the local models
+/// that are installed; `None` if none is. Nothing is downloaded for it.
+#[must_use]
+pub fn spare(preferred: &str, gpu: bool) -> Option<&'static Model> {
+    let local = all().into_iter().filter(|model| model.local.is_some());
+    pick(preferred, local.filter(|model| is_installed(model, gpu)))
+}
+
 /// The path of a program of an engine build, if that build is installed.
 fn program_in(build: &Download, runner: Runner) -> Option<PathBuf> {
     let dir = engine_dir(build)?;

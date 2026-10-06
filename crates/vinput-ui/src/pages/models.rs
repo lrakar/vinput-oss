@@ -14,11 +14,13 @@ use vinput_view::{
     ProWho, Setup, View,
 };
 
-use super::common::{DOT, ProTrouble, fraction, notice_bar, owing, price, pro_trouble, so_far};
+use super::common::{
+    DOT, ProTrouble, fraction, hours_low, least_a_month, notice_bar, owing, pro_trouble, so_far,
+};
 use super::pro::{usage, works_again};
 use crate::node::{
-    Action, ButtonKind, Content, Icon, Node, Severity, Tone, badge, button, card, header,
-    human_size, icon_button, info_bar, row, setting, toggle,
+    Action, ButtonKind, Content, Icon, Node, Severity, Tone, accent_button, badge, button, card,
+    header, human_size, icon_button, info_bar, row, setting, toggle,
 };
 
 /// What the page shows for `view`.
@@ -53,7 +55,7 @@ fn prompt(list: &[Model]) -> Option<Node> {
 }
 
 /// Why the engine that local models need is not here, if its download failed.
-fn engine_failure(engine: &Engine) -> Option<Node> {
+pub(super) fn engine_failure(engine: &Engine) -> Option<Node> {
     let Engine::Failed { reason } = engine else {
         return None;
     };
@@ -110,7 +112,7 @@ fn on_this_pc(models: &Models, graphics_card_on: bool) -> Vec<Node> {
 }
 
 /// The download of the engine that local models need, while it is under way.
-fn engine_download(engine: &Engine) -> Option<Node> {
+pub(super) fn engine_download(engine: &Engine) -> Option<Node> {
     let Engine::Fetching { done, total } = *engine else {
         return None;
     };
@@ -126,7 +128,7 @@ fn engine_download(engine: &Engine) -> Option<Node> {
 }
 
 /// One model: what it is, where it stands and what can be done with it.
-fn model_row(model: &Model) -> Node {
+pub(super) fn model_row(model: &Model) -> Node {
     let icon = if model.local {
         Icon::Model
     } else {
@@ -159,6 +161,7 @@ fn pro_card(view: &View) -> Option<Node> {
     // account that is given it.
     let behind = owing(&pro.status) && !pro.complimentary;
     let trouble = pro_trouble(pro);
+    let manage = || button("Manage", page()).kind(ButtonKind::Subtle);
     let (said, alarm, press) = match trouble {
         // The server has not said yet, or could not be asked.
         None if unknown && pro.doing == ProDoing::Asking && pro.problem.is_none() => {
@@ -166,17 +169,29 @@ fn pro_card(view: &View) -> Option<Node> {
         }
         None if unknown => ("Could not check your subscription".to_owned(), None, open()),
         // The benefit first, then what it costs.
+        // The one button of the page in the accent color: it is what makes
+        // the card easy to find.
         Some(ProTrouble::SignedOut | ProTrouble::NoSubscription) => (
+            format!("{}{DOT}from {}", about(&model.summary), least_a_month(pro)),
+            None,
+            accent_button("See plans", page()),
+        ),
+        // Typing goes on with a model on this PC: said, not warned of.
+        Some(ProTrouble::UsedUp) if pro.spare.is_some() => (
             format!(
-                "{}{DOT}{} a month",
-                about(&model.summary),
-                price(pro.monthly, &pro.currency)
+                "Hours used up{DOT}using {} {}",
+                pro.spare.as_deref().unwrap_or_default(),
+                works_again(pro, "until", "until next month")
             ),
             None,
-            button("See plans", page()),
+            manage(),
         ),
         Some(ProTrouble::UsedUp) => (
-            format!("Paused {}", works_again(pro, "until", "until next month")),
+            // The models to download are right below.
+            format!(
+                "Paused {}{DOT}download a model below to carry on",
+                works_again(pro, "until", "until next month")
+            ),
             Some(Tone::Caution),
             open(),
         ),
@@ -187,11 +202,13 @@ fn pro_card(view: &View) -> Option<Node> {
             open(),
         ),
         None if behind => ("Needs attention".to_owned(), Some(Tone::Caution), open()),
-        None if model.in_use => (
-            usage(pro),
+        // Nearly used up: what will happen then, for someone it will stop.
+        None if model.in_use && pro.spare.is_none() && hours_low(pro) => (
+            format!("{}{DOT}no model on this PC to carry on with", usage(pro)),
             None,
-            button("Manage", page()).kind(ButtonKind::Subtle),
+            manage(),
         ),
+        None if model.in_use => (usage(pro), None, manage()),
         None => {
             let choose = Action::send(Command::UseModel(model.id.clone()));
             (usage(pro), None, button("Use", choose))
@@ -199,17 +216,18 @@ fn pro_card(view: &View) -> Option<Node> {
     };
     // Only what dictation depends on right now is said in a color.
     let tone = alarm.filter(|_| model.in_use).unwrap_or(Tone::Secondary);
-    // Nor does it claim to be in use while nothing is typed with it.
-    let detail = if model.in_use && trouble.is_none() {
-        format!("In use{DOT}{said}")
-    } else {
-        said
-    };
+    // The badge of the model in use, as the rows under it wear it. Not
+    // while nothing is typed with it.
+    let mut controls = Vec::new();
+    if model.in_use && trouble.is_none() {
+        controls.push(badge("In use", Tone::Accent));
+    }
+    controls.push(press.into());
     let line = setting(Icon::Star, &model.name)
         .icon_tone(Tone::Accent)
-        .detail(detail)
+        .detail(said)
         .detail_tone(tone)
-        .control(press.into());
+        .control(row(controls));
     Some(card([line.into()]))
 }
 
@@ -677,10 +695,13 @@ mod tests {
         kinds: Vec<ButtonKind>,
         commands: Vec<Command>,
         to_its_page: bool,
+        /// Whether it wears the badge of the model in use.
+        in_use: bool,
     }
 
     /// The card pinned to the top of the page for `view`: one row in a card
-    /// of its own, with the star in the accent color and one button.
+    /// of its own, with the star in the accent color and one button, and
+    /// the badge of the model in use or none.
     fn pro(view: &View) -> ProCard {
         let page = content(view);
         let [Node::Card(rows)] = page.pinned.as_slice() else {
@@ -696,7 +717,8 @@ mod tests {
         );
         assert!(!line.selected && line.action.is_none() && line.below.is_empty());
         let seen = Seen::of_setting(line);
-        assert!(seen.badges.is_empty() && seen.presses.len() == 1);
+        assert!(seen.badges.iter().all(|badge| badge == "In use"));
+        assert!(seen.badges.len() <= 1 && seen.presses.len() == 1);
         // It is listed once: not among the online models as well.
         let listed = settings(&page.body);
         assert!(listed.iter().all(|row| row.title != line.title));
@@ -707,6 +729,7 @@ mod tests {
             kinds: seen.presses.iter().map(|press| press.kind).collect(),
             commands: seen.commands(),
             to_its_page: matches!(seen.presses[0].action, Action::Go(Page::Pro)),
+            in_use: !seen.badges.is_empty(),
         }
     }
 
@@ -725,7 +748,8 @@ mod tests {
             let card = pro(&scene(name));
             assert!(!card.detail.is_empty(), "{name}");
             assert!(!card.detail.contains(". "), "{name}: {}", card.detail);
-            assert!(card.detail.chars().count() <= 52, "{name}: {}", card.detail);
+            // One line beside its button, as the pictures show.
+            assert!(card.detail.chars().count() <= 60, "{name}: {}", card.detail);
         }
         // A list without it has nothing pinned over it.
         let mut view = scene("settings");
@@ -746,29 +770,42 @@ mod tests {
             let card = pro(&scene(name));
             assert_eq!(
                 card.detail,
-                "Types as you speak, in 60+ languages \u{b7} \u{20ac}6 a month"
+                "Types as you speak, in 60+ languages \u{b7} from \u{20ac}2.50 a month"
             );
             assert_eq!(card.tone, Tone::Secondary);
             assert_eq!(card.labels, ["See plans"], "{name}");
-            assert_eq!(card.kinds, [ButtonKind::Standard]);
-            assert!(card.to_its_page && card.commands.is_empty());
+            // The button is what makes the card easy to find: the one of
+            // the page in the accent color, with no tint or border beside.
+            assert_eq!(card.kinds, [ButtonKind::Accent]);
+            assert!(card.to_its_page && card.commands.is_empty() && !card.in_use);
+            let page = Seen::of(&content(&scene(name)).body);
+            let accent = page.presses.iter();
+            let accent = accent.filter(|press| press.kind == ButtonKind::Accent);
+            assert_eq!(accent.count(), 0, "{name}");
         }
-        // The price is the one the server gave.
+        // The price is the least a month costs, as the server gave it.
         let mut view = scene("pro-not-subscribed");
-        view.pro.monthly = 750;
+        view.pro.offers[0].monthly = 275;
         view.pro.currency = "usd".to_owned();
-        assert!(pro(&view).detail.ends_with("\u{b7} $7.50 a month"));
+        assert!(pro(&view).detail.ends_with("\u{b7} from $2.75 a month"));
+        view.pro.offers.remove(0);
+        assert!(pro(&view).detail.ends_with("\u{b7} from $5 a month"));
     }
 
     #[test]
     fn pro_shows_a_subscriber_the_use_of_the_month_and_whether_it_is_in_use() {
-        // In use: said in words, with a quiet way to its page.
-        for name in ["pro-subscribed", "pro-complimentary", "pro-offline-known"] {
+        // In use: the badge the rows of the models wear, the use of the
+        // month against what the tier comes with, and a quiet way to its
+        // page.
+        for (name, used) in [
+            ("pro-subscribed", "12 h 30 min of 25 hours"),
+            ("pro-complimentary", "12 h 30 min of 25 hours"),
+            ("pro-offline-known", "12 h 30 min of 25 hours"),
+            ("pro-plus", "3 h 10 min of 8 hours"),
+        ] {
             let card = pro(&scene(name));
-            assert_eq!(
-                card.detail, "In use \u{b7} 12 h 30 min of 40 hours",
-                "{name}"
-            );
+            assert_eq!(card.detail, used, "{name}");
+            assert!(card.in_use, "{name}");
             assert_eq!(card.tone, Tone::Secondary);
             assert_eq!(card.labels, ["Manage"]);
             assert_eq!(card.kinds, [ButtonKind::Subtle]);
@@ -777,7 +814,8 @@ mod tests {
         // Another model in use: one press switches to it.
         for name in ["pro-subscribed-elsewhere", "pro-complimentary"] {
             let card = pro(&elsewhere(name));
-            assert_eq!(card.detail, "12 h 30 min of 40 hours", "{name}");
+            assert_eq!(card.detail, "12 h 30 min of 25 hours", "{name}");
+            assert!(!card.in_use);
             assert_eq!(card.labels, ["Use"]);
             assert_eq!(card.kinds, [ButtonKind::Standard]);
             assert_eq!(card.commands, [Command::UseModel(id(PRO_MODEL))]);
@@ -785,15 +823,53 @@ mod tests {
     }
 
     #[test]
+    fn pro_says_what_types_while_the_hours_of_the_month_are_used_up() {
+        // A model on this PC carries on: said quietly, since nothing
+        // stops, and without the badge, since Pro types nothing.
+        for name in ["pro-over-allowance", "pro-plus-used-up"] {
+            let card = pro(&scene(name));
+            assert_eq!(
+                card.detail,
+                "Hours used up \u{b7} using Whisper base until 1 November"
+            );
+            assert_eq!(card.tone, Tone::Secondary, "{name}");
+            assert!(!card.in_use && card.to_its_page);
+            assert_eq!(card.labels, ["Manage"]);
+        }
+        let mut view = scene("pro-over-allowance");
+        view.pro.resets_at = 0;
+        assert!(pro(&view).detail.ends_with("until next month"));
+        // No model on this PC: dictation has stopped, and what to do about
+        // it is in the list right under the card.
+        let card = pro(&scene("pro-used-up-no-model"));
+        assert_eq!(
+            card.detail,
+            "Paused until 1 November \u{b7} download a model below to carry on"
+        );
+        assert_eq!(card.tone, Tone::Caution);
+        assert!(!card.in_use);
+        assert_eq!(card.labels, ["Open VinPUT Pro"]);
+        // Nearly used up, it is said before it happens; with plenty left
+        // or a model on this PC, never.
+        let card = pro(&scene("pro-low-no-model"));
+        assert_eq!(
+            card.detail,
+            "7 h 35 min of 8 hours \u{b7} no model on this PC to carry on with"
+        );
+        assert!(card.in_use && card.tone == Tone::Secondary);
+        let mut view = scene("pro-low-no-model");
+        view.pro.used_seconds = 7 * 3600;
+        assert_eq!(pro(&view).detail, "7 h of 8 hours");
+        view.pro.used_seconds = 8 * 3600 - 1500;
+        view.pro.spare = Some(id("Whisper base"));
+        assert_eq!(pro(&view).detail, "7 h 35 min of 8 hours");
+    }
+
+    #[test]
     fn pro_says_briefly_what_is_wrong_and_leads_to_its_page() {
         // What dictation depends on is said in a color; what it does not
         // depend on right now is said quietly.
         for (name, words, alarm) in [
-            (
-                "pro-over-allowance",
-                "Paused until 1 November",
-                Tone::Caution,
-            ),
             ("pro-payment-failed", "Needs attention", Tone::Critical),
             ("pro-expired", "Subscription ended", Tone::Critical),
         ] {
@@ -811,13 +887,18 @@ mod tests {
         }
         // A server that does not say when the month is over: no date is
         // made up.
-        let mut view = scene("pro-over-allowance");
+        let mut view = scene("pro-used-up-no-model");
         view.pro.resets_at = 0;
-        assert_eq!(pro(&view).detail, "Paused until next month");
+        assert!(
+            pro(&view)
+                .detail
+                .starts_with("Paused until next month \u{b7}")
+        );
 
         // A renewal that failed while Pro still works.
         let card = pro(&scene("pro-payment-problem"));
-        assert_eq!(card.detail, "In use \u{b7} Needs attention");
+        assert_eq!(card.detail, "Needs attention");
+        assert!(card.in_use);
         assert_eq!(card.tone, Tone::Caution);
         assert_eq!(card.labels, ["Open VinPUT Pro"]);
         let card = pro(&elsewhere("pro-payment-problem"));
@@ -833,10 +914,8 @@ mod tests {
     fn pro_says_so_when_the_account_could_not_be_checked() {
         let mut view = scene("pro-offline");
         let card = pro(&view);
-        assert_eq!(
-            card.detail,
-            "In use \u{b7} Could not check your subscription"
-        );
+        assert_eq!(card.detail, "Could not check your subscription");
+        assert!(card.in_use);
         assert_eq!(card.tone, Tone::Secondary);
         assert_eq!(card.labels, ["Open VinPUT Pro"]);
         assert!(card.to_its_page);
@@ -848,10 +927,7 @@ mod tests {
         // failed yet.
         view.pro.problem = None;
         view.pro.doing = ProDoing::Asking;
-        assert_eq!(
-            pro(&view).detail,
-            "In use \u{b7} Checking your subscription"
-        );
+        assert_eq!(pro(&view).detail, "Checking your subscription");
     }
 
     #[test]

@@ -1,5 +1,16 @@
 [
   {
+    "version": "0.4.1",
+    "published": "2026-10-06",
+    "notes": [
+      "VinPUT Plus, a second subscription: 8 hours a month for €2.50 a month or €24 a year",
+      "VinPUT Pro is now 25 hours a month for €5 a month or €49 a year",
+      "When a month's hours run out, dictation carries on with a model on this PC",
+      "VinPUT Pro has its own place at the top of Models",
+      "A welcome after a new install helps you choose between VinPUT Pro and a model on this PC"
+    ]
+  },
+  {
     "version": "0.4.0",
     "published": "2026-10-06",
     "notes": [

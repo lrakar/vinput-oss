@@ -11,6 +11,7 @@ mod gemini;
 mod google;
 mod live;
 mod local;
+pub(crate) mod standby;
 
 use std::fmt;
 use std::str::FromStr;
@@ -21,6 +22,7 @@ pub use cloud::{CloudSpeech, Timings, measure};
 pub use gemini::{GeminiConfig, GeminiSpeech};
 pub use google::{GoogleConfig, GoogleSession, GoogleSpeech};
 pub use local::LocalSpeech;
+pub use standby::Standby;
 
 use crate::settings::Settings;
 use crate::{Error, Result, log};
@@ -171,7 +173,10 @@ pub fn connect(settings: &Settings) -> Result<Arc<dyn SpeechProvider>> {
             &settings.model,
             settings.use_gpu(),
         )?)),
-        ProviderKind::Cloud => Ok(Arc::new(CloudSpeech::connect(crate::cloud::shared())?)),
+        ProviderKind::Cloud => Ok(Arc::new(CloudSpeech::connect(
+            crate::cloud::shared(),
+            Standby::shared(),
+        )?)),
     }
 }
 

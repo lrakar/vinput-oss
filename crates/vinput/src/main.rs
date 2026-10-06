@@ -77,7 +77,7 @@ const USAGE: [(&str, &str); 17] = [
     ("check-update", "look for a newer version"),
     (
         "ui <window>",
-        "show settings, models, add-model, google, pro, advanced, about or update",
+        "show settings, models, add-model, google, pro, advanced, about, welcome or update",
     ),
     (
         "ui <window> --mock <scene>",

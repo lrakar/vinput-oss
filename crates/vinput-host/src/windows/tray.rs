@@ -184,8 +184,10 @@ pub(super) enum About {
     Memo,
 }
 
-/// The tray tooltip: the keys, and the model that is at work.
-pub(super) fn tooltip(settings: &Settings) -> String {
+/// The tray tooltip: the keys, and the model that is at work. `spare` is
+/// the model on this PC that serves in place of `VinPUT` Pro while the
+/// month's hours are used up.
+pub(super) fn tooltip(settings: &Settings, spare: Option<&str>) -> String {
     let keys = match settings.hotkey_enter {
         Some(enter) => format!(
             "Vinput: {} to dictate, {enter} to dictate and send",
@@ -194,6 +196,10 @@ pub(super) fn tooltip(settings: &Settings) -> String {
         None => format!("Vinput: {} to dictate", settings.hotkey),
     };
     match models::name_in_use(settings.provider, &settings.model) {
+        Some(model) if spare.is_some() => format!(
+            "{keys}\n{model} hours used up, using {}",
+            spare.unwrap_or_default()
+        ),
         Some(model) => format!("{keys}\nModel: {model}"),
         None => format!("{keys}\nNo speech model chosen yet"),
     }
@@ -414,7 +420,8 @@ impl Host {
 
     /// Brings the tooltip of the tray icon in line with the settings.
     pub(super) fn refresh_tip(&mut self) {
-        self.tray.set_tip(&tooltip(&self.settings));
+        let tip = tooltip(&self.settings, self.pro.carrying_with(&self.settings));
+        self.tray.set_tip(&tip);
     }
 }
 
@@ -619,7 +626,7 @@ mod tests {
     fn the_tooltip_names_the_keys_and_says_when_no_model_is_chosen() {
         let mut settings = Settings::default();
         assert_eq!(
-            tooltip(&settings),
+            tooltip(&settings, None),
             "Vinput: F1 to dictate, F2 to dictate and send\nNo speech model chosen yet"
         );
         settings.hotkey_enter = None;
@@ -627,8 +634,17 @@ mod tests {
             ctrl: true,
             ..Hotkey::plain(0x20)
         };
-        assert!(tooltip(&settings).starts_with("Vinput: Ctrl+Space to dictate\n"));
+        assert!(tooltip(&settings, None).starts_with("Vinput: Ctrl+Space to dictate\n"));
         // Windows shows no more than this of a tooltip.
-        assert!(tooltip(&settings).encode_utf16().count() < 128);
+        assert!(tooltip(&settings, None).encode_utf16().count() < 128);
+        // While the hours of VinPUT Pro are used up, it says what types.
+        settings.provider = vinput_core::stt::ProviderKind::Cloud;
+        settings.model = vinput_core::cloud::MODEL_ID.to_owned();
+        let tip = tooltip(&settings, Some("Whisper large-v3 turbo (compact)"));
+        assert!(
+            tip.ends_with("\nVinPUT Pro hours used up, using Whisper large-v3 turbo (compact)"),
+            "{tip}"
+        );
+        assert!(tip.encode_utf16().count() < 128);
     }
 }

@@ -11,8 +11,8 @@
 use std::time::Duration;
 use vinput_core::audio::Microphone;
 
-use vinput_core::cloud::{AccountInfo, Plan, Prices};
-use vinput_core::models::{EngineState, Model, Status};
+use vinput_core::cloud::{AccountInfo, Plan, Prices, Tier};
+use vinput_core::models::{self, EngineState, Model, Status};
 use vinput_core::settings::Settings;
 use vinput_core::stt::ProviderKind;
 use vinput_core::update;
@@ -70,6 +70,9 @@ pub(crate) struct ProFacts<'a> {
     pub(crate) problem: Option<&'a str>,
     /// What the plans cost.
     pub(crate) prices: &'a Prices,
+    /// Whether the model on this PC serves in place of `VinPUT` Pro right
+    /// now, because the month's hours are used up.
+    pub(crate) carrying: bool,
 }
 
 /// What is known about the setup of a Google service of one's own.
@@ -189,7 +192,11 @@ fn status(facts: &Facts<'_>) -> wire::Status {
     // A model set by hand in the settings file is not on the list; it is
     // shown under the name it was written with, as an online one.
     let unlisted = Some(&facts.settings.model).filter(|name| !name.is_empty());
+    let carrying = facts.pro.carrying && facts.settings.provider == ProviderKind::Cloud;
     let runs_on = match (chosen, facts.graphics_card) {
+        (Some(_), _) if carrying && spare(facts).is_some() => {
+            wire::RunsOn::Spare(spare(facts).unwrap_or_default().to_owned())
+        }
         (None, _) if unlisted.is_none() => wire::RunsOn::Nowhere,
         (None, _) => wire::RunsOn::Online,
         (Some(model), _) if model.local.is_none() => wire::RunsOn::Online,
@@ -294,14 +301,40 @@ fn update(facts: &UpdateFacts<'_>) -> wire::Update {
     }
 }
 
-fn pro(facts: &ProFacts<'_>) -> wire::Pro {
+/// Name of the model on this PC that dictation carries on with when the
+/// hours of `VinPUT` Pro are used up, if one is downloaded.
+fn spare(facts: &Facts<'_>) -> Option<&'static str> {
+    let here = facts
+        .models
+        .iter()
+        .filter(|(model, status)| model.local.is_some() && matches!(status, Status::Installed));
+    let preferred = &facts.settings.last_local_model;
+    models::pick(preferred, here.map(|(model, _)| *model)).map(|model| model.name)
+}
+
+fn tier(tier: Tier) -> wire::ProTier {
+    match tier {
+        Tier::Pro => wire::ProTier::Pro,
+        Tier::Plus => wire::ProTier::Plus,
+    }
+}
+
+fn pro(all: &Facts<'_>) -> wire::Pro {
+    let facts = &all.pro;
+    let offers = facts.prices.offers.iter();
     let mut shown = wire::Pro {
         doing: facts.doing,
         problem: facts.problem.map(str::to_owned),
-        monthly: facts.prices.monthly,
-        yearly: facts.prices.yearly,
+        offers: offers
+            .map(|offer| wire::ProOffer {
+                tier: tier(offer.tier),
+                monthly: offer.monthly,
+                yearly: offer.yearly,
+                seconds: offer.cap_seconds,
+            })
+            .collect(),
         currency: facts.prices.currency.clone(),
-        plan_seconds: facts.prices.cap_seconds,
+        spare: spare(all).map(str::to_owned),
         ..wire::Pro::default()
     };
     // A sign-in under way shows its code, whoever was signed in before.
@@ -327,6 +360,7 @@ fn pro(facts: &ProFacts<'_>) -> wire::Pro {
     shown.entitled = info.entitled || shown.complimentary;
     shown.used_seconds = info.used_seconds;
     shown.cap_seconds = info.cap_seconds;
+    shown.tier = tier(info.tier);
     shown.resets_at = info.resets_at;
     shown.checked_minutes = facts
         .checked
@@ -401,7 +435,7 @@ pub(crate) fn build(facts: &Facts<'_>) -> wire::View {
         },
         default_memo_dir: facts.default_memo_dir.clone(),
         update: update(&facts.update),
-        pro: pro(&facts.pro),
+        pro: pro(facts),
         notice: facts.notice.clone(),
     }
 }
@@ -450,6 +484,7 @@ mod tests {
             doing: ProDoing::Nothing,
             problem: None,
             prices,
+            carrying: false,
         }
     }
 
@@ -591,6 +626,7 @@ mod tests {
             }),
             used_seconds: 5210,
             cap_seconds: 144_000,
+            tier: Tier::Plus,
             resets_at: 1_793_491_200,
             complimentary: false,
         };
@@ -604,6 +640,7 @@ mod tests {
         assert_eq!(shown.checked_minutes, Some(7));
         assert_eq!(shown.status, "past_due");
         assert_eq!(shown.plan, Some(wire::ProPlan::Yearly));
+        assert_eq!(shown.tier, wire::ProTier::Plus);
         assert!(shown.ends);
         assert_eq!(
             (
@@ -645,24 +682,91 @@ mod tests {
         let settings = Settings::default();
         let mut facts = facts(&settings);
         let shown = build(&facts).pro;
-        assert_eq!((shown.monthly, shown.yearly), (600, 5900));
-        assert_eq!(
-            (shown.currency.as_str(), shown.plan_seconds),
-            ("eur", 144_000)
-        );
+        // Until the server says: both tiers, the smaller first, as the
+        // window shows them when it is told nothing.
+        assert_eq!(shown.offers, wire::Pro::default().offers);
+        assert_eq!(shown.currency, "eur");
         let said = Prices {
-            monthly: 700,
-            yearly: 6900,
+            offers: vec![vinput_core::cloud::Offer {
+                tier: Tier::Pro,
+                monthly: 700,
+                yearly: 6900,
+                cap_seconds: 144_000,
+            }],
             currency: "usd".into(),
-            cap_seconds: 72_000,
         };
         // To someone signed out as to anyone else.
         facts.pro = no_pro(&said);
         let shown = build(&facts).pro;
-        assert_eq!((shown.monthly, shown.yearly), (700, 6900));
         assert_eq!(
-            (shown.currency.as_str(), shown.plan_seconds),
-            ("usd", 72_000)
+            shown.offers,
+            [wire::ProOffer {
+                tier: wire::ProTier::Pro,
+                monthly: 700,
+                yearly: 6900,
+                seconds: 144_000,
+            }]
+        );
+        assert_eq!(shown.currency, "usd");
+    }
+
+    #[test]
+    fn the_model_to_carry_on_with_is_the_one_last_used_or_else_the_first_that_is_here() {
+        let pro = CATALOG
+            .iter()
+            .find(|model| model.provider == ProviderKind::Cloud)
+            .unwrap_or(&CATALOG[0]);
+        let mut settings = choosing(pro);
+        let here: Vec<&Model> = CATALOG
+            .iter()
+            .filter(|model| model.local.is_some())
+            .collect();
+        let (first, last) = (here[0], here[here.len() - 1]);
+        let download = |facts: &mut Facts<'_>, which: &Model| {
+            for (model, status) in &mut facts.models {
+                if model.id == which.id {
+                    *status = Status::Installed;
+                }
+            }
+        };
+        // Nothing downloaded: nothing to carry on with, whatever was used.
+        last.id.clone_into(&mut settings.last_local_model);
+        let mut all = facts(&settings);
+        assert_eq!(build(&all).pro.spare, None);
+        // One that is being downloaded is not one that is here.
+        all.models[here.len()].1 = Status::Installing { done: 1, total: 2 };
+        assert_eq!(build(&all).pro.spare, None);
+        // The first of the catalog that is here, until the one last used is.
+        download(&mut all, first);
+        assert_eq!(build(&all).pro.spare.as_deref(), Some(first.name));
+        download(&mut all, last);
+        assert_eq!(build(&all).pro.spare.as_deref(), Some(last.name));
+
+        // While it serves in place of VinPUT Pro, the status says so; the
+        // model the settings choose is still VinPUT Pro.
+        assert_eq!(build(&all).status.runs_on, wire::RunsOn::Online);
+        all.pro.carrying = true;
+        let shown = build(&all);
+        assert_eq!(shown.status.model.as_deref(), Some(pro.name));
+        assert_eq!(
+            shown.status.runs_on,
+            wire::RunsOn::Spare(last.name.to_owned())
+        );
+        assert!(
+            shown
+                .models
+                .list
+                .iter()
+                .all(|model| model.in_use == (model.id == pro.id))
+        );
+        // Someone who dictates with another model is not told about hours.
+        let other = choosing(first);
+        let mut all = facts(&other);
+        download(&mut all, first);
+        all.pro.carrying = true;
+        assert_ne!(
+            build(&all).status.runs_on,
+            wire::RunsOn::Spare(first.name.to_owned())
         );
     }
 
@@ -860,7 +964,7 @@ mod tests {
         }];
         let mut facts = facts(&settings);
         facts.microphones = &microphones;
-        facts.clients = vec!["Stream Deck".into()];
+        facts.clients = vec!["Control Deck".into()];
         facts.gemini_key_stored = true;
         let view = build(&facts);
         assert_eq!(
@@ -870,7 +974,7 @@ mod tests {
                 name: "Microphone (USB Audio)".into()
             }]
         );
-        assert_eq!(view.api.clients, ["Stream Deck"]);
+        assert_eq!(view.api.clients, ["Control Deck"]);
         assert!(view.gemini_key_stored);
         assert_eq!(view.default_memo_dir, facts.default_memo_dir);
     }

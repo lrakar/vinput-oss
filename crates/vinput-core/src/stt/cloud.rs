@@ -46,6 +46,20 @@
 //! refusal ([`crate::cloud::Code`]) ends the dictation with words that say
 //! what to do about it; text settled before it has been typed by then.
 //!
+//! # When the month's hours run out
+//!
+//! One refusal does not end the dictation: `quota_exceeded`, at the start
+//! of a stream or in the middle of one, when a model is on this PC to carry
+//! on with ([`Standby`]). The task then leaves the audio the server did not
+//! count where the dictation finds it ([`Leftover`]): what was sent after
+//! the count the server gave, or, from a server that gives none, after the
+//! last settled text arrived, and everything that was still waiting to be
+//! sent. The dictation starts a session of the local model, hands it that
+//! audio first and everything after it, and goes on as if nothing had
+//! happened. From then until the allowance starts again no stream is asked
+//! for at all: [`CloudSpeech::start_session`] hands out sessions of the
+//! local model, which costs a look at a number in memory.
+//!
 //! # When the network stalls
 //!
 //! A write that the connection does not take within [`SEND_TIMEOUT`] ends
@@ -73,6 +87,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{Bytes, Error as WsError, Message};
 
 use super::live::{self, Client, Network, Socket, Stream};
+use super::standby::Standby;
 use super::{Emit, ProviderKind, SessionOptions, SpeechProvider, Transcriber, Transcript};
 use crate::audio::SAMPLE_RATE_HZ;
 use crate::cloud::{self, Account, Code, Failure};
@@ -169,8 +184,9 @@ enum Update {
     /// The stream is complete, with this many bytes of its audio counted,
     /// if the server said.
     Done(Option<u64>),
-    /// The server refused to go on.
-    Failed(Failure),
+    /// The server refused to go on, having counted this many bytes of the
+    /// audio, if it said.
+    Failed(Failure, Option<u64>),
     /// Nothing the dictation acts on: `ready`, or something newer.
     Other,
 }
@@ -180,13 +196,14 @@ fn read_message(text: &str) -> Update {
         return Update::Other;
     };
     let said = || message["text"].as_str().unwrap_or_default().to_owned();
+    let counted = || message["seconds"].as_f64().map(counted_bytes);
     match message["type"].as_str() {
         Some("partial") => Update::Partial(said()),
         Some("final") => Update::Final(said()),
-        Some("done") => Update::Done(message["seconds"].as_f64().map(counted_bytes)),
+        Some("done") => Update::Done(counted()),
         Some("error") => {
             let error = &message["error"];
-            Update::Failed(Failure::refused(
+            let failure = Failure::refused(
                 error["code"]
                     .as_str()
                     .and_then(Code::named)
@@ -194,7 +211,8 @@ fn read_message(text: &str) -> Update {
                 error["message"]
                     .as_str()
                     .unwrap_or("the server reported an error"),
-            ))
+            );
+            Update::Failed(failure, counted())
         }
         _ => Update::Other,
     }
@@ -417,6 +435,8 @@ struct Shared {
     request: Request,
     timing: Timing,
     ready: Mutex<Ready>,
+    /// What dictation carries on with when the month's hours are used up.
+    standby: Arc<Standby>,
 }
 
 impl Shared {
@@ -507,11 +527,11 @@ impl CloudSpeech {
     ///
     /// Returns [`Error::Transcription`] if nobody is signed in, or the
     /// runtime cannot be started.
-    pub fn connect(account: Arc<Account>) -> Result<Self> {
-        Self::with(account, Timing::default())
+    pub fn connect(account: Arc<Account>, standby: Arc<Standby>) -> Result<Self> {
+        Self::with(account, Timing::default(), standby)
     }
 
-    fn with(account: Arc<Account>, timing: Timing) -> Result<Self> {
+    fn with(account: Arc<Account>, timing: Timing, standby: Arc<Standby>) -> Result<Self> {
         if account.signed_in_as().is_none() && !account.is_ready() {
             return Err(explain(&Failure::SignedOut));
         }
@@ -528,6 +548,7 @@ impl CloudSpeech {
             request,
             timing,
             ready: Mutex::default(),
+            standby,
         });
         keep_fresh(&shared);
         Ok(Self {
@@ -541,12 +562,24 @@ impl CloudSpeech {
         let (stream, client) = live::session("VinPUT Pro stream", MAX_MESSAGE);
         let marks = Arc::new(Timeline::begin());
         let start = start_message(options.languages);
-        let serving = serve(Arc::clone(&self.shared), start, client, Arc::clone(&marks));
+        let spare = Arc::<Mutex<Option<Leftover>>>::default();
+        let serving = serve(
+            Arc::clone(&self.shared),
+            start,
+            client,
+            Arc::clone(&marks),
+            Arc::clone(&spare),
+        );
         drop(self.shared.network.spawn(serving));
         CloudSession {
             stream,
             marks,
             logged: timings_are_logged(),
+            spare,
+            standby: Arc::clone(&self.shared.standby),
+            languages: options.languages.to_vec(),
+            local: None,
+            ready: VecDeque::new(),
         }
     }
 }
@@ -565,6 +598,11 @@ impl SpeechProvider for CloudSpeech {
     }
 
     fn start_session(&self, options: SessionOptions<'_>) -> Result<Box<dyn Transcriber + Send>> {
+        // While the month's hours are used up the server is not asked: it
+        // would only say so again, a round trip later.
+        if let Some(session) = self.shared.standby.session(options) {
+            return Ok(session);
+        }
         Ok(Box::new(self.session(options)))
     }
 }
@@ -681,9 +719,21 @@ async fn open(shared: &Arc<Shared>, marks: &Timeline) -> std::result::Result<Soc
         .unwrap_or_else(|_| Err(Unopened::Failed(timed_out())))
 }
 
-/// Opens a stream, or says in words why there is none. A refusal is looked
+/// Whether a refusal says that the month's allowance is used up.
+fn is_used_up(failure: &Failure) -> bool {
+    matches!(
+        failure,
+        Failure::Refused {
+            code: Code::QuotaExceeded,
+            ..
+        }
+    )
+}
+
+/// Opens a stream, or says in words why there is none, and in `used_up`
+/// whether it is that the month's allowance is used up. A refusal is looked
 /// into only after the time for connecting, which it must not use up.
-async fn opened(shared: &Arc<Shared>, marks: &Timeline) -> Result<Socket> {
+async fn opened(shared: &Arc<Shared>, marks: &Timeline, used_up: &mut bool) -> Result<Socket> {
     match open(shared, marks).await {
         Ok(socket) => Ok(socket),
         Err(Unopened::Failed(err)) => Err(err),
@@ -693,7 +743,9 @@ async fn opened(shared: &Arc<Shared>, marks: &Timeline) -> Result<Socket> {
                 // gone, or this PC was signed out of it elsewhere.
                 shared.account.signed_out_elsewhere();
             }
-            Err(explain(&why_refused(shared, status, body.as_deref()).await))
+            let failure = why_refused(shared, status, body.as_deref()).await;
+            *used_up = is_used_up(&failure);
+            Err(explain(&failure))
         }
     }
 }
@@ -714,6 +766,8 @@ struct Sent {
     bytes: u64,
     tail: VecDeque<Bytes>,
     kept: usize,
+    /// How much of it had been sent when the last settled text arrived.
+    settled: u64,
 }
 
 impl Sent {
@@ -755,6 +809,41 @@ struct Io {
     results: std::sync::mpsc::Sender<Result<Transcript>>,
     /// How many settled pieces of text were handed on.
     finals: u32,
+    /// Whether the server has said that the month's allowance is used up.
+    used_up: bool,
+    /// How many bytes of the stream it had counted when it said so, if it
+    /// said that too.
+    counted: Option<u64>,
+}
+
+/// The audio of a dictation that the server did not count before the
+/// month's allowance was used up: what a model on this PC recognizes first.
+#[derive(Default)]
+struct Leftover {
+    audio: Vec<u8>,
+    /// Whether that is all of it; a long stretch is kept only in part.
+    whole: bool,
+}
+
+impl Leftover {
+    /// Gathers what the server did not count: the end of what the stream
+    /// was sent, and everything that was still waiting to be sent. Nothing
+    /// more is taken from the dictation after this.
+    fn of(io: &mut Io, talk: &mut Talk) -> Self {
+        io.audio.close();
+        let sent = std::mem::take(&mut talk.sent);
+        let counted = io.counted.unwrap_or(sent.settled).min(sent.bytes);
+        let whole = sent.bytes - counted <= sent.kept as u64;
+        let mut audio = sent.past(counted).concat();
+        for piece in talk.carry.drain(..) {
+            audio.extend_from_slice(&piece);
+        }
+        audio.extend(talk.pending.take().unwrap_or_default());
+        while let Ok(more) = io.audio.try_recv() {
+            audio.extend(more);
+        }
+        Self { audio, whole }
+    }
 }
 
 /// How far a dictation has come, kept from one stream to the next.
@@ -766,6 +855,8 @@ struct Talk {
     pending: Option<Vec<u8>>,
     /// Audio the stream before was sent and did not count.
     carry: Vec<Bytes>,
+    /// What the stream that is open was sent.
+    sent: Sent,
 }
 
 /// How a stream ended.
@@ -795,7 +886,13 @@ impl From<Trouble> for Error {
 
 /// Serves one dictation: its audio out, its transcripts back, in as many
 /// streams as it takes.
-async fn serve(shared: Arc<Shared>, start: String, client: Client, marks: Arc<Timeline>) {
+async fn serve(
+    shared: Arc<Shared>,
+    start: String,
+    client: Client,
+    marks: Arc<Timeline>,
+    spare: Arc<Mutex<Option<Leftover>>>,
+) {
     let Client {
         audio,
         results,
@@ -805,6 +902,14 @@ async fn serve(shared: Arc<Shared>, start: String, client: Client, marks: Arc<Ti
         audio,
         results,
         finals: 0,
+        used_up: false,
+        counted: None,
+    };
+    let mut talk = Talk {
+        audio_open: true,
+        pending: None,
+        carry: Vec::new(),
+        sent: Sent::default(),
     };
     let mut socket = None;
     // Whatever is being waited for, a dictation that was let go of is not
@@ -812,9 +917,15 @@ async fn serve(shared: Arc<Shared>, start: String, client: Client, marks: Arc<Ti
     let outcome = tokio::select! {
         biased;
         _ = &mut gone => None,
-        outcome = dictate(&shared, &start, &mut io, &mut socket, &marks) => Some(outcome),
+        outcome = dictate(&shared, &start, &mut io, &mut talk, &mut socket, &marks) => Some(outcome),
     };
     if let Some(Err(err)) = outcome {
+        // Held from before the audio is closed until the failure is on its
+        // way, so that whoever hears of either finds what was left.
+        let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
+        if io.used_up {
+            *spare = Some(Leftover::of(&mut io, &mut talk));
+        }
         let _ = io.results.send(Err(err));
     }
     // The dictation is told that it is over before the connection is closed.
@@ -835,22 +946,19 @@ async fn dictate(
     shared: &Arc<Shared>,
     start: &str,
     io: &mut Io,
+    talk: &mut Talk,
     last: &mut Option<Socket>,
     marks: &Timeline,
 ) -> Result<()> {
-    let mut talk = Talk {
-        audio_open: true,
-        pending: None,
-        carry: Vec::new(),
-    };
     let mut idle = 0;
     loop {
-        let socket = last.insert(opened(shared, marks).await?);
+        let socket = last.insert(opened(shared, marks, &mut io.used_up).await?);
         marks.mark(Mark::Open);
         let doing = "starting the stream to";
         write(shared, socket, Message::text(start), doing).await?;
-        let (finals, mut sent) = (io.finals, Sent::default());
-        let ended = converse(shared, socket, io, &mut talk, &mut sent, marks).await?;
+        let finals = io.finals;
+        talk.sent = Sent::default();
+        let ended = converse(shared, socket, io, talk, marks).await?;
         let counted = match ended {
             Ended::Gone => return Ok(()),
             Ended::Done(_) if !talk.audio_open => return Ok(()),
@@ -866,6 +974,7 @@ async fn dictate(
                 "VinPUT Pro kept ending the dictation early".into(),
             ));
         }
+        let sent = std::mem::take(&mut talk.sent);
         talk.carry = counted.map_or_else(Vec::new, |counted| sent.past(counted));
     }
 }
@@ -890,8 +999,15 @@ fn hear(
     let (text, is_final) = match update {
         Update::Partial(text) => (text, false),
         Update::Final(text) => (text, true),
-        Update::Done(counted) => return Ok(Some(Ended::Done(counted))),
-        Update::Failed(failure) => {
+        Update::Done(counted) => {
+            if let Some(counted) = counted {
+                shared.standby.counted(counted / (BYTES_PER_MS * 1000));
+            }
+            return Ok(Some(Ended::Done(counted)));
+        }
+        Update::Failed(failure, counted) => {
+            io.used_up = is_used_up(&failure);
+            io.counted = counted;
             if matches!(
                 failure,
                 Failure::Refused {
@@ -970,11 +1086,10 @@ async fn converse(
     socket: &mut Socket,
     io: &mut Io,
     talk: &mut Talk,
-    sent: &mut Sent,
     marks: &Timeline,
 ) -> Result<Ended> {
     for piece in std::mem::take(&mut talk.carry) {
-        sent.note(&piece);
+        talk.sent.note(&piece);
         if let Err(failed) = write(shared, socket, Message::Binary(piece), "sending audio to").await
         {
             return last_words(shared, socket, io, marks, failed).await;
@@ -997,15 +1112,19 @@ async fn converse(
         tokio::select! {
             biased;
             heard = socket.next() => {
+                let finals = io.finals;
                 if let Some(ended) = hear(heard, io, shared, marks)? {
                     return Ok(ended);
+                }
+                if io.finals > finals {
+                    talk.sent.settled = talk.sent.bytes;
                 }
             }
             chunk = next_audio(talk, &mut io.audio), if talk.audio_open => {
                 talk.audio_open = chunk.is_some();
                 let (doing, message) = if let Some(bytes) = chunk {
                     let piece = Bytes::from(bytes);
-                    sent.note(&piece);
+                    talk.sent.note(&piece);
                     ("sending audio to", Message::Binary(piece))
                 } else {
                     marks.mark(Mark::Released);
@@ -1020,27 +1139,108 @@ async fn converse(
     }
 }
 
+/// How much of the audio the server left uncounted a local session is
+/// handed at a time: 100 ms, the most it is handed while listening.
+const HANDOVER_BYTES: usize = SAMPLE_RATE_HZ as usize / 10 * 2;
+
 /// One dictation, and when what happened in it.
 struct CloudSession {
     stream: live::Session,
     marks: Arc<Timeline>,
     /// Whether the timings go to the log when the dictation is over.
     logged: bool,
+    /// Where the task leaves the audio the server did not count, if the
+    /// month's allowance is used up.
+    spare: Arc<Mutex<Option<Leftover>>>,
+    standby: Arc<Standby>,
+    languages: Vec<String>,
+    /// The session of the model on this PC, once the dictation has carried
+    /// on with it.
+    local: Option<Box<dyn Transcriber + Send>>,
+    /// Transcripts that were not handed on yet when it did, and those the
+    /// audio handed over came to.
+    ready: VecDeque<Transcript>,
+}
+
+impl CloudSession {
+    /// The stream has ended with `failed`. If that is because the month's
+    /// allowance is used up and a model on this PC can carry on, a session
+    /// of that model takes over: it is handed what the server did not
+    /// count, and `pcm` if that was fed and not taken any more. Otherwise
+    /// the dictation ends with `failed`, as it always has.
+    fn carry_on(&mut self, failed: Error, pcm: &[i16]) -> Result<()> {
+        // Waits for the task, which may still be gathering what is left.
+        let left = self
+            .spare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(left) = left else {
+            return Err(failed);
+        };
+        let options = SessionOptions {
+            languages: &self.languages,
+        };
+        let Some(mut local) = self.standby.take_over(options, left.whole) else {
+            return Err(failed);
+        };
+        // What the server settled before it stopped comes first.
+        self.ready.extend(self.stream.rest());
+        let samples: Vec<i16> = left
+            .audio
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        for chunk in samples.chunks(HANDOVER_BYTES / 2) {
+            self.ready.extend(local.feed(chunk)?);
+        }
+        if self.stream.unsent {
+            self.ready.extend(local.feed(pcm)?);
+        }
+        self.local = Some(local);
+        Ok(())
+    }
 }
 
 impl Transcriber for CloudSession {
     fn feed(&mut self, pcm: &[i16]) -> Result<Option<Transcript>> {
-        self.stream.feed(pcm)
+        if let Some(local) = &mut self.local {
+            let transcript = local.feed(pcm)?;
+            self.ready.extend(transcript);
+            return Ok(self.ready.pop_front());
+        }
+        match self.stream.feed(pcm) {
+            Err(failed) => {
+                self.carry_on(failed, pcm)?;
+                Ok(self.ready.pop_front())
+            }
+            fed => fed,
+        }
     }
 
     fn finish(&mut self, emit: &mut Emit<'_>) -> Result<()> {
-        let marks = Arc::clone(&self.marks);
-        marks.mark(Mark::Released);
-        self.stream.finish(&mut |transcript| {
-            emit(transcript)?;
-            marks.mark(Mark::Typed);
-            Ok(())
-        })
+        if self.local.is_none() {
+            let marks = Arc::clone(&self.marks);
+            marks.mark(Mark::Released);
+            let finished = self.stream.finish(&mut |transcript| {
+                emit(transcript)?;
+                marks.mark(Mark::Typed);
+                Ok(())
+            });
+            match finished {
+                Err(failed) => self.carry_on(failed, &[])?,
+                Ok(()) => return Ok(()),
+            }
+        }
+        for transcript in std::mem::take(&mut self.ready) {
+            if transcript.is_final {
+                emit(transcript)?;
+            }
+        }
+        match &mut self.local {
+            Some(local) => local.finish(emit),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1079,7 +1279,7 @@ pub fn measure(
     /// The time between two dictations, in which the connection for the
     /// next one is made.
     const BETWEEN: Duration = Duration::from_millis(500);
-    let speech = CloudSpeech::connect(account)?;
+    let speech = CloudSpeech::connect(account, Arc::default())?;
     let mut measured = Vec::new();
     for round in 0..rounds {
         if round > 0 {
@@ -1147,14 +1347,24 @@ mod tests {
             read_message(
                 r#"{"type":"error","error":{"code":"quota_exceeded","message":"used up"}}"#
             ),
-            Update::Failed(Failure::refused(Code::QuotaExceeded, "used up"))
+            Update::Failed(Failure::refused(Code::QuotaExceeded, "used up"), None)
         );
+        // A server that says how much it counted before the hours ran out.
+        assert!(matches!(
+            read_message(
+                r#"{"type":"error","seconds":2.5,"error":{"code":"quota_exceeded"}}"#
+            ),
+            Update::Failed(failure, Some(80_000)) if is_used_up(&failure)
+        ));
         assert!(matches!(
             read_message(r#"{"type":"error","error":{"code":"new"}}"#),
-            Update::Failed(Failure::Refused {
-                code: Code::Internal,
-                ..
-            })
+            Update::Failed(
+                Failure::Refused {
+                    code: Code::Internal,
+                    ..
+                },
+                None
+            )
         ));
         assert_eq!(read_message(r#"{"type":"later"}"#), Update::Other);
         assert_eq!(read_message("not json"), Update::Other);
@@ -1276,7 +1486,7 @@ mod tests {
     fn speech_with(fake: &Fake, timing: Timing) -> Result<(CloudSpeech, Memory)> {
         let (account, memory) = fake.account();
         memory.sign_in(fake);
-        Ok((CloudSpeech::with(account, timing)?, memory))
+        Ok((CloudSpeech::with(account, timing, Arc::default())?, memory))
     }
 
     fn speech(fake: &Fake) -> Result<(CloudSpeech, Memory)> {
@@ -1292,9 +1502,13 @@ mod tests {
     fn dictate(speech: &CloudSpeech, chunks: i16) -> (String, Result<()>) {
         let languages = slovenian_and_english();
         let mut typed = String::new();
-        let mut session = speech.session(SessionOptions {
+        let started = speech.start_session(SessionOptions {
             languages: &languages,
         });
+        let mut session = match started {
+            Ok(session) => session,
+            Err(err) => return (typed, Err(err)),
+        };
         for chunk in 0..chunks {
             match session.feed(&[chunk; 160]) {
                 Ok(Some(transcript)) if transcript.is_final => typed.push_str(&transcript.text),
@@ -1405,6 +1619,205 @@ mod tests {
             matches!(&finished, Err(Error::Transcription(why)) if why.contains("allowance is used up")),
             "{finished:?}"
         );
+        Ok(())
+    }
+
+    /// A provider at the stand-in, signed in, with a made-up model on this
+    /// PC to carry on with, and what that model hears.
+    fn speech_with_model(
+        fake: &Fake,
+    ) -> Result<(
+        CloudSpeech,
+        Arc<Standby>,
+        Arc<super::super::standby::tests::Heard>,
+    )> {
+        let (standby, heard) = super::super::standby::tests::with_model();
+        let (account, memory) = fake.account();
+        memory.sign_in(fake);
+        let speech = CloudSpeech::with(account, quick(), Arc::clone(&standby))?;
+        Ok((speech, standby, heard))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dictation_refused_for_want_of_hours_starts_on_the_model_on_this_pc() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::Refuse(429, "quota_exceeded")]);
+        let (speech, standby, heard) = speech_with_model(&fake)?;
+        let (typed, finished) = dictate(&speech, 3);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        // Everything that was said reached the model, once and in order.
+        assert_eq!(heard.fed(), audio_of(0..3));
+        assert_eq!(standby.take_served(), Some(true));
+        assert!(standby.until() > 0);
+        // From then on the server is not asked for a stream at all.
+        let (typed, finished) = dictate(&speech, 2);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        assert_eq!(fake.asked("GET /v1/stream"), 1);
+        assert_eq!(heard.sessions(), 2);
+        assert_eq!(standby.take_served(), Some(true));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vinput_pro_is_dictated_with_again_once_the_hours_are_back() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::Refuse(429, "quota_exceeded")]);
+        let (speech, standby, heard) = speech_with_model(&fake)?;
+        let (typed, _) = dictate(&speech, 2);
+        assert_eq!(typed, "Locally.");
+        // The month is over.
+        standby.lapse();
+        let (typed, finished) = dictate(&speech, 2);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Hello world.");
+        assert_eq!(fake.asked("GET /v1/stream"), 2);
+        // Used up again, and then a tier with more hours: the account says
+        // so, and nothing else has to happen.
+        standby.heard(10, 10, u64::MAX);
+        assert_eq!(dictate(&speech, 2).0, "Locally.");
+        standby.heard(10, 20, u64::MAX);
+        assert_eq!(dictate(&speech, 2).0, "Hello world.");
+        assert_eq!(fake.asked("GET /v1/stream"), 3);
+        assert_eq!(heard.sessions(), 2);
+        Ok(())
+    }
+
+    /// Dictates one chunk, waits for the settled text the stand-in answers
+    /// it with, then goes on for chunks 1 to 4 and finishes. Returns what
+    /// was typed and how it ended.
+    fn dictate_past_the_first_answer(speech: &CloudSpeech) -> (String, Result<()>) {
+        let mut session = speech.session(SessionOptions { languages: &[] });
+        let mut typed = String::new();
+        let mut fed = session.feed(&[0i16; 160]);
+        let started = Instant::now();
+        while matches!(fed, Ok(None)) && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+            // Nothing is fed: only what has come back is looked at.
+            fed = session.feed(&[]);
+        }
+        let mut chunks = 1..5i16;
+        loop {
+            match fed {
+                Ok(Some(transcript)) if transcript.is_final => typed.push_str(&transcript.text),
+                Ok(_) => {}
+                Err(err) => return (typed, Err(err)),
+            }
+            let Some(chunk) = chunks.next() else {
+                break;
+            };
+            fed = session.feed(&[chunk; 160]);
+        }
+        let finished = session.finish(&mut |transcript| {
+            typed.push_str(&transcript.text);
+            Ok(())
+        });
+        (typed, finished)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hours_that_run_out_midway_are_followed_by_the_model_on_this_pc() -> Outcome {
+        // The server says how much it counted: five milliseconds, half of
+        // the first chunk. The rest of that chunk is recognized here.
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::SpentMidway(5)]);
+        let (speech, standby, heard) = speech_with_model(&fake)?;
+        let (typed, finished) = dictate_past_the_first_answer(&speech);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "So far. Locally.");
+        let mut expected = vec![0i16; 80];
+        expected.extend(audio_of(1..5));
+        assert_eq!(heard.fed(), expected);
+        assert_eq!(standby.take_served(), Some(true));
+        assert_eq!(fake.asked("GET /v1/stream"), 1);
+
+        // A server that does not say: what was sent after the last settled
+        // text arrived is what is recognized here.
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::FailMidway("quota_exceeded")]);
+        let (speech, standby, heard) = speech_with_model(&fake)?;
+        let (typed, finished) = dictate_past_the_first_answer(&speech);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "So far. Locally.");
+        assert_eq!(heard.fed(), audio_of(1..5));
+        assert_eq!(standby.take_served(), Some(true));
+        // The next one does not ask the server.
+        assert_eq!(dictate(&speech, 1).0, "Locally.");
+        assert_eq!(fake.asked("GET /v1/stream"), 1);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hours_that_run_out_as_the_key_is_let_go_are_followed_too() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::SpentMidway(0)]);
+        let (speech, _standby, heard) = speech_with_model(&fake)?;
+        // All of it is fed and finished before the answer is looked at.
+        let (typed, finished) = dictate(&speech, 3);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "So far. Locally.");
+        assert_eq!(heard.fed(), audio_of(0..3));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_long_stretch_the_server_did_not_count_is_handed_over_in_part_and_said_so() {
+        let mut talk = Talk {
+            audio_open: true,
+            pending: Some(vec![7; 4]),
+            carry: Vec::new(),
+            sent: pieces(&[KEEP_BYTES, 8, 8]),
+        };
+        let (session, client) = live::session("test stream", MAX_MESSAGE);
+        let mut session = session;
+        assert!(session.feed(&[9i16; 2]).is_ok());
+        let mut io = Io {
+            audio: client.audio,
+            results: client.results,
+            finals: 0,
+            used_up: true,
+            counted: Some(0),
+        };
+        let left = Leftover::of(&mut io, &mut talk);
+        assert!(!left.whole);
+        // The end of what was sent, what did not fit a message, and what
+        // was still waiting, in that order.
+        assert_eq!(left.audio.len(), 16 + 4 + 4);
+        assert_eq!(left.audio[16..], [7, 7, 7, 7, 9, 0, 9, 0]);
+        // Nothing more is taken from the dictation.
+        assert!(session.feed(&[1i16; 2]).is_err() && session.unsent);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn without_a_model_on_this_pc_used_up_hours_end_the_dictation_as_before() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| {
+            state.scripts = vec![
+                Script::Refuse(429, "quota_exceeded"),
+                Script::Refuse(429, "quota_exceeded"),
+            ];
+        });
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        let standby = Arc::new(Standby::new(|_, _| None));
+        let speech = CloudSpeech::with(account, quick(), Arc::clone(&standby))?;
+        for _ in 0..2 {
+            let (typed, finished) = dictate(&speech, 2);
+            assert_eq!(typed, "");
+            assert!(
+                matches!(&finished, Err(Error::Transcription(why)) if why.ends_with(WHERE)),
+                "{finished:?}"
+            );
+        }
+        assert_eq!(standby.take_served(), None);
+        assert_eq!(fake.asked("GET /v1/stream"), 2);
         Ok(())
     }
 
@@ -1670,14 +2083,14 @@ mod tests {
     fn nobody_signed_in_is_said_before_anything_is_connected() -> Outcome {
         let fake = Fake::start()?;
         let (account, memory) = fake.account();
-        let refused = CloudSpeech::connect(Arc::clone(&account));
+        let refused = CloudSpeech::connect(Arc::clone(&account), Arc::default());
         assert!(
             matches!(&refused, Err(Error::Transcription(why)) if why.contains("sign in under Settings, VinPUT Pro")),
             "{refused:?}"
         );
         // Signed out while the provider runs: the dictation says so.
         memory.sign_in(&fake);
-        let speech = CloudSpeech::connect(account)?;
+        let speech = CloudSpeech::connect(account, Arc::default())?;
         fake.change(|state| {
             state.refresh = "another".to_owned();
             state.previous = None;

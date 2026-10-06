@@ -257,7 +257,7 @@ impl Stage {
     #[must_use]
     pub fn first_words(&self) -> Vec<Command> {
         let mut words = vec![Command::Ready];
-        if self.showing == Showing::Settings(Page::Pro) {
+        if matches!(self.showing, Showing::Settings(page) if shows_prices(page)) {
             words.push(Command::ProShown);
         }
         words
@@ -557,7 +557,7 @@ impl Stage {
         self.scroll = 0.0;
         // The page of the account shows what the server says, the prices
         // included; it is asked when the page comes into sight.
-        if page == Page::Pro {
+        if shows_prices(page) && !shows_prices(open) {
             effects.push(Effect::Send(Command::ProShown));
         }
         effects.extend(self.rebuild());
@@ -672,6 +672,12 @@ impl Stage {
             }
         }
     }
+}
+
+/// Whether `page` shows what `VinPUT` Pro costs, which is the server's to
+/// say: it is asked when such a page comes into sight.
+fn shows_prices(page: Page) -> bool {
+    matches!(page, Page::Pro | Page::Welcome | Page::WelcomePro)
 }
 
 mod focus;

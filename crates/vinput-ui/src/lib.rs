@@ -178,7 +178,8 @@ impl Options {
     /// Reads what follows `vinput ui` on the command line:
     ///
     /// ```text
-    /// <settings|models|add-model|google|pro|advanced|about|update>
+    /// <settings|models|add-model|google|pro|advanced|about|update
+    ///  |welcome|welcome-pro|welcome-local>
     ///     [--mock <scene>] [--picture <file.png>]
     ///     [--theme light|dark|contrast] [--scale 1.5] [--size 940x660]
     ///     [--focus <n>] [--hover <n>] [--scroll <units>] [--text-scale 1.5]
@@ -202,11 +203,14 @@ impl Options {
             ["pro", rest @ ..] => (Surface::Settings(Page::Pro), rest),
             ["advanced", rest @ ..] => (Surface::Settings(Page::Advanced), rest),
             ["about", rest @ ..] => (Surface::Settings(Page::About), rest),
+            ["welcome", rest @ ..] => (Surface::Settings(Page::Welcome), rest),
+            ["welcome-pro", rest @ ..] => (Surface::Settings(Page::WelcomePro), rest),
+            ["welcome-local", rest @ ..] => (Surface::Settings(Page::WelcomeLocal), rest),
             ["update", rest @ ..] => (Surface::Update, rest),
             _ => {
                 return Err(wrong(
-                    "which window? settings, models, add-model, google, pro, advanced, about or \
-                     update"
+                    "which window? settings, models, add-model, google, pro, advanced, about, \
+                     welcome, welcome-pro, welcome-local or update"
                         .to_owned(),
                 ));
             }

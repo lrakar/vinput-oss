@@ -1238,7 +1238,7 @@ mod tests {
         let fake = Fake::start()?;
         let (account, memory) = fake.account();
         memory.sign_in(&fake);
-        let speech = CloudSpeech::connect(account)?;
+        let speech = CloudSpeech::connect(account, Arc::default())?;
         // The token is fetched when the provider starts; what is connected
         // after that is for the audio.
         assert!(fake.wait_for(|state| !state.asked.is_empty()));
@@ -1279,6 +1279,51 @@ mod tests {
         // none was made in vain.
         assert!(fake.wait_for(|state| state.connections == before + 3));
         assert_eq!(fake.read(|state| state.left_unused), 0);
+        Ok(())
+    }
+
+    /// A dictation that is called off while it is handed from `VinPUT` Pro
+    /// to the model on this PC, because the hours ran out, types nothing:
+    /// not what the server settled, not what the model makes of the rest.
+    #[cfg(windows)]
+    #[test]
+    fn a_dictation_called_off_while_the_model_on_this_pc_takes_over_types_nothing()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::cloud::fake::{Fake, Script};
+        use crate::stt::CloudSpeech;
+        use crate::stt::standby::tests::with_model;
+
+        for script in [
+            Script::Refuse(429, "quota_exceeded"),
+            Script::SpentMidway(0),
+        ] {
+            let fake = Fake::start()?;
+            fake.change(|state| state.scripts = vec![script]);
+            let (account, memory) = fake.account();
+            memory.sign_in(&fake);
+            let (standby, heard) = with_model();
+            let speech = CloudSpeech::connect(account, Arc::clone(&standby))?;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let called_off = Arc::clone(&cancelled);
+            let (microphone, _) = Counted::new(5, move |read| {
+                if read == 4 {
+                    called_off.store(true, Ordering::Release);
+                }
+            });
+            let mut sink = UnlessCancelled {
+                sink: Collecting::default(),
+                cancelled: &cancelled,
+            };
+            transcribe(&speech, &[], || Ok(microphone), || {}, &mut sink)?;
+            assert_eq!(sink.sink.text, "", "{script:?}");
+            // The model did take over, and what it said fell.
+            assert_eq!(heard.sessions(), 1, "{script:?}");
+            // Not called off, the same dictation is typed, by the model.
+            let (microphone, _) = Counted::new(3, |_| {});
+            let mut sink = Collecting::default();
+            transcribe(&speech, &[], || Ok(microphone), || {}, &mut sink)?;
+            assert_eq!(sink.text, "Locally.", "{script:?}");
+        }
         Ok(())
     }
 

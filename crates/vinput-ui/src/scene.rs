@@ -129,6 +129,7 @@ impl Showing {
     #[must_use]
     pub fn chrome<'a>(&self, view: &'a View) -> Chrome<'a> {
         match self {
+            Self::Settings(page) if page.is_welcome() => Chrome::Focused,
             Self::Settings(page) => Chrome::Settings {
                 page: *page,
                 status: &view.status,

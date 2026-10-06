@@ -67,11 +67,17 @@ impl Host {
             Said::OpenLink(address) => open_link(&address),
             Said::ProSignIn => self.pro_sign_in(),
             Said::ProCancel => self.pro_cancel(),
-            Said::ProSubscribe(plan) => self.pro_subscribe(plan),
+            Said::ProSubscribe(tier, plan) => self.pro_subscribe(tier, plan),
             Said::ProManage => self.pro_manage(),
             Said::ProRefresh => self.pro_ask(true),
             Said::ProShown => self.pro_shown(),
             Said::ProSignOut => self.pro_sign_out(),
+            Said::WelcomeDone => {
+                if self.settings.first_run {
+                    self.settings.first_run = false;
+                    self.persist();
+                }
+            }
             Said::Closed => self.close_window(which),
         }
     }
@@ -188,6 +194,13 @@ impl Host {
     /// Dictates with `model` from now on.
     pub(super) fn choose_model(&mut self, model: &models::Model, controller: &mut dyn Controller) {
         let mut chosen = self.settings.clone();
+        // The model on this PC that is left for another is the one
+        // VinPUT Pro carries on with when its hours are used up.
+        if chosen.provider == vinput_core::stt::ProviderKind::Local
+            && model.provider != vinput_core::stt::ProviderKind::Local
+        {
+            chosen.last_local_model.clone_from(&chosen.model);
+        }
         chosen.provider = model.provider;
         model.id.clone_into(&mut chosen.model);
         self.apply_choices(chosen, controller);

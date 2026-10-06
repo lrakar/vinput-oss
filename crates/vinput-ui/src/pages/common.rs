@@ -79,6 +79,26 @@ pub(super) fn pro_trouble(pro: &Pro) -> Option<ProTrouble> {
     }
 }
 
+/// Whether the month's hours are used up, or nine tenths of them are: when
+/// it is worth knowing what happens once they are.
+pub(super) fn hours_low(pro: &Pro) -> bool {
+    pro.who == ProWho::SignedIn
+        && pro.known
+        && pro.entitled
+        && pro.cap_seconds > 0
+        && pro.used_seconds.saturating_mul(10) >= pro.cap_seconds.saturating_mul(9)
+}
+
+/// The least a month of `VinPUT` Pro costs, whichever tier that is:
+/// `\u{20ac}2.50 a month`.
+pub(super) fn least_a_month(pro: &Pro) -> String {
+    let least = pro.offers.iter().map(|offer| offer.monthly).min();
+    format!(
+        "{} a month",
+        price(least.unwrap_or_default(), &pro.currency)
+    )
+}
+
 /// An amount in hundredths of `currency` as people write it: `\u{20ac}6`,
 /// `\u{20ac}5.90`, `CHF 6`.
 pub(super) fn price(hundredths: u32, currency: &str) -> String {
@@ -486,6 +506,12 @@ mod tests {
         assert_eq!(date(1_767_225_599), "31 December 2025");
         assert_eq!(day(1_793_491_200), "1 November");
         assert_eq!(price(600, "eur"), "\u{20ac}6");
+        // Cents are written only where there are any, and then both.
+        assert_eq!(price(500, "eur"), "\u{20ac}5");
+        assert_eq!(price(250, "eur"), "\u{20ac}2.50");
+        assert_eq!(price(205, "eur"), "\u{20ac}2.05");
+        assert_eq!(price(2400, "eur"), "\u{20ac}24");
+        assert_eq!(price(4900, "eur"), "\u{20ac}49");
         assert_eq!(price(5900, "eur"), "\u{20ac}59");
         assert_eq!(price(590, "eur"), "\u{20ac}5.90");
         assert_eq!(price(605, "usd"), "$6.05");

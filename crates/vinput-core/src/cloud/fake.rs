@@ -31,6 +31,9 @@ pub(crate) enum Script {
     SlowToOpen(Duration),
     /// Settles some text at the first audio, then ends with this error.
     FailMidway(&'static str),
+    /// Settles some text at the first audio, then says that the month's
+    /// allowance is used up, having counted this many milliseconds.
+    SpentMidway(u32),
     /// Drops the connection at the first audio, without a word.
     DropMidway,
     /// Settles some text at the first audio and says `done`, as a server
@@ -154,21 +157,27 @@ impl Fake {
             slow_answers: Duration::ZERO,
             plans: json!({
                 "plans": [
-                    {"plan": "monthly", "amount": 600, "currency": "eur", "interval": "month"},
-                    {"plan": "yearly", "amount": 5900, "currency": "eur", "interval": "year"},
+                    {"tier": "pro", "plan": "monthly", "amount": 500, "currency": "eur",
+                        "interval": "month", "cap_seconds": 90_000},
+                    {"tier": "pro", "plan": "yearly", "amount": 4900, "currency": "eur",
+                        "interval": "year", "cap_seconds": 90_000},
+                    {"tier": "plus", "plan": "monthly", "amount": 250, "currency": "eur",
+                        "interval": "month", "cap_seconds": 28_800},
+                    {"tier": "plus", "plan": "yearly", "amount": 2400, "currency": "eur",
+                        "interval": "year", "cap_seconds": 28_800},
                 ],
-                "cap_seconds": 144_000,
+                "cap_seconds": 90_000,
             }),
             access: "access-0".to_owned(),
             expires_in: 3600,
             granted: 0,
             subscribed: false,
             account: json!({
-                "email": "ana@example.com", "entitled": true,
-                "subscription": {"status": "active", "plan": "monthly",
+                "email": "ana@example.com", "entitled": true, "tier": "pro",
+                "subscription": {"status": "active", "plan": "monthly", "tier": "pro",
                     "current_period_start": 1_791_245_814_u64,
                     "current_period_end": 1_793_837_814_u64, "cancel_at_period_end": false},
-                "usage": {"month": "2026-10", "seconds": 5210, "cap_seconds": 144_000,
+                "usage": {"month": "2026-10", "seconds": 5210, "cap_seconds": 90_000,
                     "resets_at": 1_793_491_200_u64},
             }),
             portal_url: "https://billing.stripe.com/p/session/test".to_owned(),
@@ -518,10 +527,11 @@ fn route(head: &str, body: &[u8], state: &Shared, base: &str) -> Option<(u16, St
             400,
             reasoned(old, "already_subscribed", "already subscribed"),
         ),
-        "POST /v1/billing/checkout" => match body["plan"].as_str() {
-            Some(plan @ ("monthly" | "yearly")) => (
+        "POST /v1/billing/checkout" => match (body["tier"].as_str(), body["plan"].as_str()) {
+            (Some(tier @ ("pro" | "plus")), Some(plan @ ("monthly" | "yearly"))) => (
                 200,
-                json!({"url": format!("https://checkout.stripe.com/c/pay/{plan}")}).to_string(),
+                json!({"url": format!("https://checkout.stripe.com/c/pay/{tier}-{plan}")})
+                    .to_string(),
             ),
             _ => (400, error("bad_request", "no such plan")),
         },
@@ -574,6 +584,11 @@ fn to_audio(script: Script) -> Option<Vec<Value>> {
         Script::FailMidway(code) => vec![
             so_far,
             json!({"type": "error", "error": {"code": code, "message": "refused"}}),
+        ],
+        Script::SpentMidway(counted) => vec![
+            so_far,
+            json!({"type": "error", "seconds": f64::from(counted) / 1000.0,
+                "error": {"code": "quota_exceeded", "message": "used up"}}),
         ],
         Script::DoneEarly(counted) => vec![
             so_far,

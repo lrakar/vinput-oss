@@ -11,16 +11,19 @@ use std::sync::Mutex;
 use vinput_view::{
     Api, Change, Command, Download, Engine, Event, Finder, FoundFile, Google, GoogleCheck,
     GoogleProblem, GoogleService, GoogleStep, Microphone, Model, ModelState, Models, Notice,
-    NoticeKind, PRO_MODEL, Page, Pro, ProDoing, ProPlan, ProWho, Release, RunsOn, Settings, Setup,
-    Status, Update, UpdateCheck, View,
+    NoticeKind, PRO_MODEL, Page, Pro, ProDoing, ProPlan, ProTier, ProWho, Release, RunsOn,
+    Settings, Setup, Status, Update, UpdateCheck, View,
 };
 
 use crate::{Backend, Listener};
 
 /// The names [`scene`] knows.
-pub const SCENES: [&str; 54] = [
+pub const SCENES: [&str; 62] = [
     "settings",
     "first-run",
+    "welcome-signing-in",
+    "welcome-plans",
+    "welcome-downloading",
     "listening",
     "downloading",
     "add-model",
@@ -40,6 +43,11 @@ pub const SCENES: [&str; 54] = [
     "pro-complimentary",
     "pro-ending",
     "pro-over-allowance",
+    "pro-plus",
+    "pro-plus-used-up",
+    "pro-used-up-no-model",
+    "pro-low-no-model",
+    "pro-one-tier",
     "pro-payment-problem",
     "pro-payment-failed",
     "pro-expired",
@@ -209,15 +217,25 @@ fn settled() -> View {
         },
         api: Api {
             pipe: r"\\.\pipe\vinput".to_owned(),
-            clients: vec!["Stream Deck".to_owned()],
+            clients: vec!["Control Deck".to_owned()],
         },
         gemini_key_stored: true,
         default_memo_dir: r"C:\Users\you\Documents\Vinput memos".to_owned(),
         update: Update::default(),
-        pro: Pro::default(),
+        pro: Pro {
+            spare: Some(SPARE.to_owned()),
+            ..Pro::default()
+        },
         notice: None,
     }
 }
+
+/// The model on this PC that the scenes carry on with when the hours of
+/// `VinPUT` Pro are used up: the one that was in use before it.
+const SPARE: &str = "Whisper base";
+/// What a month of Pro, and of Plus, comes with in the scenes.
+const PRO_SECONDS: u64 = 25 * 3600;
+const PLUS_SECONDS: u64 = 8 * 3600;
 
 /// When the subscription of the scenes renews or ends: 5 November 2026.
 const PERIOD_END: u64 = 1_793_837_814;
@@ -243,10 +261,32 @@ fn signed_in(entitled: bool, status: &str, plan: ProPlan) -> Pro {
         plan: subscribed.then_some(plan),
         period_end: if subscribed { PERIOD_END } else { 0 },
         used_seconds: 45_000,
-        cap_seconds: 144_000,
+        cap_seconds: PRO_SECONDS,
         resets_at: RESETS_AT,
+        spare: Some(SPARE.to_owned()),
         ..Pro::default()
     }
+}
+
+/// A subscriber to Plus who has used this much of the month.
+fn on_plus(used_seconds: u64) -> Pro {
+    Pro {
+        tier: ProTier::Plus,
+        used_seconds,
+        cap_seconds: PLUS_SECONDS,
+        ..signed_in(true, "active", ProPlan::Monthly)
+    }
+}
+
+/// Takes every model off this PC, so that there is none to carry on with.
+fn without_models(view: &mut View) {
+    for model in &mut view.models.list {
+        if model.local {
+            model.state = ModelState::Missing;
+        }
+    }
+    view.models.disk_bytes = 0;
+    view.pro.spare = None;
 }
 
 /// A sign-in that waits to be finished in the browser.
@@ -300,10 +340,41 @@ fn pro_scene(view: &mut View, name: &str) -> bool {
             view.pro.ends_at = PERIOD_END;
             dictate_with_pro(view);
         }
+        // The hours of the month are used up, and the model that was in
+        // use before carries on.
         "pro-over-allowance" => {
             view.pro = subscribed();
             view.pro.used_seconds = view.pro.cap_seconds;
             dictate_with_pro(view);
+            view.status.runs_on = RunsOn::Spare(SPARE.to_owned());
+        }
+        "pro-plus" => {
+            view.pro = on_plus(11_400);
+            dictate_with_pro(view);
+        }
+        "pro-plus-used-up" => {
+            view.pro = on_plus(PLUS_SECONDS);
+            dictate_with_pro(view);
+            view.status.runs_on = RunsOn::Spare(SPARE.to_owned());
+        }
+        // Used up, with no model on this PC: nothing can be dictated.
+        "pro-used-up-no-model" => {
+            view.pro = subscribed();
+            view.pro.used_seconds = view.pro.cap_seconds;
+            dictate_with_pro(view);
+            without_models(view);
+        }
+        // Nearly used up, with no model on this PC to carry on with.
+        "pro-low-no-model" => {
+            view.pro = on_plus(PLUS_SECONDS - 1500);
+            dictate_with_pro(view);
+            without_models(view);
+        }
+        // A server from before there were tiers: one, with forty hours.
+        "pro-one-tier" => {
+            view.pro = signed_in(false, "", ProPlan::Monthly);
+            view.pro.offers.remove(0);
+            view.pro.offers[0].seconds = 144_000;
         }
         "pro-payment-problem" => {
             view.pro = signed_in(true, "past_due", ProPlan::Monthly);
@@ -574,6 +645,7 @@ pub fn scene(name: &str) -> Option<View> {
             view.models.list = catalog();
             view.models.disk_bytes = 0;
             view.models.engine = Engine::Missing;
+            view.pro.spare = None;
             view.api.clients = Vec::new();
         }
         "listening" => view.status.listening = true,
@@ -626,6 +698,30 @@ pub fn scene(name: &str) -> Option<View> {
                 },
                 release: Some(release),
             };
+        }
+        // Someone who has just installed, part of the way through the
+        // welcome: signing in, picking a plan, downloading a model.
+        "welcome-signing-in" | "welcome-plans" | "welcome-downloading" => {
+            view = scene("first-run")?;
+            match name {
+                "welcome-signing-in" => view.pro = signing_in(),
+                "welcome-plans" => view.pro = signed_in(false, "", ProPlan::Monthly),
+                _ => {
+                    // The host puts the first model someone downloads to
+                    // use at once, and fetches the engine it runs on.
+                    if let Some(model) = view.models.list.iter_mut().find(|model| model.local) {
+                        model.in_use = true;
+                        model.state = ModelState::Installing {
+                            done: model.bytes * 2 / 5,
+                            total: model.bytes,
+                        };
+                    }
+                    view.models.engine = Engine::Fetching {
+                        done: 9 * MEGABYTE,
+                        total: 31 * MEGABYTE,
+                    };
+                }
+            }
         }
         "many-models" => view.models.list.extend(crowd()),
         "long-names" => lengthen(&mut view),
@@ -699,7 +795,7 @@ fn lengthen(view: &mut View) {
     view.api = Api {
         pipe: r"\\.\pipe\vinput-a-rather-long-user-name-session-1".to_owned(),
         clients: vec![
-            "Stream Deck".to_owned(),
+            "Control Deck".to_owned(),
             "A Program With A Remarkably Long Window Title.exe".to_owned(),
             "another-helper-process-with-a-long-name.exe".to_owned(),
         ],
@@ -895,7 +991,7 @@ fn apply(view: &mut View, command: Command) -> bool {
         // by asking again: a sign-in is finished, a payment has arrived.
         Command::ProRefresh
         | Command::ProCancel
-        | Command::ProSubscribe(_)
+        | Command::ProSubscribe(..)
         | Command::ProSignOut => {
             pro(view, &command);
         }
@@ -907,6 +1003,7 @@ fn apply(view: &mut View, command: Command) -> bool {
         | Command::ShowUpdate
         | Command::ProManage
         | Command::ProShown
+        | Command::WelcomeDone
         | Command::OpenLink(_) => {}
     }
     false
@@ -921,7 +1018,7 @@ fn pro(view: &mut View, command: &Command) {
             view.pro = Pro::default();
         }
         (Command::ProCancel, _) => view.pro.doing = ProDoing::Nothing,
-        (Command::ProSubscribe(_), ProWho::SignedIn) => {
+        (Command::ProSubscribe(..), ProWho::SignedIn) => {
             view.pro.doing = ProDoing::AwaitingPayment;
         }
         (Command::ProRefresh, ProWho::SigningIn) => {

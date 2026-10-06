@@ -21,6 +21,9 @@ pub enum Chrome<'a> {
         /// What the app is doing, for the foot of the pane.
         status: &'a Status,
     },
+    /// The Settings window while it shows the welcome: no navigation pane,
+    /// only who we are and the page, as a column in the middle.
+    Focused,
     /// A small window with nothing but its content: the update window, a
     /// question, a message.
     Compact,
@@ -67,6 +70,7 @@ fn runs_on(place: &RunsOn) -> String {
         RunsOn::Online => "Runs online".to_owned(),
         RunsOn::Processor => "Runs on the processor".to_owned(),
         RunsOn::GraphicsCard(name) => format!("Runs on {name}"),
+        RunsOn::Spare(name) => format!("Hours used up, using {name}"),
     }
 }
 
@@ -75,11 +79,8 @@ fn runs_on(place: &RunsOn) -> String {
 fn pane(builder: &mut Builder<'_>, open: Page, status: &Status, height: f32) {
     let margin = metric::NAV_MARGIN;
     let head = Rect::new(0.0, 0.0, metric::PANE, metric::NAV_HEAD);
-    let logo = Size::new(metric::LOGO, metric::LOGO);
-    builder.item(Item::Logo(
-        Rect::new(metric::NAV_LOGO_X, head.y, 0.0, head.h).left_center(logo),
-    ));
-    let name_x = margin + metric::NAV_TEXT_X;
+    // The name alone, in line with the icons of the entries under it.
+    let name_x = margin + metric::NAV_ICON_X;
     let line = Size::new(
         metric::PANE - name_x - margin,
         builder.line_height(TextStyle::BodyStrong),
@@ -229,8 +230,9 @@ pub fn frame(content: Content, chrome: Chrome<'_>, size: Size, measure: &dyn Mea
             pane(&mut builder, page, status, size.h);
             metric::PANE
         }
-        Chrome::Compact => 0.0,
+        Chrome::Focused | Chrome::Compact => 0.0,
     };
+    let focused = matches!(chrome, Chrome::Focused);
     let (pad, top, style, gap, bottom) = if compact {
         (
             metric::DIALOG_PAD,
@@ -251,8 +253,15 @@ pub fn frame(content: Content, chrome: Chrome<'_>, size: Size, measure: &dyn Mea
     // A page is at most so wide, and sits in the middle of a window that is
     // wider, as the pages of Windows' own Settings do.
     let room = (size.w - sheet_x - 2.0 * pad).max(1.0);
-    let width = room.min(metric::PAGE_MAX);
+    let width = room.min(if focused {
+        metric::WELCOME_MAX
+    } else {
+        metric::PAGE_MAX
+    });
     let x = sheet_x + pad + ((room - width) / 2.0).floor();
+    // The welcome has no pane; a little more room over its title stands
+    // in for the head of one.
+    let top = if focused { metric::WELCOME_TOP } else { top };
     let title_h = title(
         &mut builder,
         content.title,
@@ -306,7 +315,8 @@ pub fn frame(content: Content, chrome: Chrome<'_>, size: Size, measure: &dyn Mea
         fixed: laid.fixed,
         body: laid.body,
         controls: laid.controls,
-        pane: (!compact).then(|| Rect::new(0.0, 0.0, metric::PANE, size.h)),
+        pane: matches!(chrome, Chrome::Settings { .. })
+            .then(|| Rect::new(0.0, 0.0, metric::PANE, size.h)),
         sheet: Rect::new(sheet_x, 0.0, size.w - sheet_x, size.h),
         strip: (compact && footer_h > 0.0).then_some(strip),
         viewport,

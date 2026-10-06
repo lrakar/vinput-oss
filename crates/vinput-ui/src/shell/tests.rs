@@ -236,3 +236,28 @@ fn larger_text_gets_taller_controls_and_pane_entries() {
     assert!((large.0 - (metric::NAV_ITEM + line)).abs() < 0.01);
     assert!((large.1 - (metric::CONTROL + line)).abs() < 0.01);
 }
+
+#[test]
+fn the_welcome_has_the_window_to_itself() {
+    let usual = frame(page(2), Chrome::Focused, Size::new(940.0, 660.0), &Ruler);
+    let wide = frame(page(2), Chrome::Focused, Size::new(2000.0, 900.0), &Ruler);
+    for laid in [&usual, &wide] {
+        // No navigation pane and nothing to turn to another page with.
+        assert!(laid.pane.is_none() && laid.strip.is_none());
+        let mut controls = laid.controls.iter();
+        assert!(!controls.any(|control| matches!(control.kind, Kind::Nav { .. })));
+        // And no logo: the title is all that stands over the page.
+        assert!(!laid.fixed.iter().any(|item| matches!(item, Item::Logo(_))));
+        // The page is a column in the middle, never wider than reads well.
+        let mut cards = 0;
+        for item in &laid.body {
+            if let Item::Card(card) = item {
+                cards += 1;
+                assert!(card.w <= metric::WELCOME_MAX);
+                let middle = card.x + card.w / 2.0;
+                assert!((middle - laid.size.w / 2.0).abs() <= 1.0);
+            }
+        }
+        assert_eq!(cards, 1);
+    }
+}

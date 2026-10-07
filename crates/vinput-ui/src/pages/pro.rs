@@ -164,11 +164,19 @@ fn count(number: u32) -> String {
     }
 }
 
-/// While a sign-in waits to be finished in the browser: the code its page
-/// asks for, large and on a line of its own, since it is what the page is
-/// there for.
+/// While a sign-in waits to be finished in the browser. Usually there is
+/// nothing to do here: the browser brings the sign-in back by itself. A
+/// sign-in that has a code shows it large and on a line of its own, since
+/// it is then what the page is there for.
 fn signing_in(pro: &Pro) -> Vec<Node> {
     let cancel = button("Cancel", Action::send(Command::ProCancel));
+    if pro.code.is_empty() && pro.in_browser {
+        let waiting = setting(Icon::OpenExternal, "Finish in your browser")
+            .detail("Sign in with Google there. VinPUT signs in by itself when you are done.")
+            .control(cancel.into())
+            .below(Node::Progress(None));
+        return vec![card([waiting.into()])];
+    }
     if pro.code.is_empty() {
         let opening = setting(Icon::OpenExternal, "Opening your browser")
             .control(cancel.into())
@@ -680,9 +688,27 @@ mod tests {
         assert!(Seen::of(&super::content(&view).body).says("It works for 3 minutes."));
 
         view.pro.code = String::new();
+        view.pro.in_browser = false;
         let seen = Seen::of(&super::content(&view).body);
         assert!(seen.says("Opening your browser"));
         assert_eq!(seen.commands(), [Command::ProCancel]);
+    }
+
+    #[test]
+    fn a_sign_in_the_browser_brings_back_asks_for_nothing_and_can_be_called_off() {
+        let mut view = scene("pro-signing-in");
+        view.pro.code = String::new();
+        view.pro.in_browser = true;
+        let seen = Seen::of(&content(&view).body);
+        assert!(seen.says("Finish in your browser"));
+        assert!(
+            seen.says("Sign in with Google there. VinPUT signs in by itself when you are done.")
+        );
+        // No code, nothing to copy, nothing said about one.
+        assert!(!seen.texts.iter().any(|text| text.contains("code")));
+        assert_eq!(seen.labels(), ["Cancel"]);
+        assert_eq!(seen.commands(), [Command::ProCancel]);
+        assert_eq!(seen.progress, [None]);
     }
 
     #[test]

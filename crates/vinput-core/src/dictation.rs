@@ -93,6 +93,7 @@ impl Drop for Closing {
 /// What a session needs: what the settings said when it started, and the
 /// microphone, which every session shares.
 #[derive(Clone)]
+#[expect(clippy::struct_excessive_bools, reason = "independent on/off switches")]
 struct Options {
     languages: Vec<String>,
     /// Whether a sound says that listening has started, and that it has
@@ -111,6 +112,8 @@ struct Options {
     held: Arc<AtomicBool>,
     memo_dir: String,
     memo_to_clipboard: bool,
+    /// Whether words are typed while the recognizer may still change them.
+    live: bool,
 }
 
 impl Options {
@@ -124,6 +127,7 @@ impl Options {
             microphone,
             memo_dir: settings.memo_dir.clone(),
             memo_to_clipboard: settings.memo_to_clipboard,
+            live: settings.live_typing,
         }
     }
 }
@@ -338,6 +342,21 @@ impl<S: TextSink> TextSink for Counting<S> {
         self.typed += text.trim().len();
         self.sink.type_text(text)
     }
+
+    fn rewrites(&self) -> bool {
+        self.sink.rewrites()
+    }
+
+    fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+        // Near enough: all that is asked of the count is whether anything
+        // is left of what was typed.
+        self.typed = self.typed.saturating_sub(erase) + text.trim().len();
+        self.sink.rewrite(erase, text)
+    }
+
+    fn disturbed(&mut self) -> bool {
+        self.sink.disturbed()
+    }
 }
 
 /// Passes text on to the real sink until the session is called off, and
@@ -354,6 +373,23 @@ impl<S: TextSink> TextSink for UnlessCancelled<'_, S> {
             return Ok(());
         }
         self.sink.type_text(text)
+    }
+
+    fn rewrites(&self) -> bool {
+        self.sink.rewrites()
+    }
+
+    /// A guess that is on the screen when the session is called off stays
+    /// there: nothing more is typed, and Backspace is typing too.
+    fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.sink.rewrite(erase, text)
+    }
+
+    fn disturbed(&mut self) -> bool {
+        self.sink.disturbed()
     }
 }
 
@@ -402,9 +438,11 @@ fn run_session(
         sink: SendInputSink::new(),
         cancelled,
     };
+    // Only VinPUT Pro makes guesses that are meant to be typed.
+    let live = options.live && speech.kind() == ProviderKind::Cloud;
     dictate(
         speech,
-        &options.languages,
+        (&options.languages, live),
         microphone,
         (target, id),
         &alone,
@@ -424,7 +462,7 @@ fn run_session(
 /// text is handed it as always.
 fn dictate<A: AudioSource>(
     speech: &dyn SpeechProvider,
-    languages: &[String],
+    (languages, live): (&[String], bool),
     listen: impl FnOnce() -> Result<A>,
     (target, id): (Target, Option<String>),
     alone: &AtomicBool,
@@ -432,14 +470,14 @@ fn dictate<A: AudioSource>(
 ) -> Result<Option<Outcome>> {
     let mut sink = Counting { sink, typed: 0 };
     if !matches!(target, Target::Capture | Target::Search) {
-        transcribe(speech, languages, listen, &mut sink)?;
+        transcribe(speech, languages, listen, &mut sink, live)?;
         if target == Target::FocusedEnter && sink.typed > 0 && !alone.load(Ordering::Acquire) {
             sink.type_text("\n")?;
         }
         return Ok(None);
     }
     let mut kept = Collecting::default();
-    transcribe(speech, languages, listen, &mut kept)?;
+    transcribe(speech, languages, listen, &mut kept, false)?;
     let text = kept.text.trim().to_owned();
     if target == Target::Capture {
         // Sent even when empty, so whoever asked knows the session is over.
@@ -506,18 +544,26 @@ fn while_spoken_to<'a>(
 /// A provider that says no at once (no key, no model) has usually said so
 /// by the time the microphone is open; the session then ends with that error
 /// without listening to anything.
+///
+/// With `live`, the recognizer's guesses are typed as well as what it
+/// settles, where the sink can take text back.
 fn transcribe<A: AudioSource>(
     speech: &dyn SpeechProvider,
     languages: &[String],
     listen: impl FnOnce() -> Result<A>,
     sink: &mut impl TextSink,
+    live: bool,
 ) -> Result<()> {
     thread::scope(|scope| {
         let mut session = Deferred::start(scope, speech, languages);
         // Dropped on every way out of here, which lets go of the microphone.
         let mut microphone = listen()?;
         session.session(false)?;
-        pipeline::run_session(&mut microphone, &mut session, sink)
+        if live {
+            pipeline::run_live_session(&mut microphone, &mut session, sink)
+        } else {
+            pipeline::run_session(&mut microphone, &mut session, sink)
+        }
     })
 }
 
@@ -636,6 +682,13 @@ impl Transcriber for Deferred {
             Some(session) => session.finish(emit),
             None => Ok(()),
         }
+    }
+
+    /// A guess follows the text settled before it, so none is passed on
+    /// while settled text is still waiting to be.
+    fn guess(&mut self) -> Option<String> {
+        let guess = self.session.as_mut()?.guess();
+        guess.filter(|_| self.ready.is_empty())
     }
 }
 
@@ -889,7 +942,7 @@ mod tests {
         };
         let mut sink = Typed::default();
 
-        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink, false);
 
         assert!(result.is_ok(), "{result:?}");
         // The microphone was heard before there was anyone to recognize it,
@@ -911,7 +964,7 @@ mod tests {
             gate.open();
         });
 
-        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink, false);
 
         assert!(result.is_ok(), "{result:?}");
         assert!(loaded.join().is_ok());
@@ -932,7 +985,7 @@ mod tests {
         };
         let mut sink = Typed::default();
 
-        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink, false);
 
         assert!(matches!(result, Err(Error::Transcription(_))), "{result:?}");
         assert!(released.load(Ordering::SeqCst));
@@ -949,7 +1002,13 @@ mod tests {
             gate.open();
         });
 
-        let result = transcribe(&provider, &[], || Ok(microphone), &mut Typed::default());
+        let result = transcribe(
+            &provider,
+            &[],
+            || Ok(microphone),
+            &mut Typed::default(),
+            false,
+        );
 
         assert!(matches!(result, Err(Error::Transcription(_))), "{result:?}");
         assert!(failed.join().is_ok());
@@ -969,7 +1028,7 @@ mod tests {
         };
         let mut sink = Typed::default();
 
-        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink);
+        let result = transcribe(&provider, &[], || Ok(microphone), &mut sink, false);
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(provider.heard.fed(), everything(50));
@@ -989,6 +1048,7 @@ mod tests {
             &[],
             || Err::<Counted, _>(Error::Audio("no microphone".into())),
             &mut Typed::default(),
+            false,
         );
         assert!(matches!(result, Err(Error::Audio(_))), "{result:?}");
     }
@@ -1009,6 +1069,7 @@ mod tests {
                 Ok(microphone)
             },
             &mut Typed::default(),
+            false,
         );
 
         assert!(matches!(result, Err(Error::Transcription(_))), "{result:?}");
@@ -1326,7 +1387,7 @@ mod tests {
             cancelled: &cancelled,
         };
         let started = std::time::Instant::now();
-        transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
+        transcribe(&speech, &[], || Ok(microphone), &mut sink, false)?;
         assert!(started.elapsed() < Duration::from_secs(5));
         // The stand-in settled "Hello world." when the audio ended.
         assert_eq!(sink.sink.text, "");
@@ -1341,13 +1402,115 @@ mod tests {
         assert_eq!(fake.asked("GET /v1/stream"), 1);
         let (microphone, _) = Counted::new(3, |_| {});
         let mut sink = Collecting::default();
-        transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
+        transcribe(&speech, &[], || Ok(microphone), &mut sink, false)?;
         assert_eq!(sink.text, "Hello world.");
         assert!(fake.wait(|seen| seen.len() == 2 && seen[1].events.contains(&"closed")));
         // That one took the connection over and left another in its turn;
         // none was made in vain.
         assert!(fake.wait_for(|state| state.connections == before + 3));
         assert_eq!(fake.read(|state| state.left_unused), 0);
+        Ok(())
+    }
+
+    /// A text field that can be typed into and taken back from, and every
+    /// text that ever stood in it.
+    #[derive(Default)]
+    struct Field {
+        text: String,
+        stood: Vec<String>,
+    }
+
+    impl TextSink for Field {
+        fn type_text(&mut self, text: &str) -> Result<()> {
+            self.rewrite(0, text)
+        }
+
+        fn rewrites(&self) -> bool {
+            true
+        }
+
+        fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+            for _ in 0..erase {
+                self.text.pop();
+            }
+            self.text.push_str(text);
+            self.stood.push(self.text.clone());
+            Ok(())
+        }
+    }
+
+    /// A [`Field`] that is typed into by a dictation and looked at after.
+    struct Lent<'a>(&'a mut Field);
+
+    impl TextSink for Lent<'_> {
+        fn type_text(&mut self, text: &str) -> Result<()> {
+            self.0.type_text(text)
+        }
+
+        fn rewrites(&self) -> bool {
+            self.0.rewrites()
+        }
+
+        fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+            self.0.rewrite(erase, text)
+        }
+    }
+
+    /// With `VinPUT` Pro the guess of the server is on the screen while the
+    /// user still speaks, and what it settles when the key is let go takes
+    /// its place; the Enter of a dictation that ends with one follows that.
+    /// A program that asked for the text gets the settled text alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_dictation_with_vinput_pro_types_the_guess_and_then_what_is_settled()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::cloud::fake::Fake;
+        use crate::stt::CloudSpeech;
+
+        let fake = Fake::start()?;
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        let speech = CloudSpeech::connect(account, Arc::default())?;
+        // A microphone that is spoken into for a third of a second.
+        let spoken = || Counted::new(30, |_| thread::sleep(Duration::from_millis(10))).0;
+
+        let mut field = Field::default();
+        transcribe(&speech, &[], || Ok(spoken()), &mut field, true)?;
+        // The stand-in guesses "hello wor" and settles "Hello world.".
+        assert_eq!(field.text, "Hello world.");
+        assert!(
+            field.stood.iter().any(|text| text == "h"),
+            "{:?}",
+            field.stood
+        );
+        assert!(field.stood.iter().any(|text| text == "hello wor"));
+
+        // Without the setting, the same dictation types what is settled.
+        let mut field = Field::default();
+        transcribe(&speech, &[], || Ok(spoken()), &mut field, false)?;
+        assert_eq!(field.stood, ["Hello world."]);
+
+        let alone = AtomicBool::new(false);
+        let mut field = Field::default();
+        let left = dictate(
+            &speech,
+            (&[], true),
+            || Ok(spoken()),
+            (Target::FocusedEnter, None),
+            &alone,
+            Lent(&mut field),
+        )?;
+        assert_eq!((left, field.text.as_str()), (None, "Hello world.\n"));
+        let captured = dictate(
+            &speech,
+            (&[], true),
+            || Ok(spoken()),
+            (Target::Capture, None),
+            &alone,
+            Field::default(),
+        )?;
+        let text = "Hello world.".to_owned();
+        assert_eq!(captured, Some(Outcome::Captured { text, id: None }));
         Ok(())
     }
 
@@ -1383,14 +1546,14 @@ mod tests {
                 sink: Collecting::default(),
                 cancelled: &cancelled,
             };
-            transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
+            transcribe(&speech, &[], || Ok(microphone), &mut sink, false)?;
             assert_eq!(sink.sink.text, "", "{script:?}");
             // The model did take over, and what it said fell.
             assert_eq!(heard.sessions(), 1, "{script:?}");
             // Not called off, the same dictation is typed, by the model.
             let (microphone, _) = Counted::new(3, |_| {});
             let mut sink = Collecting::default();
-            transcribe(&speech, &[], || Ok(microphone), &mut sink)?;
+            transcribe(&speech, &[], || Ok(microphone), &mut sink, false)?;
             assert_eq!(sink.text, "Locally.", "{script:?}");
         }
         Ok(())
@@ -1446,7 +1609,14 @@ mod tests {
         let listen = || Ok(while_spoken_to(Still(stop.clone()), &options, stop, &alone));
         let seen = Seen::default();
         let id = Some("my-42".to_owned());
-        let left = dictate(&provider, &[], listen, (target, id), &alone, seen.clone());
+        let left = dictate(
+            &provider,
+            (&[], false),
+            listen,
+            (target, id),
+            &alone,
+            seen.clone(),
+        );
         assert!(left.is_ok(), "{left:?}");
         assert_eq!(alone.load(Ordering::Acquire), forgotten);
         let typed = seen

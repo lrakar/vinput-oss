@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 
 use vinput_view::{
-    Api, Change, Command, Download, Engine, Event, Finder, FoundFile, Google, GoogleCheck,
+    Api, Change, Command, Download, Engine, Event, Finder, Fit, FoundFile, Google, GoogleCheck,
     GoogleProblem, GoogleService, GoogleStep, Microphone, Model, ModelState, Models, Notice,
     NoticeKind, PRO_MODEL, PRO_SOON, Page, Pro, ProDoing, ProPlan, ProTier, ProWho, Release,
     RunsOn, Settings, Setup, Status, Update, UpdateCheck, View,
@@ -18,7 +18,7 @@ use vinput_view::{
 use crate::{Backend, Listener};
 
 /// The names [`scene`] knows.
-pub const SCENES: [&str; 69] = [
+pub const SCENES: [&str; 71] = [
     "settings",
     "first-run",
     "wrong-language",
@@ -36,6 +36,8 @@ pub const SCENES: [&str; 69] = [
     "update-downloading",
     "many-models",
     "long-names",
+    "modest-pc",
+    "weak-pc",
     "one-language",
     "pro-signed-out",
     "pro-intro-signed-out",
@@ -105,6 +107,8 @@ fn model(id: &str, name: &str, summary: &str, detail: &str, megabytes: u64) -> M
         in_use: false,
         lacks: Vec::new(),
         knows_none: false,
+        // The PC of the scenes has a large graphics card.
+        fit: (megabytes > 0).then_some(Fit::Well),
         state: if megabytes > 0 {
             ModelState::Missing
         } else {
@@ -196,7 +200,7 @@ fn settled() -> View {
         status: Status {
             listening: false,
             model: Some("Whisper base".to_owned()),
-            runs_on: RunsOn::GraphicsCard("NVIDIA GeForce RTX 3090".to_owned()),
+            runs_on: RunsOn::GraphicsCard("NVIDIA GeForce RTX 4070".to_owned()),
         },
         settings: Settings {
             hotkey: "F1".to_owned(),
@@ -208,6 +212,7 @@ fn settled() -> View {
             autostart: true,
             ready_sound: true,
             stop_sound: true,
+            live_typing: true,
             stop_after_minutes: 30,
             check_updates: true,
             graphics_card: true,
@@ -229,7 +234,7 @@ fn settled() -> View {
         models: Models {
             list,
             disk_bytes: 1_990 * MEGABYTE,
-            graphics_card: Some("NVIDIA GeForce RTX 3090".to_owned()),
+            graphics_card: Some("NVIDIA GeForce RTX 4070".to_owned()),
             engine: Engine::Ready,
         },
         finder: Finder::default(),
@@ -328,6 +333,7 @@ fn signing_in() -> Pro {
         who: ProWho::SigningIn,
         code: CODE.to_owned(),
         code_minutes: 10,
+        in_browser: true,
         ..Pro::default()
     }
 }
@@ -730,6 +736,32 @@ fn language_scene(view: &mut View, name: &str) -> bool {
     true
 }
 
+/// The scenes of a laptop without a graphics card that local models can
+/// use: one that runs the light models well, and one that runs none well.
+fn pc_scene(view: &mut View, name: &str) -> bool {
+    let weak = match name {
+        "modest-pc" => false,
+        "weak-pc" => true,
+        _ => return false,
+    };
+    let Some(new) = staged("first-run") else {
+        return false;
+    };
+    *view = new;
+    view.models.graphics_card = None;
+    view.settings.graphics_card = false;
+    for model in view.models.list.iter_mut().filter(|model| model.local) {
+        let large = model.name.contains("turbo");
+        let light = model.name.contains("0.6B") || model.name.contains("base");
+        model.fit = Some(match (large, light && !weak) {
+            (true, _) => Fit::Heavy,
+            (false, true) => Fit::Well,
+            (false, false) => Fit::Slow,
+        });
+    }
+    true
+}
+
 fn staged(name: &str) -> Option<View> {
     let mut view = settled();
     match name {
@@ -826,6 +858,7 @@ fn staged(name: &str) -> Option<View> {
         }
         "many-models" => view.models.list.extend(crowd()),
         "long-names" => lengthen(&mut view),
+        name if pc_scene(&mut view, name) => {}
         name if language_scene(&mut view, name) => {}
         name if offer_scene(&mut view, name) => {}
         name if pro_scene(&mut view, name) => {}
@@ -998,6 +1031,7 @@ fn set(settings: &mut Settings, change: Change) {
         Change::Autostart(on) => settings.autostart = on,
         Change::ReadySound(on) => settings.ready_sound = on,
         Change::StopSound(on) => settings.stop_sound = on,
+        Change::LiveTyping(on) => settings.live_typing = on,
         Change::StopAfterSilence(minutes) => settings.stop_after_minutes = minutes,
         Change::CheckUpdates(on) => settings.check_updates = on,
         Change::GraphicsCard(on) => settings.graphics_card = on,
@@ -1091,7 +1125,14 @@ fn apply(view: &mut View, command: Command) -> bool {
         }
         Command::CancelUpdate => view.update.download = Download::Idle,
         Command::DismissNotice => view.notice = None,
-        Command::ProSignIn => view.pro = signing_in(),
+        // As it usually goes: the browser brings the sign-in back, and
+        // there is no code to type.
+        Command::ProSignIn => {
+            view.pro = Pro {
+                code: String::new(),
+                ..signing_in()
+            };
+        }
         // What the real backend learns from the server, the fake is told
         // by asking again: a sign-in is finished, a payment has arrived.
         Command::ProRefresh

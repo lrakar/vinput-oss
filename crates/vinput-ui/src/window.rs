@@ -528,6 +528,7 @@ impl Host {
                 Event::State(_) if Some(index) != last_view => continue,
                 Event::State(view) => self.stage.set_view(*view),
                 Event::Show(page) => self.stage.show(page),
+                Event::Front => self.stage.front(),
                 Event::Close => {
                     self.finish(Closed::Dismissed);
                     Vec::new()

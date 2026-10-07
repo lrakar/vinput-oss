@@ -39,6 +39,7 @@ fn play() {
             // A picture is answered with what it said the version is.
             Event::State(view) => host.send(Command::FindModel(view.version)),
             Event::Show(page) => host.send(Command::OpenLink(format!("{page:?}"))),
+            Event::Front => host.send(Command::OpenLink("Front".to_owned())),
             Event::Close => {
                 host.send(Command::Closed);
                 break;

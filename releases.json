@@ -1,5 +1,33 @@
 [
   {
+    "version": "0.4.8",
+    "published": "2026-10-07",
+    "notes": [
+      "With VinPUT Pro, words are typed as you say them, about half a second after each",
+      "When the last words change as you go on, they are corrected in place",
+      "Text flows in steadily instead of arriving in bursts",
+      "Settings, General, Type words as you say them switches this off"
+    ]
+  },
+  {
+    "version": "0.4.7",
+    "published": "2026-10-07",
+    "notes": [
+      "Signing in to VinPUT Pro needs no code: sign in with Google and the browser brings it back",
+      "Settings comes to the front by itself once you are signed in",
+      "The sign-in pages in the browser look like the VinPUT website"
+    ]
+  },
+  {
+    "version": "0.4.6",
+    "published": "2026-10-07",
+    "notes": [
+      "Models says how each model on this PC would run on it: well, slowly, or too heavy",
+      "It goes by your graphics card, memory and processor, and follows the graphics card switch",
+      "Where no model on this PC runs well, Models says that VinPUT Pro runs online"
+    ]
+  },
+  {
     "version": "0.4.5",
     "published": "2026-10-07",
     "notes": [

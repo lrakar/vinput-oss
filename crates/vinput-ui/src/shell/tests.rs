@@ -8,7 +8,7 @@ fn settled() -> Status {
     Status {
         listening: false,
         model: Some("Whisper base".to_owned()),
-        runs_on: RunsOn::GraphicsCard("NVIDIA GeForce RTX 3090".to_owned()),
+        runs_on: RunsOn::GraphicsCard("NVIDIA GeForce RTX 4070".to_owned()),
     }
 }
 
@@ -55,7 +55,7 @@ fn the_settings_window_has_a_pane_a_title_and_a_body_that_scrolls() {
             .iter()
             .any(|item| matches!(item, Item::Text { text, .. } if text.contains(part)))
     };
-    assert!(says("Ready") && says("Whisper base") && says("RTX 3090"));
+    assert!(says("Ready") && says("Whisper base") && says("RTX 4070"));
     assert!(!frame.moving);
 }
 

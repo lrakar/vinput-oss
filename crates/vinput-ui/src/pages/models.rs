@@ -9,13 +9,17 @@
 //! its row, before it is downloaded or put to use; if it is the one in use
 //! and knows none of them, a bar says what to do about it.
 //!
+//! A model that runs on this PC also says how it would run on it, in the
+//! same quiet line: well, slowly, or not in earnest. Where none of them
+//! runs well, one more quiet line says what does.
+//!
 //! `VinPUT` Pro is not a row among them. It is the app's own service, so it
 //! has a card of its own under the title, which stays there while the lists
 //! scroll under it.
 
 use vinput_view::{
-    Change, Command, Engine, GoogleService, Model, ModelState, Models, PRO_MODEL, Page, ProDoing,
-    ProWho, Setup, View,
+    Change, Command, Engine, Fit, GoogleService, Model, ModelState, Models, PRO_MODEL, Page,
+    ProDoing, ProWho, Setup, View,
 };
 
 use super::common::{
@@ -24,7 +28,7 @@ use super::common::{
 use super::pro::{usage, works_again};
 use crate::node::{
     Action, ButtonKind, Content, Icon, Node, Severity, Tone, accent_button, badge, button, card,
-    header, human_size, icon_button, info_bar, row, setting, toggle,
+    header, human_size, icon_button, info_bar, note, row, setting, toggle,
 };
 
 /// What the page shows for `view`.
@@ -128,6 +132,8 @@ fn on_this_pc(models: &Models, graphics_card_on: bool) -> Vec<Node> {
             .map(model_row),
     );
     rows.push(add_row());
+    let mut shown = vec![header("On this PC"), card(rows)];
+    shown.extend(none_runs_well(&models.list));
     let mut facts = Vec::new();
     facts.extend(
         models
@@ -136,7 +142,30 @@ fn on_this_pc(models: &Models, graphics_card_on: bool) -> Vec<Node> {
             .map(|name| graphics_card_row(name, graphics_card_on)),
     );
     facts.push(disk_row(models.disk_bytes));
-    vec![header("On this PC"), card(rows), card(facts)]
+    shown.push(card(facts));
+    shown
+}
+
+/// What to dictate with on a PC that runs none of the models well: said
+/// once, quietly, and not to someone who dictates with it already.
+fn none_runs_well(list: &[Model]) -> Option<Node> {
+    let pro = list.iter().find(|model| model.id == PRO_MODEL)?;
+    let mut fits = list.iter().filter_map(|model| model.fit).peekable();
+    if pro.in_use || fits.peek().is_none() || fits.any(|fit| fit == Fit::Well) {
+        return None;
+    }
+    Some(note(
+        "None of these runs well on this PC. VinPUT Pro runs online, so it is quick on any PC.",
+    ))
+}
+
+/// How a model would run on this PC, as its row says it.
+fn fit_words(fit: Fit) -> &'static str {
+    match fit {
+        Fit::Well => "Runs well on this PC",
+        Fit::Slow => "May be slow on this PC",
+        Fit::Heavy => "Too heavy for this PC",
+    }
 }
 
 /// The download of the engine that local models need, while it is under way.
@@ -305,23 +334,26 @@ fn detail_line(model: &Model) -> (String, Tone) {
         ModelState::Installed => format!("Downloaded{DOT}{}", facts(model)),
         ModelState::Online | ModelState::Missing => facts(model),
     };
-    if model.lacks.is_empty() {
-        return (line, Tone::Secondary);
-    }
-    let tone = if model.knows_none {
+    // Only what dictation depends on right now is said in a color.
+    let too_heavy = model.in_use && model.fit == Some(Fit::Heavy);
+    let tone = if model.knows_none || too_heavy {
         Tone::Caution
     } else {
         Tone::Secondary
     };
+    if model.lacks.is_empty() {
+        return (line, tone);
+    }
     let lacks = listed(&model.lacks);
     (format!("Does not know {lacks}{DOT}{line}"), tone)
 }
 
-/// What a model is, on one line: its size, its languages or what it needs,
-/// and what it is good at.
+/// What a model is, on one line: how it would run on this PC, its size,
+/// its languages or what it needs, and what it is good at.
 fn facts(model: &Model) -> String {
     let about = about(&model.summary);
     let mut parts = Vec::new();
+    parts.extend(model.fit.map(|fit| fit_words(fit).to_owned()));
     if model.bytes > 0 {
         parts.push(human_size(model.bytes));
     }
@@ -709,7 +741,7 @@ mod tests {
     fn the_facts_about_this_pc_follow_the_models() {
         let mut view = scene("settings");
         let page = content(&view);
-        let card = row_of(&page, "Run on the graphics card (NVIDIA GeForce RTX 3090)");
+        let card = row_of(&page, "Run on the graphics card (NVIDIA GeForce RTX 4070)");
         let toggles = Seen::of_setting(card).toggles;
         let [(true, off)] = toggles.as_slice() else {
             unreachable!("one switch that is on was expected");
@@ -1085,5 +1117,77 @@ mod tests {
             "Types as you speak. Needs a Gemini API key"
         );
         assert_eq!(facts(&model("", "", 0)), "");
+    }
+
+    const NONE_WELL: &str = "None of these runs well on this PC";
+
+    #[test]
+    fn a_model_on_this_pc_says_how_it_would_run_and_an_online_one_does_not() {
+        let page = content(&scene("settings"));
+        let line = row_of(&page, "Whisper base");
+        assert!(
+            line.detail
+                .starts_with("Downloaded \u{b7} Runs well on this PC \u{b7} ")
+        );
+        assert!(
+            !row_of(&page, "Google Gemini 3.5 Transcribe")
+                .detail
+                .contains("this PC")
+        );
+        // Where they all run well there is nothing more to say.
+        assert!(!Seen::of(&page.body).says(NONE_WELL));
+
+        let page = content(&scene("modest-pc"));
+        for (name, said) in [
+            ("Whisper base", "Runs well on this PC"),
+            ("NVIDIA Parakeet TDT v3", "May be slow on this PC"),
+            ("Whisper large-v3 turbo", "Too heavy for this PC"),
+        ] {
+            let line = row_of(&page, name);
+            assert!(line.detail.starts_with(said), "{}", line.detail);
+            // Said, not warned of: nothing is dictated with it.
+            assert_eq!(line.detail_tone, Tone::Secondary);
+        }
+        assert!(!Seen::of(&page.body).says(NONE_WELL));
+    }
+
+    #[test]
+    fn a_model_in_use_that_is_too_heavy_is_a_caution() {
+        let mut view = scene("modest-pc");
+        for model in &mut view.models.list {
+            model.in_use = model.name == "Whisper large-v3 turbo";
+        }
+        let page = content(&view);
+        let line = row_of(&page, "Whisper large-v3 turbo");
+        assert_eq!(line.detail_tone, Tone::Caution);
+        let other = row_of(&page, "Whisper large-v3 turbo (compact)");
+        assert_eq!(other.detail_tone, Tone::Secondary);
+    }
+
+    #[test]
+    fn a_pc_that_runs_no_model_well_is_told_once_what_does() {
+        let mut view = scene("weak-pc");
+        let seen = Seen::of(&content(&view).body);
+        let told = seen.texts.iter().filter(|text| text.contains(NONE_WELL));
+        assert_eq!(told.count(), 1);
+        assert!(seen.says("VinPUT Pro runs online"));
+        // Not a bar, not a button: the page offers what it offered before.
+        assert_eq!(seen.bars.len(), 1);
+        let labels = Seen::of(&content(&scene("first-run")).body).labels().len();
+        assert_eq!(seen.labels().len(), labels);
+
+        // Someone who dictates with it already knows.
+        for model in &mut view.models.list {
+            model.in_use = model.id == PRO_MODEL;
+        }
+        assert!(!Seen::of(&content(&view).body).says(NONE_WELL));
+
+        // A PC that could not be looked over says nothing at all.
+        let mut view = scene("weak-pc");
+        for model in &mut view.models.list {
+            model.fit = None;
+        }
+        let seen = Seen::of(&content(&view).body);
+        assert!(!seen.says(NONE_WELL) && !seen.says("on this PC \u{b7}"));
     }
 }

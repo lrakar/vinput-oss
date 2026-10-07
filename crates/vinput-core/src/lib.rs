@@ -29,6 +29,7 @@ pub mod dictation;
 pub mod download;
 pub mod error;
 pub mod gpu;
+pub mod hardware;
 pub mod inject;
 pub mod instance;
 #[cfg(windows)]

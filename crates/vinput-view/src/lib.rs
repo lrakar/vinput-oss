@@ -183,6 +183,8 @@ pub struct Settings {
     pub ready_sound: bool,
     /// Whether a short sound plays when listening stops.
     pub stop_sound: bool,
+    /// Whether words are typed as they are said and corrected in place.
+    pub live_typing: bool,
     /// After how many minutes without a sound a dictation stops by itself.
     pub stop_after_minutes: u32,
     /// Whether Vinput looks for newer versions by itself.
@@ -222,6 +224,8 @@ pub enum Change {
     ReadySound(bool),
     /// See [`Settings::stop_sound`].
     StopSound(bool),
+    /// See [`Settings::live_typing`].
+    LiveTyping(bool),
     /// See [`Settings::stop_after_minutes`]. A time that is not on offer is
     /// left unmade.
     StopAfterSilence(u32),
@@ -292,8 +296,23 @@ pub struct Model {
     pub lacks: Vec<String>,
     /// Whether it knows none of the configured languages at all.
     pub knows_none: bool,
+    /// How it would run on this PC, for a local model on a PC that could be
+    /// looked over.
+    pub fit: Option<Fit>,
     /// Where it stands.
     pub state: ModelState,
+}
+
+/// How a local model would run on this PC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fit {
+    /// Text arrives about as soon as it can.
+    Well,
+    /// It works, with a wait after each dictation.
+    Slow,
+    /// Too little memory for it, or too long a wait.
+    Heavy,
 }
 
 /// Where a model stands.
@@ -658,11 +677,14 @@ pub const PRO_SOON: &str = "Subscribing opens shortly. Nothing was charged. Your
 pub struct Pro {
     /// Whether anyone is signed in.
     pub who: ProWho,
-    /// While a sign-in waits: the code the page in the browser asks for;
-    /// empty until the server has handed it out.
+    /// While a sign-in waits: the code the page in the browser asks for.
+    /// Empty until the server has handed it out, and for a sign-in the
+    /// browser brings back by itself, which has no code to type.
     pub code: String,
-    /// While a sign-in waits: how many minutes the code works for.
+    /// While a sign-in waits: how many minutes the person has for it.
     pub code_minutes: u32,
+    /// While a sign-in waits: whether the browser was opened for it.
+    pub in_browser: bool,
     /// The Google address of whoever is signed in.
     pub email: String,
     /// Whether the server has said how the account stands since the app
@@ -741,6 +763,7 @@ impl Default for Pro {
             who: ProWho::SignedOut,
             code: String::new(),
             code_minutes: 10,
+            in_browser: false,
             email: String::new(),
             known: false,
             entitled: false,
@@ -870,6 +893,9 @@ pub enum Event {
     /// Turn the Settings window to this page and bring it to the front. The
     /// update window, which has no pages, only comes to the front.
     Show(Page),
+    /// Come to the front on whatever page is shown: what was waited for in
+    /// the browser has happened.
+    Front,
     /// Close the window.
     Close,
 }
@@ -1003,7 +1029,7 @@ mod tests {
             status: Status {
                 listening: true,
                 model: Some("Whisper base".to_owned()),
-                runs_on: RunsOn::GraphicsCard("NVIDIA GeForce RTX 3090".to_owned()),
+                runs_on: RunsOn::GraphicsCard("NVIDIA GeForce RTX 4070".to_owned()),
             },
             models: Models {
                 list: vec![Model {
@@ -1018,6 +1044,7 @@ mod tests {
         for event in [
             Event::State(Box::new(view)),
             Event::Show(Page::Models),
+            Event::Front,
             Event::Close,
         ] {
             let line = event.to_line();

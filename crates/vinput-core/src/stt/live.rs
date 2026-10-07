@@ -168,6 +168,12 @@ pub(super) struct Session {
     /// Whether the audio last fed was not taken, because the task had let
     /// go of the stream by then.
     pub(super) unsent: bool,
+    /// The newest guess at what follows the settled text, if one has come
+    /// since the last settled text and nobody has taken it yet.
+    guess: Option<String>,
+    /// The failure that came after settled text, which was handed back
+    /// first.
+    failed: Option<Error>,
     /// Dropped with the session, which tells its task to stop at once: after
     /// a failure to type, say, nothing more is wanted from the service.
     _alive: oneshot::Sender<()>,
@@ -185,6 +191,8 @@ pub(super) fn session(what: &'static str, piece: usize) -> (Session, Client) {
         audio: Some(audio_tx),
         results: result_rx,
         unsent: false,
+        guess: None,
+        failed: None,
         _alive: alive,
     };
     let client = Client {
@@ -204,6 +212,12 @@ impl Session {
     pub(super) fn rest(&mut self) -> impl Iterator<Item = Transcript> + '_ {
         self.results.try_iter().flatten()
     }
+
+    /// The service's guess at what follows the text handed back so far, if
+    /// it has made a new one since this was last asked.
+    pub(super) fn take_guess(&mut self) -> Option<String> {
+        self.guess.take()
+    }
 }
 
 /// Samples as the bytes they are sent as.
@@ -217,6 +231,11 @@ pub(super) fn bytes_of(pcm: &[i16]) -> Vec<u8> {
 
 impl Transcriber for Session {
     fn feed(&mut self, pcm: &[i16]) -> Result<Option<Transcript>> {
+        if let Some(failed) = self.failed.take() {
+            // The task had ended before this audio could be handed to it.
+            self.unsent = true;
+            return Err(failed);
+        }
         let Some(audio) = &self.audio else {
             return Err(self.closed());
         };
@@ -227,16 +246,38 @@ impl Transcriber for Session {
             sent &= audio.send(bytes_of(piece)).is_ok();
         }
         self.unsent = !sent;
-        // Hand back the first final transcript that is ready, else the
-        // newest interim. What was settled before a failure is typed before
+        // Hand back all the settled text that is ready, as one piece, else
+        // the newest interim, and keep the guess that came after the
+        // settled text for whoever asks: the two belong together, and a
+        // guess read without the text settled before it would be a guess at
+        // something else. What was settled before a failure is typed before
         // the failure is reported.
+        let mut settled = String::new();
         let mut interim = None;
         for result in self.results.try_iter() {
-            let transcript = result?;
-            if transcript.is_final {
-                return Ok(Some(transcript));
+            match result {
+                Ok(transcript) if transcript.is_final => {
+                    settled.push_str(&transcript.text);
+                    // It took the place of the guess that was showing.
+                    self.guess = None;
+                    interim = None;
+                }
+                Ok(transcript) => {
+                    self.guess = Some(transcript.text.clone());
+                    interim = Some(transcript);
+                }
+                Err(failed) if settled.is_empty() => return Err(failed),
+                Err(failed) => {
+                    self.failed = Some(failed);
+                    break;
+                }
             }
-            interim = Some(transcript);
+        }
+        if !settled.is_empty() {
+            return Ok(Some(Transcript {
+                text: settled,
+                is_final: true,
+            }));
         }
         if !sent {
             // The task has ended and has left nothing more behind.

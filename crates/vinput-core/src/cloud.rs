@@ -1,10 +1,13 @@
 //! `VinPUT` Pro: the account at Vinput's own server, and the session with it.
 //!
 //! Pro is speech recognition as a subscription. The person signs in with
-//! Google in the browser, never in the app: the app asks the server to start
-//! a sign-in, opens the address it gets back, shows the short code the page
-//! asks for, and polls until the server hands it a session. A session is two
-//! tokens. The refresh token is kept in the Windows credential store and
+//! Google in the browser, never in the app. The app listens on a port of
+//! this computer, opens the server's sign-in page, and the browser comes
+//! back to that port with a one-time code, which the app trades for a
+//! session together with a secret it never let go of (`cloud/loopback.rs`).
+//! Only if no port can be listened on does it sign in the older way: it asks
+//! the server to start a sign-in, shows the short code the page asks for,
+//! and polls until the server hands it a session. A session is two tokens. The refresh token is kept in the Windows credential store and
 //! nowhere else: not in the settings file, not in the log. The access token
 //! lives in memory for the hour it is good for and is traded for a new one
 //! shortly before that hour is up.
@@ -27,6 +30,7 @@
 
 #[cfg(test)]
 pub(crate) mod fake;
+mod loopback;
 mod turn;
 
 use std::fmt;
@@ -34,6 +38,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::digest;
+use ring::rand::{SecureRandom as _, SystemRandom};
 use serde_json::{Value, json};
 
 use crate::net::{Request, Target};
@@ -104,6 +112,15 @@ const RETRY_WAITS: [Duration; 3] = [
 const TURN_WAIT: Duration = Duration::from_secs(20);
 /// The longest name of this PC the server is told.
 const DEVICE_NAME_MAX: usize = 64;
+/// How long the person has to sign in with Google once the browser was
+/// opened for it: as long as the server keeps the sign-in.
+const BROWSER_WAIT: Duration = Duration::from_secs(10 * 60);
+/// What is said when the browser came back without anyone signed in.
+const NOT_THROUGH: &str =
+    "The sign-in did not go through in the browser. Start it again when you are ready.";
+/// What is said when Google will not vouch for the account's address.
+const UNVERIFIED: &str = "Google has not verified this account's e-mail address. Verify it with \
+                          Google, then sign in again.";
 
 /// The address of the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +315,9 @@ pub enum Failure {
     Unreachable(String),
     /// A sign-in was not finished in the browser in time.
     Expired,
+    /// A sign-in ended in the browser without anyone signed in, for the
+    /// reason these words give the person.
+    Browser(&'static str),
     /// A wait was called off.
     Stopped,
 }
@@ -309,6 +329,7 @@ impl fmt::Display for Failure {
             Self::Refused { message, .. } => write!(f, "VinPUT Pro said: {message}"),
             Self::Unreachable(why) => write!(f, "VinPUT Pro could not be reached: {why}"),
             Self::Expired => f.write_str("the sign-in was not finished in time"),
+            Self::Browser(why) => f.write_str(why),
             Self::Stopped => f.write_str("stopped"),
         }
     }
@@ -335,7 +356,7 @@ impl Failure {
                 code,
                 Code::TooManyRequests | Code::Internal | Code::UpstreamFailed | Code::Unavailable
             ),
-            Self::SignedOut | Self::Expired | Self::Stopped => false,
+            Self::SignedOut | Self::Expired | Self::Browser(_) | Self::Stopped => false,
         }
     }
 }
@@ -623,22 +644,41 @@ fn sign_in_request(device: Option<&str>) -> String {
 }
 
 /// A sign-in that was started and waits to be finished in the browser.
-#[derive(Clone, PartialEq, Eq)]
 pub struct SignIn {
-    /// What the app trades for a session once the person has signed in.
-    device_code: String,
     /// The page to open in the browser.
     pub verification_url: String,
-    /// The code that page asks for; the app shows it.
+    /// The code that page asks for, which the app shows. Empty for a
+    /// sign-in the browser brings back by itself: there is nothing to type.
     pub confirm_code: String,
-    /// How long to wait between two looks.
-    interval: Duration,
+    /// How the session comes to this process.
+    way: Way,
     /// How long the person has.
     expires_in: Duration,
 }
 
+/// How a sign-in that was started ends in a session.
+enum Way {
+    /// The browser comes back to a port of this computer with a code.
+    Listening {
+        /// Where it comes back to.
+        listener: loopback::Listener,
+        /// The secret the code is good for nothing without.
+        verifier: String,
+        /// What the browser must bring back along with the code.
+        state: String,
+    },
+    /// The person types a code in the browser, and the server is asked
+    /// until it hands the session out.
+    Asking {
+        /// What the app trades for a session once the person has signed in.
+        device_code: String,
+        /// How long to wait between two looks.
+        interval: Duration,
+    },
+}
+
 impl SignIn {
-    /// How many minutes the person has to finish it, as the server said.
+    /// How many minutes the person has to finish it.
     #[must_use]
     pub fn minutes(&self) -> u32 {
         u32::try_from(self.expires_in.as_secs() / 60).unwrap_or(u32::MAX)
@@ -647,7 +687,8 @@ impl SignIn {
 
 impl fmt::Debug for SignIn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The device code is as good as a session; it stays out of logs.
+        // The device code is as good as a session, and so is the secret of
+        // a sign-in that listens; they stay out of logs.
         f.debug_struct("SignIn")
             .field("confirm_code", &self.confirm_code)
             .finish_non_exhaustive()
@@ -656,15 +697,43 @@ impl fmt::Debug for SignIn {
 
 fn parse_sign_in(answer: &Value) -> Option<SignIn> {
     Some(SignIn {
-        device_code: answer["device_code"].as_str()?.to_owned(),
         verification_url: answer["verification_url"].as_str()?.to_owned(),
         confirm_code: answer["confirm_code"]
             .as_str()
             .unwrap_or_default()
             .to_owned(),
-        interval: Duration::from_secs(answer["interval"].as_u64().unwrap_or(2)),
+        way: Way::Asking {
+            device_code: answer["device_code"].as_str()?.to_owned(),
+            interval: Duration::from_secs(answer["interval"].as_u64().unwrap_or(2)),
+        },
         expires_in: Duration::from_secs(answer["expires_in"].as_u64().unwrap_or(600)),
     })
+}
+
+/// A fresh secret: 256 random bits in base64url, which is 43 characters of
+/// what goes into an address as it is.
+fn random_token() -> Option<String> {
+    let mut bytes = [0_u8; 32];
+    SystemRandom::new().fill(&mut bytes).ok()?;
+    Some(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// The challenge that `verifier` answers: its SHA-256 in base64url, as
+/// PKCE's `S256` makes it.
+fn challenge_of(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, verifier.as_bytes()))
+}
+
+/// What the code the browser brought back is traded with: the secret it
+/// was asked for with, and the name of this PC.
+fn app_code_request(code: &str, verifier: &str, device: Option<&str>) -> String {
+    let mut request = json!({
+        "grant_type": "app_code", "code": code, "code_verifier": verifier,
+    });
+    if let Some(name) = device {
+        request["device_name"] = json!(name);
+    }
+    request.to_string()
 }
 
 /// A session as the server grants it.
@@ -925,13 +994,54 @@ impl Account {
     }
 
     /// Starts a sign-in. The caller opens [`SignIn::verification_url`] in
-    /// the browser, shows [`SignIn::confirm_code`] and waits with
-    /// [`finish_sign_in`](Self::finish_sign_in).
+    /// the browser, shows [`SignIn::confirm_code`] if there is one, and
+    /// waits with [`finish_sign_in`](Self::finish_sign_in).
+    ///
+    /// The browser comes back to a port of this computer by itself. Only
+    /// when none can be listened on is the server asked for a sign-in with
+    /// a code to type.
     ///
     /// # Errors
     ///
-    /// Returns why the server did not start one.
+    /// Returns why the server did not start one, where it was asked.
     pub fn start_sign_in(&self) -> Result<SignIn, Failure> {
+        match self.listen_for_sign_in() {
+            Ok(sign_in) => Ok(sign_in),
+            Err(why) => {
+                log::write(&format!(
+                    "no port to sign in to VinPUT Pro through ({why}); signing in with a code"
+                ));
+                self.start_sign_in_with_code()
+            }
+        }
+    }
+
+    /// A sign-in the browser brings back to a port of this computer. Asks
+    /// the server nothing: the page it opens does.
+    fn listen_for_sign_in(&self) -> Result<SignIn, String> {
+        let listener = loopback::Listener::bind().map_err(|err| err.to_string())?;
+        let no_randomness = || "Windows has no randomness to give".to_owned();
+        let verifier = random_token().ok_or_else(no_randomness)?;
+        let state = random_token().ok_or_else(no_randomness)?;
+        let page = format!(
+            "/v1/auth/app/start?port={}&code_challenge={}&state={state}",
+            listener.port(),
+            challenge_of(&verifier),
+        );
+        Ok(SignIn {
+            verification_url: self.server.url(&page),
+            confirm_code: String::new(),
+            way: Way::Listening {
+                listener,
+                verifier,
+                state,
+            },
+            expires_in: BROWSER_WAIT,
+        })
+    }
+
+    /// A sign-in with a code to type, which the server starts.
+    fn start_sign_in_with_code(&self) -> Result<SignIn, Failure> {
         let device = device_name(std::env::var("COMPUTERNAME").ok());
         let request = sign_in_request(device.as_deref());
         let answer = self.ask(Ask::open("/v1/auth/device", Some(&request)))?;
@@ -957,16 +1067,106 @@ impl Account {
     ///
     /// # Errors
     ///
-    /// Returns [`Failure::Stopped`] once `stop` is set, [`Failure::Expired`]
-    /// when the time for it is up or the server has forgotten it, and
-    /// otherwise why it could not be finished. A request that fails for
-    /// want of a connection, or because the server is busy or has a fault,
-    /// is made again until the time is up: the person is in the browser
-    /// meanwhile, and finishes there whatever happens here.
+    /// Returns [`Failure::Stopped`] once `stop` is set, or when the person
+    /// declined in the browser; [`Failure::Expired`] when the time for it is
+    /// up or the server has forgotten it; [`Failure::Browser`] when the
+    /// browser came back without anyone signed in; and otherwise why it
+    /// could not be finished. A request that fails for want of a
+    /// connection, or because the server is busy or has a fault, is made
+    /// again: the person is in the browser meanwhile, and finishes there
+    /// whatever happens here.
     pub fn finish_sign_in(&self, sign_in: &SignIn, stop: &AtomicBool) -> Result<String, Failure> {
+        match &sign_in.way {
+            Way::Listening {
+                listener,
+                verifier,
+                state,
+            } => {
+                let (arrived, browser) = listener.wait(state, sign_in.expires_in, stop)?;
+                let ended = match arrived {
+                    loopback::Arrived::Code(code) => self.trade_app_code(&code, verifier, stop),
+                    loopback::Arrived::Error(word) => Err(match word.as_str() {
+                        // Their own doing, and they know: nothing to say.
+                        "cancelled" => Failure::Stopped,
+                        "unverified" => Failure::Browser(UNVERIFIED),
+                        _ => Failure::Browser(NOT_THROUGH),
+                    }),
+                };
+                // The browser is told last, so that what its page says is
+                // what became of the sign-in here.
+                let result = match &ended {
+                    Ok(_) => "signed_in",
+                    Err(Failure::Stopped) => "cancelled",
+                    Err(Failure::Browser(UNVERIFIED)) => "unverified",
+                    Err(_) => "failed",
+                };
+                browser.send_to(
+                    &self
+                        .server
+                        .url(&format!("/v1/auth/app/done?result={result}")),
+                );
+                ended
+            }
+            Way::Asking {
+                device_code,
+                interval,
+            } => self.ask_until_signed_in(device_code, *interval, sign_in.expires_in, stop),
+        }
+    }
+
+    /// Trades the code the browser brought back for a session, and keeps
+    /// it. Returns the address that signed in.
+    fn trade_app_code(
+        &self,
+        code: &str,
+        verifier: &str,
+        stop: &AtomicBool,
+    ) -> Result<String, Failure> {
+        let device = device_name(std::env::var("COMPUTERNAME").ok());
+        let request = app_code_request(code, verifier, device.as_deref());
+        // The browser is waiting for its page meanwhile, so not for long.
+        let mut waits = self.retry_waits.iter().take(2);
+        let answer = loop {
+            match self.ask(Ask::open("/v1/auth/token", Some(&request))) {
+                Err(failure) if failure.is_passing() => match waits.next() {
+                    Some(wait) => std::thread::sleep(*wait),
+                    None => return Err(failure),
+                },
+                // The code works once and for a minute. A code the server
+                // does not take was used by a request whose answer was
+                // lost, or came too late.
+                Err(Failure::Refused {
+                    code: Code::Unauthorized,
+                    ..
+                }) => return Err(Failure::Expired),
+                other => break other?,
+            }
+        };
+        let granted = parse_granted(&answer)
+            .ok_or_else(|| Failure::Unreachable("the server's answer could not be read".into()))?;
+        // Called off while the answer was on its way: nobody is signed in,
+        // here or there.
+        if stop.load(Ordering::Relaxed) {
+            self.tell_goodbye(&granted.refresh_token, TIMEOUT);
+            return Err(Failure::Stopped);
+        }
+        let email = granted.email.clone();
+        self.keep(granted)?;
+        Ok(email)
+    }
+
+    /// Asks the server whether the person has typed the code in the
+    /// browser, until it hands the session out, and keeps it.
+    fn ask_until_signed_in(
+        &self,
+        device_code: &str,
+        interval: Duration,
+        expires_in: Duration,
+        stop: &AtomicBool,
+    ) -> Result<String, Failure> {
         let started = Instant::now();
-        let request = device_request(&sign_in.device_code);
-        let interval = sign_in.interval.max(self.poll_floor);
+        let request = device_request(device_code);
+        let interval = interval.max(self.poll_floor);
         let mut passing = None;
         loop {
             let waited = Instant::now();
@@ -976,7 +1176,7 @@ impl Account {
                 }
                 std::thread::sleep(STOP_STEP.min(interval));
             }
-            if started.elapsed() > sign_in.expires_in {
+            if started.elapsed() > expires_in {
                 return Err(passing.unwrap_or(Failure::Expired));
             }
             let answer = self.ask(Ask::open("/v1/auth/token", Some(&request)));
@@ -1724,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn the_answers_of_the_server_are_read() {
+    fn a_sign_in_with_a_code_is_read_from_the_servers_answer() {
         let sign_in = parse_sign_in(&json!({
             "device_code": "dev", "verification_url": "https://x/start?code=1",
             "confirm_code": "K7M2QX", "interval": 2, "expires_in": 600
@@ -1733,12 +1933,19 @@ mod tests {
             unreachable!("a complete answer reads");
         };
         assert_eq!(sign_in.confirm_code, "K7M2QX");
-        assert_eq!(sign_in.interval, Duration::from_secs(2));
+        assert!(matches!(
+            &sign_in.way,
+            Way::Asking { device_code, interval }
+                if device_code == "dev" && *interval == Duration::from_secs(2)
+        ));
         assert_eq!(sign_in.expires_in, Duration::from_secs(600));
         assert_eq!(sign_in.minutes(), 10);
         assert!(!format!("{sign_in:?}").contains("dev"));
         assert!(parse_sign_in(&json!({"verification_url": "https://x"})).is_none());
+    }
 
+    #[test]
+    fn the_answers_of_the_server_are_read() {
         let granted = parse_granted(&json!({
             "access_token": "a", "expires_in": 3600, "refresh_token": "r", "email": "ana@example.com"
         }));
@@ -1867,7 +2074,9 @@ mod tests {
         assert_eq!(account.signed_in_as(), None);
         assert_eq!(account.access_token(), Err(Failure::SignedOut));
 
-        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        let sign_in = account
+            .start_sign_in_with_code()
+            .map_err(|err| err.to_string())?;
         assert_eq!(sign_in.confirm_code, "K7M2QX");
         assert!(sign_in.verification_url.starts_with(&fake.base));
         // The server was told what this PC is called, if it has a name.
@@ -1893,13 +2102,244 @@ mod tests {
         Ok(())
     }
 
+    /// What the page of a sign-in without a code to type was opened with:
+    /// the port, the challenge and the state.
+    fn opened_with(sign_in: &SignIn, fake: &Fake) -> Option<(u16, String, String)> {
+        let query = sign_in
+            .verification_url
+            .strip_prefix(&format!("{}/v1/auth/app/start?", fake.base))?;
+        let mut parts = query.split('&');
+        let port = parts.next()?.strip_prefix("port=")?.parse().ok()?;
+        let challenge = parts.next()?.strip_prefix("code_challenge=")?.to_owned();
+        let state = parts.next()?.strip_prefix("state=")?.to_owned();
+        parts.next().is_none().then_some((port, challenge, state))
+    }
+
+    /// Comes back to the app on `port` as the browser does, with `query`,
+    /// and returns where the app sends the browser next.
+    fn come_back(port: u16, query: &str) -> std::io::Result<String> {
+        use std::io::{Read as _, Write as _};
+        let mut browser = std::net::TcpStream::connect(("127.0.0.1", port))?;
+        browser.set_read_timeout(Some(Duration::from_secs(20)))?;
+        let request = format!("GET /callback?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        browser.write_all(request.as_bytes())?;
+        let mut answer = String::new();
+        browser.read_to_string(&mut answer)?;
+        let location = answer
+            .lines()
+            .find_map(|line| line.strip_prefix("Location: "));
+        Ok(location.unwrap_or(&answer).to_owned())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn signing_in_needs_no_code_when_the_browser_can_come_back_to_this_pc() -> Outcome {
+        let fake = Fake::start()?;
+        let (account, memory) = fake.account();
+        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        // Nothing to type, nothing asked of the server yet, and a page of
+        // the server's to open.
+        assert_eq!(sign_in.confirm_code, "");
+        assert_eq!(sign_in.minutes(), 10);
+        assert_eq!(fake.asked("POST /v1/auth/device"), 0);
+        assert!(account.server().is_sign_in_page(&sign_in.verification_url));
+        let (port, challenge, state) =
+            opened_with(&sign_in, &fake).ok_or("not the address of a sign-in that listens")?;
+        // What the address carries is the hash of the secret, not the
+        // secret, and both are 256 bits in base64url.
+        let Way::Listening { verifier, .. } = &sign_in.way else {
+            return Err("the sign-in does not listen".into());
+        };
+        assert_eq!(challenge, challenge_of(verifier));
+        assert_ne!(&challenge, verifier);
+        assert_eq!((verifier.len(), challenge.len(), state.len()), (43, 43, 43));
+        assert!(!format!("{sign_in:?}").contains(verifier.as_str()));
+
+        // The browser comes back from the server with a code, and is sent
+        // on to the page that says so once the app has its session.
+        fake.change(|server| server.app_code = Some(("code-1".to_owned(), challenge)));
+        let browser =
+            std::thread::spawn(move || come_back(port, &format!("code=code-1&state={state}")));
+        let email = account.finish_sign_in(&sign_in, &AtomicBool::new(false));
+        assert_eq!(email.as_deref(), Ok("ana@example.com"));
+        let sent_to = browser.join().map_err(|_| "the browser panicked")??;
+        assert_eq!(
+            sent_to,
+            format!("{}/v1/auth/app/done?result=signed_in", fake.base)
+        );
+
+        // One request made the session, which is kept and used as it is.
+        assert_eq!(fake.asked("POST /v1/auth/token"), 1);
+        let name = device_name(std::env::var("COMPUTERNAME").ok());
+        assert_eq!(
+            fake.read(|server| server.device_name.as_str().map(str::to_owned)),
+            name
+        );
+        assert_eq!(account.signed_in_as().as_deref(), Some("ana@example.com"));
+        assert!(
+            memory
+                .refresh_token()
+                .is_some_and(|token| token == fake.read(|s| s.refresh.clone()))
+        );
+        assert!(account.is_ready());
+        assert!(account.info().is_ok_and(|info| info.entitled));
+        assert_eq!(fake.asked("POST /v1/auth/token"), 1);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sign_in_that_ends_badly_in_the_browser_signs_nobody_in_and_says_why() -> Outcome {
+        let fake = Fake::start()?;
+        let cases = [
+            ("error=cancelled", Failure::Stopped, "cancelled"),
+            (
+                "error=unverified",
+                Failure::Browser(UNVERIFIED),
+                "unverified",
+            ),
+            ("error=failed", Failure::Browser(NOT_THROUGH), "failed"),
+            (
+                "error=something_new",
+                Failure::Browser(NOT_THROUGH),
+                "failed",
+            ),
+            // A code the server does not take: spent, or too late.
+            ("code=stale", Failure::Expired, "failed"),
+        ];
+        for (outcome, failure, result) in cases {
+            let (account, _) = fake.account();
+            let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+            let (port, _, state) = opened_with(&sign_in, &fake).ok_or("not that address")?;
+            let query = format!("{outcome}&state={state}");
+            let browser = std::thread::spawn(move || come_back(port, &query));
+            assert_eq!(
+                account.finish_sign_in(&sign_in, &AtomicBool::new(false)),
+                Err(failure),
+                "{outcome}"
+            );
+            let sent_to = browser.join().map_err(|_| "the browser panicked")??;
+            assert_eq!(
+                sent_to,
+                format!("{}/v1/auth/app/done?result={result}", fake.base),
+                "{outcome}"
+            );
+            assert_eq!(account.signed_in_as(), None, "{outcome}");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_code_brought_with_another_state_or_secret_signs_nobody_in() -> Outcome {
+        let fake = Fake::start()?;
+        let (account, _) = fake.account();
+        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        let (port, challenge, state) = opened_with(&sign_in, &fake).ok_or("not that address")?;
+        fake.change(|server| server.app_code = Some(("code-1".to_owned(), challenge)));
+
+        // Someone else's sign-in, brought to this app: not taken, and the
+        // server is asked nothing. The app goes on waiting for its own.
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiting = {
+            let (account, stop) = (Arc::clone(&account), Arc::clone(&stop));
+            std::thread::spawn(move || account.finish_sign_in(&sign_in, &stop))
+        };
+        let other = "b".repeat(43);
+        let answer = come_back(port, &format!("code=code-1&state={other}"))?;
+        assert!(answer.starts_with("HTTP/1.1 404 "), "{answer}");
+        assert_eq!(fake.asked("POST /v1/auth/token"), 0);
+        assert!(!waiting.is_finished());
+
+        // Its own code, traded by another app with a secret of its own, is
+        // refused and spent: the challenge was this app's.
+        let (stranger, _) = fake.account();
+        let traded = stranger.trade_app_code("code-1", &"c".repeat(43), &AtomicBool::new(false));
+        assert_eq!(traded, Err(Failure::Expired));
+        assert_eq!(stranger.signed_in_as(), None);
+
+        stop.store(true, Ordering::Relaxed);
+        let ended = waiting.join().map_err(|_| "the wait panicked")?;
+        assert_eq!(ended, Err(Failure::Stopped));
+        assert_eq!(account.signed_in_as(), None);
+        // What the browser would have brought now finds nobody listening.
+        assert!(come_back(port, &format!("code=code-1&state={state}")).is_err());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sign_in_called_off_while_its_code_was_traded_signs_nobody_in() -> Outcome {
+        let fake = Fake::start()?;
+        let (account, _) = fake.account();
+        fake.change(|server| {
+            server.app_code = Some(("code-1".to_owned(), challenge_of("secret")));
+        });
+        // Called off already when the answer arrives: the session the
+        // server made is given back, and none is kept.
+        let stop = AtomicBool::new(true);
+        assert_eq!(
+            account.trade_app_code("code-1", "secret", &stop),
+            Err(Failure::Stopped)
+        );
+        assert_eq!(account.signed_in_as(), None);
+        assert_eq!(fake.asked("POST /v1/auth/signout"), 1);
+        assert_eq!(fake.read(|server| server.refresh.clone()), "signed-out");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_code_is_traded_again_when_the_server_is_busy_for_a_moment() -> Outcome {
+        let fake = Fake::start()?;
+        let (account, _) = fake.account();
+        fake.change(|server| {
+            server.app_code = Some(("code-1".to_owned(), challenge_of("secret")));
+            server.faults = vec![("POST /v1/auth/token", 503, "unavailable")];
+        });
+        let traded = account.trade_app_code("code-1", "secret", &AtomicBool::new(false));
+        assert_eq!(traded.as_deref(), Ok("ana@example.com"));
+        assert_eq!(fake.asked("POST /v1/auth/token"), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_challenge_is_the_hash_of_its_secret_as_pkce_makes_it() {
+        // RFC 7636, appendix B.
+        assert_eq!(
+            challenge_of("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        let (first, second) = (random_token(), random_token());
+        assert!(first.as_ref().is_some_and(|token| token.len() == 43));
+        assert_ne!(first, second);
+        let request: Value =
+            serde_json::from_str(&app_code_request("c", "v", Some("ANA \"PC\"")))
+                .unwrap_or_default();
+        assert_eq!(
+            request,
+            json!({
+                "grant_type": "app_code", "code": "c", "code_verifier": "v",
+                "device_name": "ANA \"PC\"",
+            })
+        );
+        let unnamed: Value =
+            serde_json::from_str(&app_code_request("c", "v", None)).unwrap_or_default();
+        assert_eq!(
+            unnamed,
+            json!({"grant_type": "app_code", "code": "c", "code_verifier": "v"})
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_sign_in_ends_when_it_is_called_off_or_forgotten() -> Outcome {
         let fake = Fake::start()?;
         fake.change(|server| server.pending = u32::MAX);
         let (account, memory) = fake.account();
-        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        let sign_in = account
+            .start_sign_in_with_code()
+            .map_err(|err| err.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let stopper = std::thread::spawn(move || {
@@ -2123,7 +2563,9 @@ mod tests {
             ];
         });
         let (account, memory) = fake.account();
-        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        let sign_in = account
+            .start_sign_in_with_code()
+            .map_err(|err| err.to_string())?;
         // The person finishes in the browser meanwhile; so does the app.
         let email = account.finish_sign_in(&sign_in, &AtomicBool::new(false));
         assert_eq!(email.as_deref(), Ok("ana@example.com"));
@@ -2136,7 +2578,9 @@ mod tests {
             server.old_errors = true;
         });
         let (account, _memory) = fake.account();
-        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        let sign_in = account
+            .start_sign_in_with_code()
+            .map_err(|err| err.to_string())?;
         assert!(
             account
                 .finish_sign_in(&sign_in, &AtomicBool::new(false))
@@ -2146,7 +2590,9 @@ mod tests {
         let fake = Fake::start()?;
         fake.change(|server| server.faults = vec![("POST /v1/auth/token", 400, "bad_request")]);
         let (account, memory) = fake.account();
-        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        let sign_in = account
+            .start_sign_in_with_code()
+            .map_err(|err| err.to_string())?;
         assert!(matches!(
             account.finish_sign_in(&sign_in, &AtomicBool::new(false)),
             Err(Failure::Refused {
@@ -2163,7 +2609,9 @@ mod tests {
     fn a_sign_in_called_off_while_its_answer_was_on_the_way_signs_nobody_in() -> Outcome {
         let fake = Fake::start()?;
         let (account, memory) = fake.account();
-        let sign_in = account.start_sign_in().map_err(|err| err.to_string())?;
+        let sign_in = account
+            .start_sign_in_with_code()
+            .map_err(|err| err.to_string())?;
         // Finished in the browser, and called off before the app has asked:
         // the wait ends before it asks, as ever.
         let stop = AtomicBool::new(true);

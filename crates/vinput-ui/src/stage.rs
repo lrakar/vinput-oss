@@ -521,6 +521,12 @@ impl Stage {
         effects
     }
 
+    /// The background process asks for the window in front of everything,
+    /// on the page it shows.
+    pub fn front(&mut self) -> Vec<Effect> {
+        vec![Effect::Front]
+    }
+
     /// Where the work of a window that asks stands.
     pub fn set_phase(&mut self, phase: Phase) -> Vec<Effect> {
         if let Showing::Asking(asking) = &mut self.showing {

@@ -16,7 +16,7 @@ use super::Host;
 use crate::view::{self, Facts, UpdateFacts};
 use vinput_core::models::{self, EngineState, Installer, Model, Runner, Status};
 use vinput_core::stt::check;
-use vinput_core::{api, audio, gpu, memo, secrets};
+use vinput_core::{api, audio, gpu, hardware, memo, secrets};
 use vinput_view as wire;
 
 /// After this many ticks of the window timer, about two seconds, what takes
@@ -223,6 +223,7 @@ impl Host {
             listening: self.ticking,
             graphics_card: gpu::card().map(|card| card.name.as_str()),
             card_engine: on_disk.card_engine,
+            pc: hardware::pc(),
             models: on_disk.models,
             engine: on_disk.engine,
             disk_bytes: self.slow.disk_bytes,

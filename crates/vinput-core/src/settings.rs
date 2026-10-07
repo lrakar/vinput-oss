@@ -51,6 +51,10 @@ pub struct Settings {
     pub ready_sound: bool,
     /// Whether a short sound plays when Vinput stops listening.
     pub stop_sound: bool,
+    /// Whether words are typed as they are said, before the recognizer has
+    /// settled them, and corrected in place when it changes its mind. Only
+    /// `VinPUT` Pro makes the guesses this types.
+    pub live_typing: bool,
     /// After how many minutes without a sound a dictation stops by itself:
     /// one of [`STOP_AFTER_MINUTES`].
     pub stop_after_minutes: u32,
@@ -105,6 +109,7 @@ impl Default for Settings {
             autostart: true,
             ready_sound: true,
             stop_sound: true,
+            live_typing: true,
             stop_after_minutes: DEFAULT_STOP_AFTER_MINUTES,
             microphone: String::new(),
             provider: ProviderKind::default(),
@@ -173,6 +178,7 @@ impl Settings {
                 "autostart" => settings.autostart = flag(),
                 "ready_sound" => settings.ready_sound = flag(),
                 "stop_sound" => settings.stop_sound = flag(),
+                "live_typing" => settings.live_typing = flag(),
                 "stop_after_silence" => {
                     if let Some(minutes) = value
                         .parse()
@@ -247,7 +253,8 @@ impl Settings {
              microphone = {}\n\
              last_local_model = {}\n\
              stop_sound = {}\n\
-             stop_after_silence = {}\n",
+             stop_after_silence = {}\n\
+             live_typing = {}\n",
             self.hotkey,
             optional_hotkey(self.hotkey_enter),
             optional_hotkey(self.hotkey_memo),
@@ -269,6 +276,7 @@ impl Settings {
             self.last_local_model,
             self.stop_sound,
             self.stop_after_minutes,
+            self.live_typing,
         );
         // Written only while it is on: the file of someone who was never
         // owed a welcome, or has had it, says nothing of it.
@@ -504,6 +512,7 @@ mod tests {
             autostart: false,
             ready_sound: false,
             stop_sound: false,
+            live_typing: false,
             stop_after_minutes: 5,
             microphone: r"{0.0.1.00000000}.{6c1f3d2e-0d3a-4c58-9a51-1f0f2b8e7a10}".into(),
             provider: ProviderKind::Local,
@@ -544,6 +553,7 @@ mod tests {
         assert!(!settings.autostart);
         // Settings added since then take their defaults.
         assert!(settings.api_enabled && settings.memo_to_clipboard);
+        assert!(settings.live_typing);
         assert_eq!(settings.hotkey_search, None);
         assert_eq!(settings.search_url, search::DEFAULT_TEMPLATE);
         assert!(settings.microphone.is_empty(), "the default microphone");

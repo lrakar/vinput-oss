@@ -229,6 +229,7 @@ fn explain(failure: &Failure) -> Error {
         failure,
         Failure::SignedOut
             | Failure::Expired
+            | Failure::Browser(_)
             | Failure::Stopped
             | Failure::Refused {
                 code: Code::Unauthorized | Code::SubscriptionRequired | Code::QuotaExceeded,
@@ -258,7 +259,9 @@ fn explain(failure: &Failure) -> Error {
             .to_owned(),
         Failure::Refused { message, .. } => format!("VinPUT Pro could not transcribe: {message}"),
         Failure::Unreachable(why) => format!("VinPUT Pro could not be reached: {why}"),
-        Failure::Expired | Failure::Stopped => "VinPUT Pro is not signed in".to_owned(),
+        Failure::Expired | Failure::Browser(_) | Failure::Stopped => {
+            "VinPUT Pro is not signed in".to_owned()
+        }
     };
     if lasting {
         Error::Setup(why)
@@ -290,6 +293,8 @@ enum Mark {
     FirstAudio,
     /// The first guess has come back.
     FirstPartial,
+    /// The first settled text has come back.
+    FirstFinal,
     /// The key was let go: the audio has ended.
     Released,
     /// The last settled text has come back.
@@ -299,7 +304,7 @@ enum Mark {
     Typed,
 }
 
-const MARKS: usize = 6;
+const MARKS: usize = 7;
 
 /// When what happened in one dictation, for finding out where its time
 /// goes. Costs a clock reading at each mark and nothing else.
@@ -345,6 +350,7 @@ impl Timeline {
             socket_open: at(Mark::Open),
             first_audio: at(Mark::FirstAudio),
             first_partial: at(Mark::FirstPartial),
+            first_final: at(Mark::FirstFinal),
             released: at(Mark::Released),
             last_final: at(Mark::Final),
             typed: at(Mark::Typed),
@@ -363,8 +369,12 @@ pub struct Timings {
     pub socket_open: Option<Duration>,
     /// The first audio had been written to it.
     pub first_audio: Option<Duration>,
-    /// The first guess had come back.
+    /// The first guess had come back: from here on words are on the
+    /// screen where guesses are typed.
     pub first_partial: Option<Duration>,
+    /// The first settled text had come back: from here on words are on the
+    /// screen where only settled text is typed.
+    pub first_final: Option<Duration>,
     /// The key was let go.
     pub released: Option<Duration>,
     /// The last settled text had come back.
@@ -386,6 +396,7 @@ impl fmt::Display for Timings {
             ("", self.socket_open),
             (", first audio sent", self.first_audio),
             (", first partial", self.first_partial),
+            (", first settled text", self.first_final),
             (", key released", self.released),
             (", final received", self.last_final),
             (", text typed", self.typed),
@@ -598,6 +609,7 @@ impl CloudSpeech {
             languages: options.languages.to_vec(),
             local: None,
             ready: VecDeque::new(),
+            withdrawn: false,
         }
     }
 }
@@ -1045,6 +1057,7 @@ fn hear(
         Update::Other => return Ok(None),
     };
     if is_final {
+        marks.mark(Mark::FirstFinal);
         marks.mark(Mark::Final);
         io.finals += 1;
     } else {
@@ -1178,6 +1191,9 @@ struct CloudSession {
     /// Transcripts that were not handed on yet when it did, and those the
     /// audio handed over came to.
     ready: VecDeque<Transcript>,
+    /// Whether the guess the server made last is still to be withdrawn: the
+    /// model on this PC, which has taken over, makes none.
+    withdrawn: bool,
 }
 
 impl CloudSession {
@@ -1216,6 +1232,7 @@ impl CloudSession {
             self.ready.extend(local.feed(pcm)?);
         }
         self.local = Some(local);
+        self.withdrawn = true;
         Ok(())
     }
 }
@@ -1259,6 +1276,16 @@ impl Transcriber for CloudSession {
             Some(local) => local.finish(emit),
             None => Ok(()),
         }
+    }
+
+    /// The server's guess follows the text it has settled, so none is
+    /// passed on while settled text is still on its way to be typed.
+    fn guess(&mut self) -> Option<String> {
+        if self.local.is_some() {
+            return std::mem::take(&mut self.withdrawn).then(String::new);
+        }
+        let guess = self.stream.take_guess();
+        guess.filter(|_| self.ready.is_empty())
     }
 }
 
@@ -1500,6 +1527,7 @@ mod tests {
             socket_open: Some(Duration::from_millis(40)),
             first_audio: Some(Duration::from_millis(41)),
             first_partial: None,
+            first_final: Some(Duration::from_millis(900)),
             released: Some(Duration::from_millis(2000)),
             last_final: Some(Duration::from_millis(2200)),
             typed: Some(Duration::from_millis(2201)),
@@ -1508,8 +1536,8 @@ mod tests {
         assert_eq!(
             line,
             "socket open on a connection kept ready 40 ms, first audio sent 41 ms, first \
-             partial never, key released 2000 ms, final received 2200 ms, text typed 2201 ms \
-             (201 ms after the key)"
+             partial never, first settled text 900 ms, key released 2000 ms, final received \
+             2200 ms, text typed 2201 ms (201 ms after the key)"
         );
     }
 

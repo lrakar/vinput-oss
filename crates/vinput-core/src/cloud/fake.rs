@@ -82,6 +82,10 @@ pub(crate) struct State {
     pub(crate) old_errors: bool,
     /// The name the last sign-in was started with.
     pub(crate) device_name: Value,
+    /// The code the browser of a sign-in without a code to type is sent
+    /// back to the app with, and the challenge that sign-in was begun with;
+    /// `None` once the code was traded, or presented wrongly.
+    pub(crate) app_code: Option<(String, String)>,
     /// How long every answer takes.
     pub(crate) slow_answers: Duration,
     /// What `/v1/plans` answers.
@@ -154,6 +158,7 @@ impl Fake {
             faults: Vec::new(),
             old_errors: false,
             device_name: Value::Null,
+            app_code: None,
             slow_answers: Duration::ZERO,
             plans: json!({
                 "plans": [
@@ -492,6 +497,24 @@ fn route(head: &str, body: &[u8], state: &Shared, base: &str) -> Option<(u16, St
             }
             Some("device_code") => {
                 state.device_traded = true;
+                (200, state.grant().to_string())
+            }
+            // A code works once, and only with the secret whose hash the
+            // sign-in was begun with.
+            Some("app_code") => {
+                let fits = state.app_code.take().is_some_and(|(code, challenge)| {
+                    let verifier = body["code_verifier"].as_str().unwrap_or_default();
+                    body["code"] == code.as_str() && super::challenge_of(verifier) == challenge
+                });
+                if !fits {
+                    return Some(unauthorized());
+                }
+                state.device_name = body["device_name"].clone();
+                if state.lost_answers > 0 {
+                    state.lost_answers -= 1;
+                    state.grant();
+                    return None;
+                }
                 (200, state.grant().to_string())
             }
             // The token that is good, or the one before it, which is taken

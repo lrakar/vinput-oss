@@ -231,6 +231,12 @@ fn behavior(settings: &Settings) -> [Node; 2] {
                 }))
                 .into(),
             stop_after_row(settings.stop_after_minutes),
+            setting(Icon::Keyboard, "Type words as you say them")
+                .detail("With VinPUT Pro. A word that changes as you go on is corrected in place")
+                .control(toggle(settings.live_typing, |on| {
+                    Action::send(Command::Set(Change::LiveTyping(on)))
+                }))
+                .into(),
         ]),
     ]
 }

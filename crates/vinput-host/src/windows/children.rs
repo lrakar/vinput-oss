@@ -72,6 +72,14 @@ impl Window {
         }
     }
 
+    /// Has the window come to the front on the page it shows. One that is
+    /// not up yet is about to come to the front anyway.
+    fn front(&mut self) {
+        if self.ready {
+            self.link.send(wire::Event::Front);
+        }
+    }
+
     /// Shows the window `picture` unless that is what it shows already, and
     /// then the page it was asked for while it was not up yet.
     fn picture(&mut self, picture: &wire::View) {
@@ -148,6 +156,16 @@ impl Windows {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Has the window come to the front as it is, if its process is still
+    /// there. One that is closed stays closed.
+    pub(super) fn front(&mut self, which: Which) {
+        if let Some(window) = self.slot(which).as_mut()
+            && !window.link.has_ended()
+        {
+            window.front();
         }
     }
 

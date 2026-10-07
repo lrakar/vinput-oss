@@ -56,6 +56,17 @@ pub trait Transcriber {
     /// Returns [`Error::Transcription`](crate::Error::Transcription) if the
     /// service fails, or the first error `emit` returns.
     fn finish(&mut self, emit: &mut Emit<'_>) -> Result<()>;
+
+    /// The recognizer's guess at what follows all the text it has settled,
+    /// if it has made a new one since it was last asked: the whole of it,
+    /// in place of the guess before. An empty one withdraws the guess.
+    ///
+    /// Only a recognizer whose guesses are meant to be typed while they may
+    /// still change says anything here; the text is then taken back as far
+    /// as it changes (`inject/live.rs`).
+    fn guess(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Where [`Transcriber::finish`] hands each transcript.
@@ -68,6 +79,10 @@ impl<T: Transcriber + ?Sized> Transcriber for Box<T> {
 
     fn finish(&mut self, emit: &mut Emit<'_>) -> Result<()> {
         (**self).finish(emit)
+    }
+
+    fn guess(&mut self) -> Option<String> {
+        (**self).guess()
     }
 }
 

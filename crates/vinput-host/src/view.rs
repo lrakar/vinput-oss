@@ -12,6 +12,7 @@ use std::time::Duration;
 use vinput_core::audio::Microphone;
 
 use vinput_core::cloud::{AccountInfo, Plan, Prices, Tier};
+use vinput_core::hardware::{self, Fit, Pc};
 use vinput_core::models::{self, EngineState, Model, Status};
 use vinput_core::settings::Settings;
 use vinput_core::stt::ProviderKind;
@@ -57,8 +58,9 @@ pub(crate) struct UpdateFacts<'a> {
 pub(crate) struct ProFacts<'a> {
     /// The address that is signed in.
     pub(crate) email: Option<&'a str>,
-    /// The code of the sign-in under way, empty until the server has
-    /// handed it out, and how many minutes it works for.
+    /// The code of the sign-in under way, which is empty until the server
+    /// has handed it out and stays empty for a sign-in without one, and how
+    /// many minutes the person has: none until the browser was opened.
     pub(crate) signing_in: Option<(&'a str, u32)>,
     /// How the account stood when the server last said.
     pub(crate) info: Option<&'a AccountInfo>,
@@ -112,6 +114,8 @@ pub(crate) struct Facts<'a> {
     pub(crate) graphics_card: Option<&'a str>,
     /// Whether the engine that runs models on a graphics card is installed.
     pub(crate) card_engine: bool,
+    /// What this PC has to run local models with, if that could be found out.
+    pub(crate) pc: Option<&'a Pc>,
     /// Every model in the order to list them, with where each stands.
     pub(crate) models: Vec<(&'static Model, Status)>,
     /// Where the engine the settings ask for stands.
@@ -173,6 +177,7 @@ fn settings(settings: &Settings, graphics_card: bool) -> wire::Settings {
         autostart: settings.autostart,
         ready_sound: settings.ready_sound,
         stop_sound: settings.stop_sound,
+        live_typing: settings.live_typing,
         stop_after_minutes: settings.stop_after_minutes,
         check_updates: settings.check_updates,
         // What the user wants only counts on a PC that has a card.
@@ -220,9 +225,15 @@ fn status(facts: &Facts<'_>) -> wire::Status {
     }
 }
 
-fn model(settings: &Settings, model: &Model, status: &Status) -> wire::Model {
+fn model(settings: &Settings, pc: Option<&Pc>, model: &Model, status: &Status) -> wire::Model {
     let file_bytes = model.bytes();
+    let fit = pc.and_then(|pc| hardware::fit(model, pc, settings.local_gpu));
     wire::Model {
+        fit: fit.map(|fit| match fit {
+            Fit::Well => wire::Fit::Well,
+            Fit::Slow => wire::Fit::Slow,
+            Fit::Heavy => wire::Fit::Heavy,
+        }),
         lacks: model.lacks(&settings.languages),
         knows_none: model.reach(&settings.languages) == 0,
         id: model.id.to_owned(),
@@ -354,6 +365,7 @@ fn pro(all: &Facts<'_>) -> wire::Pro {
             shown.who = wire::ProWho::SigningIn;
             code.clone_into(&mut shown.code);
             shown.code_minutes = minutes;
+            shown.in_browser = minutes > 0;
             return shown;
         }
         (None, None) => return shown,
@@ -409,7 +421,7 @@ pub(crate) fn build(facts: &Facts<'_>) -> wire::View {
             list: facts
                 .models
                 .iter()
-                .map(|(listed, status)| model(facts.settings, listed, status))
+                .map(|(listed, status)| model(facts.settings, facts.pc, listed, status))
                 .collect(),
             disk_bytes: facts.disk_bytes,
             graphics_card: facts.graphics_card.map(str::to_owned),
@@ -458,7 +470,13 @@ mod tests {
 
     use super::*;
 
-    const CARD: &str = "NVIDIA GeForce RTX 3090";
+    const CARD: &str = "NVIDIA GeForce RTX 4070";
+    /// The PC that card is in.
+    const PC: Pc = Pc {
+        card_memory: 24 << 30,
+        memory: 64 << 30,
+        threads: 32,
+    };
 
     fn online() -> &'static Model {
         CATALOG
@@ -523,6 +541,7 @@ mod tests {
             listening: false,
             graphics_card: Some(CARD),
             card_engine: true,
+            pc: Some(&PC),
             models: CATALOG
                 .iter()
                 .map(|model| {
@@ -606,7 +625,15 @@ mod tests {
         let shown = build(&facts).pro;
         assert_eq!(shown.who, wire::ProWho::SigningIn);
         assert_eq!((shown.code.as_str(), shown.code_minutes), ("K7M2QX", 10));
+        assert!(shown.in_browser);
         assert_eq!(shown.email, "");
+        // Before the browser was opened for it, and once it was for a
+        // sign-in that has no code.
+        facts.pro.signing_in = Some(("", 0));
+        assert!(!build(&facts).pro.in_browser);
+        facts.pro.signing_in = Some(("", 10));
+        let shown = build(&facts).pro;
+        assert!(shown.in_browser && shown.code.is_empty());
 
         // Signed in, and the server has not said anything yet.
         facts.pro = ProFacts {
@@ -862,6 +889,40 @@ mod tests {
         assert_eq!(view.memo_dir, r"D:\Memos");
         assert_eq!(view.microphone, "{usb}");
         assert!(!view.graphics_card);
+    }
+
+    #[test]
+    fn a_local_model_says_how_it_would_run_on_this_pc() {
+        let settings = Settings::default();
+        let off = Settings {
+            local_gpu: false,
+            ..Settings::default()
+        };
+        let (mut facts, off) = (facts(&settings), facts(&off));
+        let fits = |facts: &Facts<'_>| -> Vec<Option<wire::Fit>> {
+            let list = build(facts).models.list;
+            list.iter().map(|model| model.fit).collect()
+        };
+        // Every local model runs well on the card; an online one runs elsewhere.
+        let with_card = fits(&facts);
+        for (shown, (model, _)) in with_card.iter().zip(&facts.models) {
+            assert_eq!(*shown, model.local.map(|_| wire::Fit::Well));
+        }
+        // A laptop without a card: some of them are too much for it.
+        let laptop = Pc {
+            card_memory: 0,
+            memory: 8_000_000_000,
+            threads: 4,
+        };
+        facts.pc = Some(&laptop);
+        let on_laptop = fits(&facts);
+        assert!(on_laptop.contains(&Some(wire::Fit::Heavy)));
+        assert!(on_laptop.contains(&Some(wire::Fit::Well)));
+        // A PC that could not be looked over says nothing.
+        facts.pc = None;
+        assert!(fits(&facts).iter().all(Option::is_none));
+        // With the card switched off, the processor is what counts.
+        assert!(fits(&off).contains(&Some(wire::Fit::Slow)));
     }
 
     #[test]

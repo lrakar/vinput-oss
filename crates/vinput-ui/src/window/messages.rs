@@ -8,21 +8,22 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, HDC, PAINTSTRUCT, SetBkColor, SetTextColor,
 };
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::UiaRootObjectId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, EN_CHANGE, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT,
-    IDC_ARROW, IDC_HAND, IDC_IBEAM, IsIconic, KillTimer, LoadCursorW, MINMAXINFO, PostQuitMessage,
-    SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowPos,
-    ShowWindow, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCLBUTTONDOWN,
-    WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE,
-    WM_SIZE, WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER,
-    WM_XBUTTONUP,
+    BringWindowToTop, DefWindowProcW, DestroyWindow, EN_CHANGE, GWLP_USERDATA, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowThreadProcessId, HTCLIENT, IDC_ARROW, IDC_HAND, IDC_IBEAM,
+    IsIconic, KillTimer, LoadCursorW, MINMAXINFO, PostQuitMessage, SW_RESTORE, SWP_NOACTIVATE,
+    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, WM_ACTIVATE, WM_CHAR,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_GETOBJECT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_PAINT,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR,
+    WM_SYSCOLORCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_THEMECHANGED, WM_TIMER, WM_XBUTTONUP,
 };
 
 use crate::a11y;
@@ -335,6 +336,39 @@ pub(super) unsafe extern "system" fn proc(
     handled.unwrap_or_else(default)
 }
 
+/// Brings the window in front of every other and gives it the keyboard.
+///
+/// Windows grants that only to the program the person is using, and lets
+/// any other merely flash its button on the taskbar. When this window is
+/// asked forward the person is often somewhere else: in the browser, where
+/// they have just signed in. So where the plain request is not granted, it
+/// is made again as part of the input queue of the window that is in front,
+/// which is allowed to hand the foreground on.
+///
+/// # Safety
+///
+/// `hwnd` must be a live window of the calling thread.
+unsafe fn take_foreground(hwnd: HWND) {
+    // SAFETY: `hwnd` is live and of this thread, as the caller promises;
+    // the other calls take any window or thread, gone or not.
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+        let front = GetForegroundWindow();
+        if front == hwnd || front.is_invalid() {
+            return;
+        }
+        let (ours, theirs) = (GetCurrentThreadId(), GetWindowThreadProcessId(front, None));
+        if theirs == 0 || theirs == ours {
+            return;
+        }
+        if AttachThreadInput(ours, theirs, true).as_bool() {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+    }
+}
+
 /// Does what must be done outside any borrow of the host, because it sends
 /// the window messages of its own or calls back into it: destroying the
 /// window, bringing it to the front, fitting it to what it says, telling
@@ -359,7 +393,7 @@ fn outside(hwnd: HWND, host: &RefCell<Host>, message: u32) -> Option<LRESULT> {
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
-                let _ = SetForegroundWindow(hwnd);
+                take_foreground(hwnd);
             }
         }
         APP_FIT => {

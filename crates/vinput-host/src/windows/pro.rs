@@ -34,11 +34,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+use super::children::Which;
 use super::tray::About;
 use super::{Host, PRO_HEARD};
 use crate::view::{ProDoing, ProFacts};
 use crate::win::{is_page, open};
-use vinput_core::cloud::{self, Account, AccountInfo, Failure, Plan, Prices, Reason, SignIn, Tier};
+use vinput_core::cloud::{self, Account, AccountInfo, Failure, Plan, Prices, Reason, Tier};
 use vinput_core::session::Controller;
 use vinput_core::settings::Settings;
 use vinput_core::stt::{ProviderKind, Standby};
@@ -70,8 +71,13 @@ const STOP_STEP: Duration = Duration::from_millis(100);
 /// What a thread that asked the server leaves for the loop.
 #[derive(Debug)]
 enum Report {
-    /// A sign-in was started: the page to open and the code to show.
-    SignInStarted(SignIn),
+    /// A sign-in was started: the page to open, the code to show if it
+    /// has one, and how many minutes the person has.
+    SignInStarted {
+        address: String,
+        code: String,
+        minutes: u32,
+    },
     /// The sign-in was finished in the browser; this address signed in.
     SignedIn(String),
     /// The sign-in came to nothing.
@@ -107,6 +113,9 @@ enum Effect {
     /// Ask the server how the account stands; `true` if the page shows
     /// that it is being asked.
     Ask(bool),
+    /// Bring the Settings window to the front, if it is open: the person
+    /// is in the browser, and what they did there is done.
+    Front,
     /// The payment that was waited for has arrived: dictate with Pro.
     Paid,
 }
@@ -153,8 +162,9 @@ pub(super) struct Pro {
     session: u64,
     /// The address that is signed in.
     email: Option<String>,
-    /// The sign-in under way: its code, once the server has handed it out,
-    /// how many minutes that works for, and what calls it off.
+    /// The sign-in under way: its code, if the server has handed one out,
+    /// how many minutes the person has once the browser was opened for it,
+    /// and what calls it off.
     signing_in: Option<(String, u32, Arc<AtomicBool>)>,
     /// How the account stood when the server last said, and when that was.
     info: Option<(AccountInfo, Instant)>,
@@ -416,15 +426,26 @@ impl Pro {
             };
         }
         match report {
-            Report::SignInStarted(sign_in) => {
-                let Some((code, minutes, _)) = &mut self.signing_in else {
+            Report::SignInStarted {
+                address,
+                code,
+                minutes,
+            } => {
+                let Some(waiting) = &mut self.signing_in else {
                     return Vec::new();
                 };
-                code.clone_from(&sign_in.confirm_code);
-                *minutes = sign_in.minutes();
-                vec![Effect::OpenSignIn(sign_in.verification_url)]
+                // Never none, which is how a sign-in that has not opened
+                // the browser yet is told.
+                (waiting.0, waiting.1) = (code, minutes.max(1));
+                vec![Effect::OpenSignIn(address)]
             }
-            Report::SignedIn(email) => self.signed_in(email),
+            Report::SignedIn(email) => {
+                // The person is looking at the browser, where there is
+                // nothing more to do.
+                let mut effects = self.signed_in(email);
+                effects.push(Effect::Front);
+                effects
+            }
             Report::SignInFailed(failure) => {
                 self.signing_in = None;
                 self.problem = Some(words(&failure)).filter(|words| !words.is_empty());
@@ -553,6 +574,7 @@ fn words(failure: &Failure) -> String {
         Failure::Expired => {
             "The sign-in was not finished in time. Start it again when you are ready.".to_owned()
         }
+        Failure::Browser(why) => (*why).to_owned(),
         Failure::Stopped => String::new(),
     }
 }
@@ -654,7 +676,11 @@ impl Host {
                 Ok(sign_in) => sign_in,
                 Err(failure) => return reporter.send(Report::SignInFailed(failure)),
             };
-            reporter.send(Report::SignInStarted(sign_in.clone()));
+            reporter.send(Report::SignInStarted {
+                address: sign_in.verification_url.clone(),
+                code: sign_in.confirm_code.clone(),
+                minutes: sign_in.minutes(),
+            });
             reporter.send(match account.finish_sign_in(&sign_in, &stop) {
                 Ok(email) => Report::SignedIn(email),
                 Err(failure) => Report::SignInFailed(failure),
@@ -864,6 +890,7 @@ impl Host {
                 }
             }
             Effect::Ask(shown) => self.pro_ask(shown),
+            Effect::Front => self.windows.front(Which::Settings),
             Effect::Paid => self.pro_paid(controller),
         }
     }
@@ -1359,11 +1386,35 @@ mod tests {
         assert!(pro.signing_in.is_none() && pro.problem.is_some());
         assert!(!stop.load(Ordering::Relaxed));
 
+        // The browser is opened for it, with a code to show or without.
+        for (code, minutes, shown) in [("K7M2QX", 10, 10), ("", 10, 10), ("", 0, 1)] {
+            assert!(pro.begin_sign_in().is_some());
+            let started = Report::SignInStarted {
+                address: "https://cloud.example.com/v1/auth/app/start?port=50123".into(),
+                code: code.into(),
+                minutes,
+            };
+            let effects = told(&mut pro, vec![started]);
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::OpenSignIn(address)] if address.contains("/v1/auth/app/start")
+            ));
+            assert_eq!(pro.facts().signing_in, Some((code, shown)));
+            // What the browser said is what the page says.
+            let failed = Report::SignInFailed(Failure::Browser("Not this time."));
+            assert!(told(&mut pro, vec![failed]).is_empty());
+            assert_eq!(pro.problem.as_deref(), Some("Not this time."));
+        }
+
         // Finished in the browser.
         assert!(pro.begin_sign_in().is_some());
         assert_eq!(pro.problem, None);
         let effects = told(&mut pro, vec![Report::SignedIn("ana@example.com".into())]);
-        assert_eq!(effects, [Effect::Reconnect, Effect::Ask(true)]);
+        // The window comes forward: the person is still in the browser.
+        assert_eq!(
+            effects,
+            [Effect::Reconnect, Effect::Ask(true), Effect::Front]
+        );
         assert_eq!(pro.email.as_deref(), Some("ana@example.com"));
         // Signed in: no second sign-in.
         assert!(pro.begin_sign_in().is_none());

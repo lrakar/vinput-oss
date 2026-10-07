@@ -222,6 +222,7 @@ pub(crate) fn apply(
         Change::Autostart(on) => put(&mut settings.autostart, on, Follow::Autostart),
         Change::ReadySound(on) => put(&mut settings.ready_sound, on, Follow::Nothing),
         Change::StopSound(on) => put(&mut settings.stop_sound, on, Follow::Nothing),
+        Change::LiveTyping(on) => put(&mut settings.live_typing, on, Follow::Nothing),
         Change::StopAfterSilence(minutes) if !STOP_AFTER_MINUTES.contains(&minutes) => {
             Applied::Unchanged
         }
@@ -425,6 +426,7 @@ mod tests {
             (Change::Autostart(false), Follow::Autostart),
             (Change::ReadySound(false), Follow::Nothing),
             (Change::StopSound(false), Follow::Nothing),
+            (Change::LiveTyping(false), Follow::Nothing),
             (Change::StopAfterSilence(5), Follow::Nothing),
             (Change::CheckUpdates(false), Follow::UpdateTimer),
             (Change::GraphicsCard(false), Follow::Engine),
@@ -441,7 +443,7 @@ mod tests {
             assert_eq!(made(&mut settings, change), Applied::Unchanged);
         }
         assert!(!settings.autostart && !settings.ready_sound && !settings.check_updates);
-        assert!(!settings.stop_sound);
+        assert!(!settings.stop_sound && !settings.live_typing);
         assert_eq!(settings.stop_after_minutes, 5);
         // A time that is not on offer changes nothing.
         assert_eq!(

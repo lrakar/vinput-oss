@@ -20,6 +20,13 @@
 //! thread of its own, for as long as the indicator follows the caret; this
 //! thread only takes the last answer, so nothing here waits for another
 //! program beyond the few milliseconds the first frame gives it.
+//!
+//! Being a topmost window does not keep the indicator on top for good. In a
+//! Vinput that has run for a while, Windows is found to have let it sink
+//! below the windows used since, while it still says it is topmost: it was
+//! shown where it belonged and nobody saw it. So the indicator is put back
+//! above every other window each time it is shown, and again if the window
+//! being dictated into gets above it while it shows.
 #![allow(unsafe_code)]
 #![allow(
     clippy::cast_possible_truncation,
@@ -42,8 +49,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RegGetValueW};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GWLP_USERDATA, GetForegroundWindow, GetWindowLongPtrW,
-    KillTimer, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer, SetWindowLongPtrW, ShowWindow, ULW_ALPHA,
+    CreateWindowExW, DestroyWindow, GW_HWNDPREV, GWLP_USERDATA, GetForegroundWindow, GetWindow,
+    GetWindowLongPtrW, HWND_TOPMOST, KillTimer, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA,
     UpdateLayeredWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -96,6 +104,10 @@ const FINISH_LIMIT: u32 = 900;
 /// and how many redraws that takes.
 const LEAVE_MS: u32 = 16;
 const LEAVE_STEPS: f32 = 7.0;
+/// How many windows above the indicator are looked at, at most, to find out
+/// whether the one being dictated into is among them. The indicator belongs
+/// at the very top, so one that has not sunk has only a handful above it.
+const MOST_ABOVE: usize = 256;
 
 /// Where an indicator sits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,11 +413,21 @@ impl State {
                 &raw const blend,
                 ULW_ALPHA,
             );
-            if !self.visible {
-                ShowWindow(self.window.0, SW_SHOWNOACTIVATE);
-            }
+        }
+        if !self.visible {
+            self.window.show();
         }
         self.visible = true;
+    }
+
+    /// Puts an indicator that is showing back on top, if the window in the
+    /// foreground has got above it. A hidden one is put on top when shown.
+    fn surface_again(&self) {
+        // SAFETY: no arguments.
+        let foreground = unsafe { GetForegroundWindow() };
+        if self.visible && self.window.is_under(foreground) {
+            self.window.show();
+        }
     }
 
     /// Finds out again where the indicator goes, as far as that takes no
@@ -414,6 +436,7 @@ impl State {
     /// has the caret looked for, and [`State::follow`] takes the answer when
     /// it is there; without a thread to look, it goes by the window.
     fn look(&mut self) {
+        self.surface_again();
         if self.placement == Placement::Screen {
             // SAFETY: no arguments.
             let monitor = monitor_of_window(unsafe { GetForegroundWindow() });
@@ -713,6 +736,46 @@ impl Window {
         }
         Ok(Self(hwnd))
     }
+
+    /// Shows the window above every other one, topmost ones included,
+    /// without giving it the focus. `ShowWindow` would show it wherever it
+    /// is among the other windows, which for a window that has sunk is
+    /// behind the one being dictated into.
+    fn show(&self) {
+        // SAFETY: the window is live; neither its place nor its size, which
+        // `UpdateLayeredWindow` sets, is touched.
+        unsafe {
+            SetWindowPos(
+                self.0,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    /// Whether `other` is above this window, and so covers it where the two
+    /// overlap. No window, or this one itself, is not.
+    fn is_under(&self, other: HWND) -> bool {
+        if other.is_null() || other == self.0 {
+            return false;
+        }
+        let mut above = self.0;
+        for _ in 0..MOST_ABOVE {
+            // SAFETY: a plain query; a window that has gone gives null.
+            above = unsafe { GetWindow(above, GW_HWNDPREV) };
+            if above.is_null() {
+                return false;
+            }
+            if above == other {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl Drop for Window {
@@ -812,6 +875,8 @@ impl Drop for Surface {
 
 #[cfg(test)]
 mod tests {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, IsWindowVisible};
+
     use super::*;
 
     const WORK: Rect = Rect {
@@ -917,6 +982,79 @@ mod tests {
             assert!(now > last);
             last = now;
         }
+    }
+
+    /// A window like any program's: hidden, and not topmost.
+    fn plain_window() -> Result<Window> {
+        let class = wide("STATIC");
+        // SAFETY: the class name is NUL-terminated; the window is never shown.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            )
+        };
+        if hwnd.is_null() {
+            return Err(last_error("creating a window to test with"));
+        }
+        Ok(Window(hwnd))
+    }
+
+    fn is_topmost(window: &Window) -> bool {
+        // SAFETY: the window is live.
+        let styles = unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) };
+        styles as u32 & WS_EX_TOPMOST != 0
+    }
+
+    #[test]
+    fn an_indicator_that_sank_behind_another_window_is_shown_above_it() -> Result<()> {
+        // Nothing of this is seen: neither window has a size, and a layered
+        // window that was never drawn into shows nothing.
+        let other = plain_window()?;
+        let indicator = Window::new()?;
+        assert!(is_topmost(&indicator) && !indicator.is_under(other.0));
+        // It sinks behind the window of another program.
+        // SAFETY: both windows are live; only the order of the two changes.
+        unsafe {
+            SetWindowPos(
+                indicator.0,
+                other.0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        assert!(indicator.is_under(other.0));
+        // SAFETY: no arguments.
+        let foreground = unsafe { GetForegroundWindow() };
+        indicator.show();
+        // Shown, it is above that window again, and topmost, and the
+        // program being dictated into still has the keyboard.
+        assert!(!indicator.is_under(other.0));
+        assert!(is_topmost(&indicator));
+        // SAFETY: plain queries on a live window.
+        unsafe {
+            assert_ne!(IsWindowVisible(indicator.0), 0);
+            assert_eq!(GetForegroundWindow(), foreground);
+        }
+        // Whatever is above it now, it is not that window, however often
+        // it is asked; and no window at all covers nothing.
+        assert!(!indicator.is_under(null_mut()));
+        assert!(!indicator.is_under(indicator.0));
+        assert!(other.is_under(indicator.0));
+        Ok(())
     }
 
     #[test]

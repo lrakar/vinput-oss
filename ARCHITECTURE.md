@@ -114,7 +114,7 @@ vinput.exe ui <window>             exists only while a window is open
 | `windows/updates.rs` | Update check, download and hand-over to setup |
 | `windows/pro.rs` | VinPUT Pro: every request to its server on a thread of its own, which wakes the loop with `PRO_HEARD`; the wait for a payment made in the browser, which a busy server does not end and which always says when it is over |
 | `windows/google.rs` | The setup of a Google service of one's own: its steps, what was entered and not kept yet, and each question to Google, and the reading of a key file, on a thread of its own, which leaves its answer in a queue and wakes the loop with `GOOGLE_CHECKED`. An answer nobody waits for any more (a newer question, the page left, the window closed) is dropped. Nothing is kept or put to use before the user finishes the setup |
-| `indicator.rs`, `draw.rs` | The listening indicator: a layered window, its phases and where it goes; the picture in it |
+| `indicator.rs`, `draw.rs` | The listening indicator: a layered window, its phases and where it goes, put back above every other window each time it is shown; the picture in it |
 | `caret.rs` | Where the text caret is. The lookup asks the foreground program, so it runs on a thread of its own (`Watch`) and never on the loop's |
 | `link.rs` | The line to one window process: two threads, a queue, never blocks the loop |
 | `change.rs`, `view.rs`, `finder.rs` | Pure rules: one changed setting, drawing a `View`, the search for a model to add |

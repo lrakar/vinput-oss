@@ -1,5 +1,13 @@
 [
   {
+    "version": "0.4.5",
+    "published": "2026-10-07",
+    "notes": [
+      "The listening indicator shows under the caret again after VinPUT has been running for a while",
+      "It stays above the window you dictate into, also when you switch windows while dictating"
+    ]
+  },
+  {
     "version": "0.4.4",
     "published": "2026-10-06",
     "notes": [

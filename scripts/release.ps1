@@ -41,6 +41,9 @@ $target = Join-Path $root "target\dist"
 # .cargo\config.toml links the C runtime into the executable; a RUSTFLAGS
 # variable left over in this shell would replace those flags.
 Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+# The address of the VinPUT Pro server is built in from VINPUT_SERVER; the
+# source names none (crates\vinput-core\src\cloud.rs).
+if (-not $env:VINPUT_SERVER) { throw "set VINPUT_SERVER to the address of the VinPUT Pro server" }
 cargo build --release --locked -p vinput --target-dir $target
 if ($LASTEXITCODE -ne 0) { throw "the build failed" }
 $built = Join-Path $target "release\vinput.exe"

@@ -78,6 +78,7 @@ const BUILT_IN: [Offer; 2] = [
         first: 0,
         yearly: 2400,
         cap_seconds: 8 * 3600,
+        trial_days: 0,
     },
     Offer {
         tier: Tier::Pro,
@@ -85,6 +86,7 @@ const BUILT_IN: [Offer; 2] = [
         first: 0,
         yearly: 4900,
         cap_seconds: 25 * 3600,
+        trial_days: 0,
     },
 ];
 
@@ -470,6 +472,10 @@ pub struct Subscription {
 
 /// What the server knows about the account.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts the server tells"
+)]
 pub struct AccountInfo {
     /// The Google address that is signed in.
     pub email: String,
@@ -494,6 +500,9 @@ pub struct AccountInfo {
     /// Whether the account would pay the price of a first month, as someone
     /// new does. An answer that does not say is one that would not.
     pub intro_eligible: bool,
+    /// Whether a first subscription to a tier with a free trial would start
+    /// with it. An answer that does not say is one that would not.
+    pub trial_eligible: bool,
 }
 
 impl AccountInfo {
@@ -545,6 +554,7 @@ fn parse_account(answer: &Value) -> Option<AccountInfo> {
         resets_at: usage["resets_at"].as_u64().unwrap_or(0),
         complimentary: answer["complimentary"].as_bool().unwrap_or(false),
         intro_eligible: answer["intro_eligible"].as_bool().unwrap_or(false),
+        trial_eligible: answer["trial_eligible"].as_bool().unwrap_or(false),
     })
 }
 
@@ -562,6 +572,9 @@ pub struct Offer {
     pub yearly: u32,
     /// Seconds of speech a month comes with.
     pub cap_seconds: u64,
+    /// How many days free a first subscription starts with; zero where
+    /// there is no trial.
+    pub trial_days: u32,
 }
 
 /// What the tiers cost and what a month of each comes with.
@@ -623,6 +636,7 @@ fn parse_prices(answer: &Value) -> Option<Prices> {
             first: first.unwrap_or(0),
             yearly: amount(yearly)?,
             cap_seconds: cap.unwrap_or(built_in.cap_seconds),
+            trial_days: trial_days(monthly),
         });
     }
     (!offers.is_empty()).then(|| Prices {
@@ -630,6 +644,16 @@ fn parse_prices(answer: &Value) -> Option<Prices> {
         currency: currency.to_ascii_lowercase(),
         open: answer["checkout_open"] != false,
     })
+}
+
+/// The days of free trial an offer names: a whole number of days up to a
+/// month, or none. Anything else is not what the app says about it.
+fn trial_days(offer: &Value) -> u32 {
+    offer["trial_days"]
+        .as_u64()
+        .and_then(|days| u32::try_from(days).ok())
+        .filter(|days| (1..=31).contains(days))
+        .unwrap_or(0)
 }
 
 /// The name of this PC, for the list of the account's sessions on the
@@ -1788,6 +1812,7 @@ mod tests {
             first: 0,
             yearly,
             cap_seconds,
+            trial_days: 0,
         };
         let built_in = Prices::default();
         assert_eq!(
@@ -1947,6 +1972,40 @@ mod tests {
     }
 
     #[test]
+    fn a_free_trial_is_the_servers_or_there_is_none() {
+        assert!(BUILT_IN.iter().all(|offer| offer.trial_days == 0));
+        let said = |days: Value| {
+            let prices = parse_prices(&json!({"plans": [
+                {"tier": "plus", "plan": "monthly", "amount": 250, "currency": "eur"},
+                {"tier": "plus", "plan": "yearly", "amount": 2400, "currency": "eur"},
+                {"tier": "pro", "plan": "monthly", "amount": 500, "currency": "eur",
+                    "trial_days": days},
+                {"tier": "pro", "plan": "yearly", "amount": 4900, "currency": "eur"},
+            ]}));
+            let offers = prices.map(|prices| prices.offers).unwrap_or_default();
+            (offers[0].trial_days, offers[1].trial_days)
+        };
+        assert_eq!(said(json!(7)), (0, 7));
+        for nothing in [Value::Null, json!(0), json!(-7), json!("7"), json!(400)] {
+            assert_eq!(said(nothing.clone()), (0, 0), "{nothing}");
+        }
+        // Whether this account would get it is the server's to say too.
+        for (said, eligible) in [
+            (json!(true), true),
+            (json!("yes"), false),
+            (Value::Null, false),
+        ] {
+            let account = parse_account(&json!({
+                "email": "ana@example.com", "entitled": false, "trial_eligible": said
+            }));
+            assert_eq!(
+                account.map(|account| account.trial_eligible),
+                Some(eligible)
+            );
+        }
+    }
+
+    #[test]
     fn the_token_requests_are_what_the_server_takes() {
         let device: Value = serde_json::from_str(&device_request("dev")).unwrap_or_default();
         assert_eq!(
@@ -2034,6 +2093,7 @@ mod tests {
             resets_at: 0,
             complimentary: false,
             intro_eligible: false,
+            trial_eligible: false,
         };
         assert_eq!(account, Some(plain.clone()));
         assert!(!plain.at_no_charge());

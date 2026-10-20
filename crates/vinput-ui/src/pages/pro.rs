@@ -14,7 +14,7 @@ use vinput_view::{
 
 use super::common::{
     DOT, ProTrouble, date, day, fraction, hours_low, least_a_month, least_first, notice_bar, owing,
-    price, pro_in_use, pro_trouble,
+    price, pro_in_use, pro_trial, pro_trouble,
 };
 use crate::node::{
     Action, ButtonKind, Content, Icon, Node, Severity, TextStyle, Tone, accent_button, badge,
@@ -30,6 +30,15 @@ const SAME: &str = "Both use the same recognition. When the month's hours run ou
 /// have one: what is paid afterwards, and for how long.
 const INTRO: &str = "The first month is at the introductory price. After that the regular price \
                      applies until you cancel.";
+
+/// What the free trial means, said once under the tiers when Pro has one
+/// for whoever is looking. `{days}` is the number of days.
+fn trial_note(days: u32) -> String {
+    format!(
+        "Pro starts with {days} free days. Nothing is charged until they end, and if you cancel \
+         before then you pay nothing."
+    )
+}
 
 /// The way to a model for the time the hours are used up, for someone who
 /// has none on this PC.
@@ -129,9 +138,10 @@ fn pitch(pro: &Pro, with_prices: bool, control: Option<Node>) -> Node {
     let mut about = setting(Icon::Star, "Dictate with VinPUT Pro").below(bullets(points));
     if with_prices {
         let from = least_a_month(pro);
-        about = about.detail(match least_first(pro) {
-            Some(first) => format!("From {first} for the first month, then from {from}"),
-            None => format!("From {from}"),
+        about = about.detail(match (pro_trial(pro), least_first(pro)) {
+            (Some(days), _) => format!("Try Pro free for {days} days, then from {from}"),
+            (None, Some(first)) => format!("From {first} for the first month, then from {from}"),
+            (None, None) => format!("From {from}"),
         });
     }
     if let Some(control) = control {
@@ -415,6 +425,9 @@ fn plans(pro: &Pro) -> Vec<Node> {
             let first = price(offer.first, &pro.currency);
             comes_with = format!("{comes_with}{DOT}first month {first}");
         }
+        if pro.open && offer.trial_days > 0 {
+            comes_with = format!("{comes_with}{DOT}first {} days free", offer.trial_days);
+        }
         rows.push(
             plain_setting(tier_name(offer.tier))
                 .indented()
@@ -440,6 +453,9 @@ fn plans(pro: &Pro) -> Vec<Node> {
         paying.insert_str(0, "Paid by the year, two months are free. ");
     }
     let mut page = vec![pitch(pro, false, None), header("Choose a plan"), card(rows)];
+    if let Some(days) = pro_trial(pro) {
+        page.push(note(trial_note(days)));
+    }
     if least_first(pro).is_some() {
         page.push(note(INTRO));
     }
@@ -820,6 +836,37 @@ mod tests {
         view.pro.offers[0].monthly = 250;
         view.pro.currency = "usd".to_owned();
         assert!(Seen::of(&content(&view).body).says("From $2.50 a month"));
+    }
+
+    #[test]
+    fn a_free_trial_of_pro_is_said_beside_its_hours_and_once_under_the_tiers() {
+        let plain = seen("pro-not-subscribed");
+        let view = scene("pro-trial");
+        let seen = Seen::of(&content(&view).body);
+        // The buttons stay what a month and a year cost, and lead where
+        // they led.
+        assert_eq!(seen.labels(), plain.labels());
+        assert_eq!(seen.commands(), plain.commands());
+        let detail = detail_of(&view, "Pro").map(|(detail, _)| detail);
+        assert_eq!(
+            detail.as_deref(),
+            Some("25 hours of dictation a month \u{b7} first 7 days free")
+        );
+        // Plus has no trial.
+        let plus = detail_of(&view, "Plus").map(|(detail, _)| detail);
+        assert!(plus.is_some_and(|plus| !plus.contains("free")));
+        let note = trial_note(7);
+        assert_eq!(seen.texts.iter().filter(|text| **text == note).count(), 1);
+        assert!(note.contains("Nothing is charged until they end"));
+        assert!(!plain.says("free days") && !plain.says("days free"));
+
+        // Someone signed out reads it in the pitch.
+        let seen = self::seen("pro-trial-signed-out");
+        assert!(seen.says("Try Pro free for 7 days, then from \u{20ac}2.50 a month"));
+        // Not while subscribing is not open.
+        let mut view = scene("pro-trial-signed-out");
+        view.pro.open = false;
+        assert!(!Seen::of(&content(&view).body).says("free for"));
     }
 
     #[test]

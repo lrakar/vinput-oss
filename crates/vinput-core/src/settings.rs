@@ -113,6 +113,10 @@ pub struct Settings {
     /// it does, and cleared once they have chosen a model or said later.
     /// A file that does not say has it off, so an update never shows it.
     pub first_run: bool,
+    /// How many dictations a model on this PC has typed, counted up to the
+    /// one after which `VinPUT` Pro is mentioned once, and no further. It
+    /// stays in this file and is never sent anywhere.
+    pub local_dictations: u32,
     /// The dictionary, the snippets, and whether spoken formatting is
     /// listened for; see [`crate::words`].
     pub words: Words,
@@ -155,6 +159,7 @@ impl Default for Settings {
             search_url: search::DEFAULT_TEMPLATE.to_owned(),
             last_local_model: String::new(),
             first_run: false,
+            local_dictations: 0,
             words: Words::default(),
             actions: Vec::new(),
             extra: Vec::new(),
@@ -262,6 +267,7 @@ impl Settings {
                 }
                 "last_local_model" => value.clone_into(&mut settings.last_local_model),
                 "first_run" => settings.first_run = flag(),
+                "local_dictations" => settings.local_dictations = value.parse().unwrap_or(0),
                 "action" if settings.actions.len() < actions::MAX_ACTIONS => {
                     settings.actions.extend(Action::parse(value));
                 }
@@ -345,6 +351,12 @@ impl Settings {
                 "first_run = true
 ",
             );
+        }
+        // Likewise written only once there is something to count.
+        if self.local_dictations > 0 {
+            text.push_str("local_dictations = ");
+            text.push_str(&self.local_dictations.to_string());
+            text.push('\n');
         }
         for (key, value) in &self.extra {
             text.push_str(key);
@@ -631,6 +643,7 @@ mod tests {
             search_url: "https://duckduckgo.com/?q=%s".into(),
             last_local_model: "whisper-base".into(),
             first_run: true,
+            local_dictations: 0,
             words,
             actions: vec![
                 Action::default(),
@@ -847,6 +860,23 @@ model =
         assert!(!Settings::load_from(&path, &[]).first_run);
         assert!(std::fs::read_to_string(&path).is_ok_and(|text| !text.contains("first_run")));
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_count_of_local_dictations_is_kept_and_written_only_once_there_is_one() {
+        let plain = Settings::default();
+        assert!(!plain.serialize().contains("local_dictations"));
+        let counted = Settings {
+            local_dictations: 12,
+            ..Settings::default()
+        };
+        let text = counted.serialize();
+        assert!(text.contains("local_dictations = 12\n"), "{text}");
+        assert_eq!(Settings::parse(&text).local_dictations, 12);
+        // What cannot be read starts the count again, and is not kept.
+        let odd = Settings::parse("local_dictations = many\n");
+        assert_eq!(odd.local_dictations, 0);
+        assert!(odd.extra.is_empty());
     }
 
     #[test]

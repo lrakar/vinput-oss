@@ -204,6 +204,11 @@ pub trait Controller {
     fn take_said(&mut self) -> Vec<Said> {
         Vec::new()
     }
+    /// How many dictations a model on this PC typed something for since the
+    /// last call. Counted on this PC only.
+    fn take_local_dictations(&mut self) -> u32 {
+        0
+    }
     /// Takes what sessions have left behind since the last call.
     fn take_outcomes(&mut self) -> Vec<Outcome>;
     /// Applies changed settings to future sessions. With `reconnect`, the

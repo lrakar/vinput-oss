@@ -532,6 +532,7 @@ impl Host {
         };
         self.report(title, left.outcomes, &left.failures);
         self.pro_after_session();
+        self.count_local_dictations(controller.take_local_dictations());
         self.hold_session_keys(controller);
     }
 

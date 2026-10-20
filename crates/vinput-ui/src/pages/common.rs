@@ -4,7 +4,7 @@
 // A program without Vinput's pages uses only some of what is here.
 #![cfg_attr(not(feature = "vinput"), allow(dead_code, unused_imports))]
 
-use vinput_view::{Change, Command, NoticeKind, PRO_MODEL, Page, Pro, ProWho, View};
+use vinput_view::{Change, Command, NoticeKind, PRO_MODEL, Page, Pro, ProTier, ProWho, View};
 
 use crate::node::{
     Action, Icon, Node, Severity, TextStyle, Tone, card, header, human_size, setting, styled,
@@ -150,6 +150,13 @@ pub(super) fn least_a_month(pro: &Pro) -> String {
         "{} a month",
         price(least.unwrap_or_default(), &pro.currency)
     )
+}
+
+/// How many days free Pro starts with for whoever is looking, where the
+/// server offers them a trial and Pro can be subscribed to now.
+pub(super) fn pro_trial(pro: &Pro) -> Option<u32> {
+    let offer = pro.offers.iter().find(|offer| offer.tier == ProTier::Pro)?;
+    (pro.open && offer.trial_days > 0).then_some(offer.trial_days)
 }
 
 /// The least a first month costs, where the server has a price for it that

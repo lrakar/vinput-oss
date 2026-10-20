@@ -986,6 +986,57 @@ impl Host {
             page: Page::Pro,
         });
     }
+
+    /// Counts dictations that a model on this PC typed, `more` of them
+    /// since the last time, and at the [`MENTION_AFTER`]th says once what
+    /// `VinPUT` Pro adds. Only the count is kept, in the settings file on
+    /// this PC; nothing about it is sent anywhere. Once it is reached it is
+    /// never counted or said again.
+    pub(super) fn count_local_dictations(&mut self, more: u32) {
+        let before = self.settings.local_dictations;
+        if more == 0 || before >= MENTION_AFTER {
+            return;
+        }
+        self.settings.local_dictations = before.saturating_add(more).min(MENTION_AFTER);
+        if self.settings.local_dictations == MENTION_AFTER
+            && let Some((title, text)) = self.pro.mention()
+        {
+            // Without a sound: it asks for nothing.
+            self.tray.mention(About::Settings(Page::Pro), title, &text);
+        }
+        self.persist();
+    }
+}
+
+/// After how many dictations with a model on this PC `VinPUT` Pro is
+/// mentioned, the one time it is.
+pub(super) const MENTION_AFTER: u32 = 50;
+
+impl Pro {
+    /// What is said, the one time it is, to someone who dictates with a
+    /// model on this PC: what Pro adds, and the free trial where the server
+    /// offers one to them. Nothing for someone who has Pro already.
+    fn mention(&self) -> Option<(&'static str, String)> {
+        let info = self.info.as_ref().map(|(info, _)| info);
+        if info.is_some_and(|info| info.entitled || info.complimentary) {
+            return None;
+        }
+        let pro = self
+            .prices
+            .offers
+            .iter()
+            .find(|offer| offer.tier == Tier::Pro);
+        let days = pro.map_or(0, |offer| offer.trial_days);
+        // Signed out, anyone may be new; signed in, the server says.
+        let theirs = self.email.is_none() || info.is_some_and(|info| info.trial_eligible);
+        let pitch = "VinPUT Pro types while you talk, in more than 60 languages.";
+        let text = if days > 0 && theirs && self.prices.open {
+            format!("{pitch} Try it free for {days} days.")
+        } else {
+            format!("{pitch} Click to see the plans.")
+        };
+        Some(("Want live text as you speak?", text))
+    }
 }
 
 #[cfg(test)]
@@ -1021,6 +1072,7 @@ mod tests {
             resets_at: 0,
             complimentary: false,
             intro_eligible: false,
+            trial_eligible: false,
         }
     }
 
@@ -1705,5 +1757,47 @@ mod tests {
         assert!(partly.ends_with("What was said just before the switch may be missing."));
         // Short enough for a notification.
         assert!(partly.chars().count() < 200);
+    }
+
+    #[test]
+    fn pro_is_mentioned_once_with_the_trial_only_where_it_is_theirs() {
+        let mut signed_out = pro(None);
+        let (title, text) = signed_out.mention().unwrap_or_default();
+        assert_eq!(title, "Want live text as you speak?");
+        // The built-in prices know of no trial: none is promised.
+        assert!(text.ends_with("Click to see the plans."), "{text}");
+        for offer in &mut signed_out.prices.offers {
+            if offer.tier == Tier::Pro {
+                offer.trial_days = 7;
+            }
+        }
+        let (_, text) = signed_out.mention().unwrap_or_default();
+        assert!(text.ends_with("Try it free for 7 days."), "{text}");
+        // Not while subscribing is not open.
+        signed_out.prices.open = false;
+        let (_, text) = signed_out.mention().unwrap_or_default();
+        assert!(!text.contains("free"), "{text}");
+        signed_out.prices.open = true;
+
+        // Signed in, only on the server's word.
+        let mut signed_in = pro(Some("ana@example.com"));
+        signed_in.prices = signed_out.prices.clone();
+        let (_, text) = signed_in.mention().unwrap_or_default();
+        assert!(!text.contains("free"), "{text}");
+        signed_in.info = Some((info(false), Instant::now()));
+        let (_, text) = signed_in.mention().unwrap_or_default();
+        assert!(!text.contains("free"), "{text}");
+        let new = AccountInfo {
+            trial_eligible: true,
+            ..info(false)
+        };
+        signed_in.info = Some((new, Instant::now()));
+        let (_, text) = signed_in.mention().unwrap_or_default();
+        assert!(text.ends_with("Try it free for 7 days."), "{text}");
+        // And never to someone who has Pro.
+        signed_in.info = Some((info(true), Instant::now()));
+        assert_eq!(signed_in.mention(), None);
+        // Short enough for a notification.
+        assert!(text.chars().count() < 200);
     }
 }

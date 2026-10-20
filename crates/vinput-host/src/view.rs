@@ -477,6 +477,8 @@ fn pro(all: &Facts<'_>) -> wire::Pro {
     // The price of a first month is for someone new: whoever is signed out
     // may be, and of an account the server says.
     let new = facts.email.is_none() || facts.info.is_some_and(|info| info.intro_eligible);
+    // And so is a free trial, which the server says of an account apart.
+    let trial = facts.email.is_none() || facts.info.is_some_and(|info| info.trial_eligible);
     let mut shown = wire::Pro {
         doing: facts.doing,
         problem: facts.problem.map(str::to_owned),
@@ -487,6 +489,7 @@ fn pro(all: &Facts<'_>) -> wire::Pro {
                 first: if new { offer.first } else { 0 },
                 yearly: offer.yearly,
                 seconds: offer.cap_seconds,
+                trial_days: if trial { offer.trial_days } else { 0 },
             })
             .collect(),
         currency: facts.prices.currency.clone(),
@@ -902,6 +905,7 @@ mod tests {
             resets_at: 1_793_491_200,
             complimentary: false,
             intro_eligible: false,
+            trial_eligible: false,
         };
         facts.pro.info = Some(&info);
         // Known from a while ago, with the server out of reach now.
@@ -966,6 +970,7 @@ mod tests {
                 first: 490,
                 yearly: 6900,
                 cap_seconds: 144_000,
+                trial_days: 7,
             }],
             currency: "usd".into(),
             open: false,
@@ -981,6 +986,7 @@ mod tests {
                 first: 490,
                 yearly: 6900,
                 seconds: 144_000,
+                trial_days: 7,
             }]
         );
         assert_eq!(shown.currency, "usd");
@@ -1002,15 +1008,27 @@ mod tests {
             resets_at: 0,
             complimentary: false,
             intro_eligible: false,
+            trial_eligible: false,
         };
         facts.pro.info = Some(&info);
         assert_eq!(first(&facts), 0);
         let new = AccountInfo {
             intro_eligible: true,
+            trial_eligible: false,
             ..info.clone()
         };
         facts.pro.info = Some(&new);
         assert_eq!(first(&facts), 490);
+        // The free trial likewise, on the server's word for the account.
+        let trial = |facts: &Facts<'_>| build(facts).pro.offers[0].trial_days;
+        assert_eq!(trial(&facts), 0);
+        let trial_new = AccountInfo {
+            trial_eligible: true,
+            ..info.clone()
+        };
+        facts.pro.info = Some(&trial_new);
+        assert_eq!(trial(&facts), 7);
+        facts.pro.info = Some(&new);
         // The prices themselves are everyone's.
         assert_eq!(build(&facts).pro.offers[0].monthly, 700);
     }

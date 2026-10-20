@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.6.3",
+    "published": "2026-10-20",
+    "notes": [
+      "Pro can be tried free for 7 days: nothing is charged until they end, and cancelling before then costs nothing",
+      "The Models page and the VinPUT Pro page show the free days where Pro is offered",
+      "After 50 dictations with a model on this PC, one quiet notification mentions VinPUT Pro, once and never again",
+      "Your settings carry over as they are"
+    ]
+  },
+  {
     "version": "0.6.2",
     "published": "2026-10-16",
     "notes": [

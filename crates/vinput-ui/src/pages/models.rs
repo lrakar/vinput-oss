@@ -29,7 +29,8 @@ use vinput_view::{
 };
 
 use super::common::{
-    DOT, ProTrouble, fraction, hours_low, least_a_month, notice_bar, owing, pro_trouble, so_far,
+    DOT, ProTrouble, fraction, hours_low, least_a_month, notice_bar, owing, pro_trial, pro_trouble,
+    so_far,
 };
 use super::pro::{usage, works_again};
 use crate::node::{
@@ -263,11 +264,19 @@ fn pro_card(view: &View) -> Option<Node> {
         // The benefit first, then what it costs.
         // The one button of the page in the accent color: it is what makes
         // the card easy to find.
-        Some(ProTrouble::SignedOut | ProTrouble::NoSubscription) => (
-            format!("{}{DOT}from {}", about(&model.summary), least_a_month(pro)),
-            None,
-            accent_button("See plans", page()),
-        ),
+        // A free trial, where there is one for them, says the most.
+        Some(ProTrouble::SignedOut | ProTrouble::NoSubscription) => match pro_trial(pro) {
+            Some(days) => (
+                format!("{}{DOT}free for {days} days", about(&model.summary)),
+                None,
+                accent_button("Try free", page()),
+            ),
+            None => (
+                format!("{}{DOT}from {}", about(&model.summary), least_a_month(pro)),
+                None,
+                accent_button("See plans", page()),
+            ),
+        },
         // Typing goes on with a model on this PC: said, not warned of.
         Some(ProTrouble::UsedUp) if pro.spare.is_some() => (
             format!(
@@ -902,6 +911,18 @@ mod tests {
         assert!(pro(&view).detail.ends_with("\u{b7} from $2.75 a month"));
         view.pro.offers.remove(0);
         assert!(pro(&view).detail.ends_with("\u{b7} from $5 a month"));
+        // A free trial of Pro, where there is one for them, is what the line
+        // and its button say.
+        for name in ["pro-trial", "pro-trial-signed-out"] {
+            let card = pro(&scene(name));
+            assert!(
+                card.detail.ends_with("\u{b7} free for 7 days"),
+                "{name}: {}",
+                card.detail
+            );
+            assert_eq!(card.labels, ["Try free"], "{name}");
+            assert!(card.to_its_page, "{name}");
+        }
         // A price for the first month is the plans' to say: the line here
         // has no room for both, and stays what a month costs.
         for name in ["pro-intro", "pro-intro-signed-out"] {

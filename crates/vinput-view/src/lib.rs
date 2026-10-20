@@ -1019,6 +1019,10 @@ pub struct ProOffer {
     pub yearly: u32,
     /// Seconds of speech a month comes with.
     pub seconds: u64,
+    /// How many days free a first subscription starts with for whoever is
+    /// looking: zero where there is no trial, or it is not theirs.
+    #[serde(default)]
+    pub trial_days: u32,
 }
 
 impl Default for Pro {
@@ -1054,6 +1058,7 @@ impl Default for Pro {
                     first: 0,
                     yearly: 2400,
                     seconds: 8 * 3600,
+                    trial_days: 0,
                 },
                 ProOffer {
                     tier: ProTier::Pro,
@@ -1061,6 +1066,7 @@ impl Default for Pro {
                     first: 0,
                     yearly: 4900,
                     seconds: 25 * 3600,
+                    trial_days: 0,
                 },
             ],
             currency: "eur".to_owned(),

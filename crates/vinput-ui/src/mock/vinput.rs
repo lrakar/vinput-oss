@@ -11,7 +11,7 @@ use vinput_view::{
 };
 
 /// The names [`scene`] knows.
-pub const SCENES: [&str; 77] = [
+pub const SCENES: [&str; 79] = [
     "settings",
     "actions",
     "action-tested",
@@ -42,6 +42,8 @@ pub const SCENES: [&str; 77] = [
     "pro-signing-in",
     "pro-not-subscribed",
     "pro-intro",
+    "pro-trial-signed-out",
+    "pro-trial",
     "pro-opening-soon",
     "pro-not-yet",
     "pro-awaiting-payment",
@@ -384,6 +386,17 @@ fn on_plus(used_seconds: u64) -> Pro {
 
 /// Gives the tiers the price of a first month, as the server does for
 /// whoever is signed out and for an account it says is new.
+/// Gives Pro the free trial the server offers someone new, and Plus its
+/// first month, as the server does while the trial is on.
+fn with_trial(pro: &mut Pro) {
+    for offer in &mut pro.offers {
+        match offer.tier {
+            ProTier::Pro => offer.trial_days = 7,
+            ProTier::Plus => offer.first = 149,
+        }
+    }
+}
+
 fn with_intro(pro: &mut Pro) {
     for (offer, first) in pro.offers.iter_mut().zip([149, 349]) {
         offer.first = first;
@@ -432,6 +445,12 @@ fn offer_scene(view: &mut View, name: &str) -> bool {
                 view.pro = signed_in(false, "", ProPlan::Monthly);
             }
             with_intro(&mut view.pro);
+        }
+        "pro-trial-signed-out" | "pro-trial" => {
+            if name == "pro-trial" {
+                view.pro = signed_in(false, "", ProPlan::Monthly);
+            }
+            with_trial(&mut view.pro);
         }
         // No plan can be subscribed to yet: as the server says beforehand,
         // and as it answers a press it had not said so to.

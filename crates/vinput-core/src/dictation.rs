@@ -9,7 +9,7 @@
 //! taken when the key goes down, what is said is carried out on it, and the
 //! result is put in its place ([`command`]).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, Scope};
@@ -138,6 +138,10 @@ struct Options {
     action_cleanup: Vec<Mode>,
     /// The model that tidies and edits.
     rewriter: Arc<dyn Rewriter>,
+    /// How many dictations a model on this PC has typed something for since
+    /// the host last asked. Kept on this PC and never sent anywhere: the
+    /// host counts them towards the one time it mentions `VinPUT` Pro.
+    typed_locally: Arc<AtomicU32>,
 }
 
 impl Options {
@@ -168,6 +172,7 @@ impl Options {
             said: None,
             rules: Rules::of(&settings.words),
             around_a_model: Rules::around_a_model(&settings.words),
+            typed_locally: Arc::default(),
         }
     }
 
@@ -428,6 +433,10 @@ impl Controller for Dictation {
         std::mem::take(&mut *self.outcomes.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
+    fn take_local_dictations(&mut self) -> u32 {
+        self.options.typed_locally.swap(0, Ordering::AcqRel)
+    }
+
     fn take_said(&mut self) -> Vec<Said> {
         // A dictation that started while programs were let read what is
         // typed goes on leaving it here after they no longer are. It is
@@ -453,8 +462,11 @@ impl Controller for Dictation {
         self.rewrite_config = config;
         ready_to_rewrite(settings, rewriter.as_ref());
         let typing_enter = self.options.typing_enter.take();
+        // The count goes on across changes of the settings.
+        let typed_locally = Arc::clone(&self.options.typed_locally);
         self.options = Options::of(settings, microphone, held, rewriter);
         self.options.typing_enter = typing_enter;
+        self.options.typed_locally = typed_locally;
         self.options.said = said_for(settings, &self.said);
         // The dictation that starts next asks for the words as they are now.
         words::listen_for(settings.words.terms());
@@ -832,7 +844,12 @@ fn run_session(
         live: options.live && speech.kind() == ProviderKind::Cloud,
         preview: options.live,
     };
-    dictate(
+    let typed = AtomicBool::new(false);
+    let sink = Noticing {
+        sink,
+        typed: &typed,
+    };
+    let done = dictate(
         speech,
         (&options.languages, typing),
         microphone,
@@ -840,7 +857,59 @@ fn run_session(
         (&alone, entered),
         sink,
         tidy,
-    )
+    )?;
+    if typed.load(Ordering::Acquire) && speech.kind() == ProviderKind::Local {
+        options.typed_locally.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(done)
+}
+
+/// Notes whether anything at all was typed through it: what a dictation
+/// that counts is told apart by from one that heard nothing.
+struct Noticing<'a, S> {
+    sink: S,
+    typed: &'a AtomicBool,
+}
+
+impl<S: TextSink> Noticing<'_, S> {
+    fn note(&self, text: &str) {
+        if !text.trim().is_empty() {
+            self.typed.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl<S: TextSink> TextSink for Noticing<'_, S> {
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        self.note(text);
+        self.sink.type_text(text)
+    }
+
+    fn rewrites(&self) -> bool {
+        self.sink.rewrites()
+    }
+
+    fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+        self.note(text);
+        self.sink.rewrite(erase, text)
+    }
+
+    fn disturbed(&mut self) -> bool {
+        self.sink.disturbed()
+    }
+
+    fn paste(&mut self, text: &str) -> Result<bool> {
+        let pasted = self.sink.paste(text)?;
+        if pasted {
+            self.note(text);
+        }
+        Ok(pasted)
+    }
+
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        self.note(text);
+        self.sink.type_lines(text)
+    }
 }
 
 /// The sink of a dictation over the real one: what is typed into `sink` is
@@ -2005,6 +2074,53 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_dictation_counts_once_something_is_typed_through_it() -> Result<()> {
+        let typed = AtomicBool::new(false);
+        let mut sink = Noticing {
+            sink: Collecting::default(),
+            typed: &typed,
+        };
+        sink.type_text("  ")?;
+        sink.type_lines("\n")?;
+        assert!(!typed.load(Ordering::Acquire));
+        sink.type_text("Hello")?;
+        assert!(typed.load(Ordering::Acquire));
+        assert_eq!(sink.sink.text, "  \nHello");
+        Ok(())
+    }
+
+    #[test]
+    fn the_count_of_local_dictations_is_taken_once_and_kept_across_settings() {
+        let settings = Settings::default();
+        let microphone = Arc::new(ArmedMicrophone::new(&settings.microphone));
+        let mut dictation = Dictation {
+            speech: Arc::new(Loading::new(false, false)),
+            speech_config: settings.speech_config(),
+            rewrite_config: rewrite_config(&settings),
+            options: Options::of(&settings, microphone, Arc::default(), quiet_model()),
+            meter: LevelMeter::new(),
+            failures: Arc::default(),
+            outcomes: Arc::default(),
+            said: Arc::default(),
+            active: None,
+            finishing: Vec::new(),
+            notify: None,
+        };
+        assert_eq!(dictation.take_local_dictations(), 0);
+        dictation
+            .options
+            .typed_locally
+            .fetch_add(3, Ordering::AcqRel);
+        // A session still running counts into the same place after the
+        // settings change.
+        let running = Arc::clone(&dictation.options.typed_locally);
+        dictation.configure(&settings, false);
+        running.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(dictation.take_local_dictations(), 4);
+        assert_eq!(dictation.take_local_dictations(), 0);
     }
 
     #[test]
@@ -3577,5 +3693,176 @@ mod tests {
         // switched on again.
         dictation.configure(&on, false);
         assert!(dictation.take_said().is_empty());
+    }
+
+    /// A recognizer that settles on `0` as soon as it hears anything, and
+    /// on `1` when the audio ends.
+    struct SaysInTwo(&'static str, &'static str);
+
+    impl SpeechProvider for SaysInTwo {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Local
+        }
+
+        fn start_session(&self, _: SessionOptions<'_>) -> Result<Session> {
+            Ok(Box::new(SettlesInTwo(Some(self.0), self.1)))
+        }
+    }
+
+    struct SettlesInTwo(Option<&'static str>, &'static str);
+
+    impl Transcriber for SettlesInTwo {
+        fn feed(&mut self, _: &[i16]) -> Result<Option<Transcript>> {
+            Ok(self.0.take().map(|text| Transcript {
+                text: text.to_owned(),
+                is_final: true,
+            }))
+        }
+
+        fn finish(&mut self, emit: &mut Emit<'_>) -> Result<()> {
+            emit(Transcript {
+                text: self.1.to_owned(),
+                is_final: true,
+            })
+        }
+    }
+
+    /// The real model `VINPUT_TEXT_MODEL` chooses (empty: the one of
+    /// `VinPUT` Pro), made ready. A local one that is not on this PC is
+    /// installed first, and then `None` is returned: whatever has the focus
+    /// after a long download is not what was focused for a test.
+    #[cfg(windows)]
+    #[allow(clippy::print_stderr, reason = "how far the download is")]
+    fn real_rewriter() -> Result<Option<Arc<dyn Rewriter>>> {
+        let settings = Settings {
+            text_model: std::env::var("VINPUT_TEXT_MODEL").unwrap_or_default(),
+            cleanup: Mode::Clean,
+            ..Settings::default()
+        };
+        if let Some(model) = crate::models::writer(&settings.text_model) {
+            let gpu = settings.use_gpu();
+            if !crate::models::is_installed(model, gpu) {
+                let installer = crate::models::Installer::new();
+                installer.install(model, gpu);
+                loop {
+                    match installer.status(model, gpu) {
+                        crate::models::Status::Installing { done, total } => {
+                            eprintln!("installing {}: {done} of {total}", model.id);
+                        }
+                        crate::models::Status::Installed => break,
+                        other => return Err(Error::Host(format!("{other:?}"))),
+                    }
+                    thread::sleep(Duration::from_secs(5));
+                }
+                eprintln!("{} is installed; run again", model.id);
+                return Ok(None);
+            }
+        }
+        let rewriter = rewrite::connect(&settings);
+        rewriter.make_ready();
+        Ok(Some(rewriter))
+    }
+
+    /// A dictation said in two pieces two seconds apart, shown into `sink`
+    /// while it is said and tidied by `rewriter` after.
+    #[cfg(windows)]
+    #[allow(clippy::print_stderr, reason = "what it did is its output")]
+    fn said_in_two_and_tidied(
+        rewriter: &dyn Rewriter,
+        target: Target,
+        sink: impl TextSink,
+    ) -> Result<Option<Outcome>> {
+        let cancelled = AtomicBool::new(false);
+        let languages = ["en-US".to_owned()];
+        let started = Instant::now();
+        let left = dictate(
+            &SaysInTwo(
+                "um so I think we should uh meet at six",
+                " tomorrow at the office, no wait, at the cafe",
+            ),
+            (&languages, LIVE),
+            || Ok(Counted::new(20, |_| thread::sleep(Duration::from_millis(100))).0),
+            (target, None),
+            (&AtomicBool::new(false), &AtomicBool::new(false)),
+            sink,
+            Some(Tidy {
+                rewriter,
+                kind: Kind::Clean,
+                snippets: None,
+                stop: &cancelled,
+            }),
+        )?;
+        eprintln!("done in {:?}: {left:?}", started.elapsed());
+        Ok(left)
+    }
+
+    /// What is said shows in the window in front while the user speaks, and
+    /// the real model's tidied text takes its place. Focus a text field
+    /// within three seconds of the start; `VINPUT_TEST_ENTER=1` ends with
+    /// Enter. See [`real_rewriter`] for the model.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "types into the window in front, and needs a text model"]
+    fn a_real_preview_is_replaced_by_real_tidied_text() -> Result<()> {
+        let Some(rewriter) = real_rewriter()? else {
+            return Ok(());
+        };
+        let target = if std::env::var("VINPUT_TEST_ENTER").as_deref() == Ok("1") {
+            Target::FocusedEnter
+        } else {
+            Target::Focused
+        };
+        thread::sleep(Duration::from_secs(3));
+        said_in_two_and_tidied(rewriter.as_ref(), target, SendInputSink::new())?;
+        Ok(())
+    }
+
+    /// The same with a made-up field: once the real model is done, the
+    /// field holds what it wrote and nothing of what was said.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a text model"]
+    #[allow(clippy::print_stderr, reason = "what it did is its output")]
+    fn a_preview_is_replaced_by_real_tidied_text() -> Result<()> {
+        let Some(rewriter) = real_rewriter()? else {
+            return Ok(());
+        };
+        let field = Screen::default();
+        let left = said_in_two_and_tidied(rewriter.as_ref(), Target::FocusedEnter, field.clone())?;
+        eprintln!("sent: {:#?}", field.sent());
+        let text = field.text();
+        eprintln!("field: {text:?}");
+        assert_eq!(left, None);
+        assert!(text.ends_with('\n') && !text[..text.len() - 1].contains('\n'));
+        for raw in ["um ", " uh "] {
+            assert!(!text.contains(raw), "{raw:?} is left in {text:?}");
+        }
+        assert_eq!(text.matches("six").count(), 1, "{text:?}");
+        assert!(text.contains("caf"), "{text:?}");
+        // Whether the model follows "no wait" is up to the model, and not
+        // checked. What was said was on the screen first, as it was said,
+        // and was taken back whole in one go by the model's first words.
+        let said =
+            "um so I think we should uh meet at six tomorrow at the office, no wait, at the cafe";
+        let sent = field.sent();
+        let shown = sent.iter().take_while(|(_, text)| text.starts_with("0:"));
+        let shown: String = shown.map(|(_, text)| &text[2..]).collect();
+        assert_eq!(shown, said);
+        let replaced = &sent[sent
+            .iter()
+            .filter(|(_, text)| text.starts_with("0:"))
+            .count()];
+        assert!(
+            replaced
+                .1
+                .starts_with(&format!("{}:", said.chars().count())),
+            "{replaced:?}"
+        );
+        assert!(
+            sent.iter().skip(1).all(|(how, text)| how == &"typed"
+                || text.starts_with("0:")
+                || text == &replaced.1)
+        );
+        Ok(())
     }
 }

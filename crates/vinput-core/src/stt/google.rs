@@ -143,7 +143,7 @@ impl GoogleSpeech {
         drop(network.handle().spawn(keep_fresh(Arc::clone(&tokens))));
         let endpoint = Endpoint::from_shared(config.endpoint())
             .map_err(stt_error("building the service address"))?
-            .tls_config(ClientTlsConfig::new().with_webpki_roots())
+            .tls_config(ClientTlsConfig::new().with_native_roots())
             .map_err(stt_error("configuring TLS"))?
             .connect_timeout(CONNECT_TIMEOUT)
             .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)

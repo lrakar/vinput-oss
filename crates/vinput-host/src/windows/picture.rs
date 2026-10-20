@@ -16,7 +16,7 @@ use super::Host;
 use crate::view::{self, Facts, UpdateFacts};
 use vinput_core::models::{self, EngineState, Installer, Model, Runner, Status};
 use vinput_core::stt::check;
-use vinput_core::{api, audio, gpu, hardware, memo, secrets};
+use vinput_core::{api, audio, gpu, hardware, memo, rewrite, secrets};
 use vinput_view as wire;
 
 /// After this many ticks of the window timer, about two seconds, what takes
@@ -112,6 +112,8 @@ pub(super) struct OnDisk {
     card_engine: bool,
     /// Every model in the order to list them, with where each stands.
     models: Vec<(&'static Model, Status)>,
+    /// The models that write, likewise.
+    writers: Vec<(&'static Model, Status)>,
     /// Where the engine the settings ask for stands.
     engine: EngineState,
 }
@@ -126,6 +128,10 @@ impl OnDisk {
             card_engine: models::engine_program(true, Runner::Server).is_some(),
             models: models::all()
                 .into_iter()
+                .map(|model| (model, installer.status(model, gpu)))
+                .collect(),
+            writers: models::writers()
+                .iter()
                 .map(|model| (model, installer.status(model, gpu)))
                 .collect(),
             // No engine is fetched on its own for a PC without a local
@@ -223,6 +229,7 @@ impl Host {
             listening: self.ticking,
             graphics_card: gpu::card().map(|card| card.name.as_str()),
             card_engine: on_disk.card_engine,
+            card_use: view::CardUse::of(vinput_core::stt::fell_back()),
             pc: hardware::pc(),
             models: on_disk.models,
             engine: on_disk.engine,
@@ -249,8 +256,12 @@ impl Host {
                 failed: updates.failed.as_deref(),
             },
             pro: self.pro.facts(),
+            writers: on_disk.writers,
+            standing: rewrite::local::engine().standing(),
             finder: self.finder.snapshot(),
             notice: self.notice.clone(),
+            system_languages: vinput_core::languages::preferred(),
+            hub_installed: vinput_core::hub::installed(),
         })
     }
 }
@@ -319,6 +330,7 @@ mod tests {
                 gpu,
                 card_engine: false,
                 models: Vec::new(),
+                writers: Vec::new(),
                 engine: EngineState::Ready,
             }
         })

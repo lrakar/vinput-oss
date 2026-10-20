@@ -14,7 +14,9 @@ use canned::resolve;
 fn resolve(options: &Options) -> Result<(crate::scene::Showing, vinput_view::View)> {
     use crate::scene::Showing;
     match &options.source {
-        crate::Source::Host => Ok((Showing::of(options.surface), vinput_view::View::default())),
+        crate::Source::Host | crate::Source::Program(_) => {
+            Ok((Showing::of(options.surface), vinput_view::View::default()))
+        }
         crate::Source::Mock(name) => Err(crate::Error::UnknownScene(name.clone())),
     }
 }
@@ -118,7 +120,7 @@ mod canned {
     pub(super) fn resolve(options: &Options) -> Result<(Showing, View)> {
         let surface = Showing::of(options.surface);
         match &options.source {
-            Source::Host => Ok((surface, View::default())),
+            Source::Host | Source::Program(_) => Ok((surface, View::default())),
             Source::Mock(name) if name == gallery::SCENE => Ok((
                 Showing::Gallery,
                 mock::scene("settings").unwrap_or_default(),
@@ -155,6 +157,8 @@ mod canned {
             scroll: f32::from(options.scroll),
             ..shot.look
         };
+        shot.memory = Some(&options.memory);
+        shot.lists = f32::from(options.list_scroll);
         picture::save(showing, view, &shot, path)
     }
 }

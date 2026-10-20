@@ -115,7 +115,7 @@ impl Showing {
     pub fn content(&self, view: &View) -> Content {
         match self {
             Self::Settings(page) => pages::content(*page, view),
-            Self::Update => pages::update::content(view),
+            Self::Update => pages::update(view),
             #[cfg(any(debug_assertions, test))]
             Self::Gallery => gallery::content(),
             // The build that ships has no test card and never shows one.
@@ -146,6 +146,10 @@ impl Showing {
     #[must_use]
     pub fn title(&self) -> &str {
         match self {
+            #[cfg(feature = "hub")]
+            Self::Settings(page) if page.app() == vinput_view::App::Hub => "PUTLAB",
+            #[cfg(feature = "voutput")]
+            Self::Settings(page) if page.app() == vinput_view::App::Voutput => "Voutput settings",
             Self::Settings(_) | Self::Gallery => "VinPUT settings",
             Self::Update => "VinPUT update",
             Self::Asking(asking) if asking.dialog.title.is_empty() => "VinPUT",

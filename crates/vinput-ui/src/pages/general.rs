@@ -1,10 +1,12 @@
-//! The General page: hotkeys and the everyday switches.
+//! The General page: what `VinPUT` listens with and for, and the everyday
+//! switches. The keys are on the Shortcuts page.
 
 use vinput_view::{Change, Command, Microphone, Page, Settings, View};
 
-use super::common::{notice_bar, pro_in_use, pro_trouble, set_text};
+use super::common::{notice_bar, pro_in_use, pro_trouble};
+use super::languages;
 use crate::node::{
-    Action, Content, Icon, Node, Severity, Tone, card, choice, field, header, hotkey, note,
+    Action, Content, Icon, Node, Severity, Tone, card, choice, expander, header, plain_setting,
     setting, toggle,
 };
 
@@ -20,9 +22,9 @@ pub fn content(view: &View) -> Content {
     body.extend(notice_bar(view, Page::General));
     body.extend(model_prompt(view));
     body.extend(pro_prompt(view));
-    body.extend(hotkeys(&view.settings));
     body.extend(input(view));
-    body.extend(behavior(&view.settings));
+    body.extend(dictation(&view.settings));
+    body.extend(startup(&view.settings));
     Content {
         pinned: Vec::new(),
         title: "General".to_owned(),
@@ -60,68 +62,6 @@ fn pro_prompt(view: &View) -> Option<Node> {
     })
 }
 
-/// The field for one of the hotkeys.
-fn hotkey_field(
-    key: &'static str,
-    current: &str,
-    clearable: bool,
-    change: fn(String) -> Change,
-) -> Node {
-    let before = current.to_owned();
-    hotkey(key, current, clearable, move |typed| {
-        set_text(&before, &typed, change)
-    })
-}
-
-/// The keys that start and stop listening.
-fn hotkeys(settings: &Settings) -> [Node; 3] {
-    [
-        header("Hotkeys"),
-        note(
-            "Tap a key to start and tap it again to stop, or hold it while you speak and let go \
-             when you are done.",
-        ),
-        card([
-            setting(Icon::Keyboard, "Dictate")
-                .detail("Types what you say into the window you are working in")
-                .control(hotkey_field(
-                    "hotkey",
-                    &settings.hotkey,
-                    false,
-                    Change::Hotkey,
-                ))
-                .into(),
-            setting(Icon::Keyboard, "Dictate, then press Enter")
-                .detail("Types what you say and sends it, for chats and prompts")
-                .control(hotkey_field(
-                    "hotkey-enter",
-                    &settings.hotkey_enter,
-                    true,
-                    Change::HotkeyEnter,
-                ))
-                .into(),
-            setting(Icon::Search, "Dictate, then search the web")
-                .detail("Opens what you say as a web search in your browser")
-                .control(hotkey_field(
-                    "hotkey-search",
-                    &settings.hotkey_search,
-                    true,
-                    Change::HotkeySearch,
-                ))
-                .into(),
-            setting(Icon::Memo, "Record a voice memo")
-                .detail("Saves what you say as an audio file")
-                .control(hotkey_field(
-                    "hotkey-memo",
-                    &settings.hotkey_memo,
-                    true,
-                    Change::HotkeyMemo,
-                ))
-                .into(),
-        ]),
-    ]
-}
-
 /// The row that picks the audio input. A chosen input that Windows no longer
 /// has stays in the list, so the choice is kept until it is plugged in again.
 fn microphone_row(chosen: &str, microphones: &[Microphone]) -> Node {
@@ -134,7 +74,7 @@ fn microphone_row(chosen: &str, microphones: &[Microphone]) -> Node {
     let found = ids.iter().position(|id| id == chosen);
     let selected = found.unwrap_or(ids.len());
     let (detail, tone) = if found.is_some() {
-        ("The microphone VinPUT listens with", Tone::Secondary)
+        ("", Tone::Secondary)
     } else {
         names.push(MISSING_MICROPHONE.to_owned());
         ids.push(chosen.to_owned());
@@ -144,7 +84,7 @@ fn microphone_row(chosen: &str, microphones: &[Microphone]) -> Node {
             Tone::Caution,
         )
     };
-    setting(Icon::Microphone, "Audio input")
+    setting(Icon::Microphone, "Microphone")
         .detail(detail)
         .detail_tone(tone)
         .control(choice(
@@ -161,83 +101,84 @@ fn microphone_row(chosen: &str, microphones: &[Microphone]) -> Node {
         .into()
 }
 
-/// What `VinPUT` Pro can do for someone who has named one language.
-const MORE_LANGUAGES: &str = "Speak more than one language? Add each of them, and VinPUT Pro \
-                              follows you when you switch.";
-
 /// What the app listens with and what it listens for.
 fn input(view: &View) -> [Node; 2] {
     let settings = &view.settings;
-    let languages = settings.languages.clone();
-    let mut row = setting(Icon::Globe, "Languages")
-        .detail("The languages you speak, as codes separated by commas, such as en-US, sl-SI")
-        .control(
-            field("languages", &settings.languages, move |typed| {
-                set_text(&languages, &typed, Change::Languages)
-            })
-            .placeholder("en-US")
-            .into(),
-        );
     // VinPUT Pro leans towards the languages it is told of, and can take
     // speech in another one for a third: worth one quiet line, here, to
     // whoever has named a single language.
-    if pro_in_use(view) && spoken_languages(&settings.languages) == 1 {
-        row = row.below(note(MORE_LANGUAGES));
-    }
+    let more = pro_in_use(view) && languages::count(&settings.languages) == 1;
     [
-        header("Input"),
+        header("Speech"),
         card([
             microphone_row(&settings.microphone, &view.microphones),
-            row.into(),
+            languages::picker(&settings.languages, &view.system_languages, more).into(),
         ]),
     ]
 }
 
-/// How many languages `codes` names. Two regions of one language, such as
-/// en-US and en-GB, are one.
-fn spoken_languages(codes: &str) -> usize {
-    let mut languages: Vec<String> = codes
-        .split(',')
-        .filter_map(|code| code.split(['-', '_']).next())
-        .map(|language| language.trim().to_ascii_lowercase())
-        .filter(|language| !language.is_empty())
-        .collect();
-    languages.sort_unstable();
-    languages.dedup();
-    languages.len()
-}
-
-/// The everyday switches.
-fn behavior(settings: &Settings) -> [Node; 2] {
-    [
-        header("Behavior"),
-        card([
-            setting(Icon::Power, "Start with Windows")
-                .detail("VinPUT waits in the tray from the moment you sign in")
-                .control(toggle(settings.autostart, |on| {
-                    Action::send(Command::Set(Change::Autostart(on)))
-                }))
-                .into(),
-            setting(Icon::Volume, "Play a sound when listening starts")
-                .detail("A soft click as soon as you press the key")
+/// The row of the two sounds of a dictation. Closed, it says which of them
+/// are played.
+fn sounds_row(settings: &Settings) -> Node {
+    let played = match (settings.ready_sound, settings.stop_sound) {
+        (true, true) => "Start and stop",
+        (true, false) => "Start",
+        (false, true) => "Stop",
+        (false, false) => "Off",
+    };
+    expander(
+        "sounds",
+        Icon::Volume,
+        "Sounds",
+        [
+            plain_setting("When listening starts")
+                .indented()
+                .compact()
                 .control(toggle(settings.ready_sound, |on| {
                     Action::send(Command::Set(Change::ReadySound(on)))
                 }))
                 .into(),
-            setting(Icon::Volume, "Play a sound when listening stops")
-                .detail("A lower click as soon as you are done")
+            plain_setting("When listening stops")
+                .indented()
+                .compact()
                 .control(toggle(settings.stop_sound, |on| {
                     Action::send(Command::Set(Change::StopSound(on)))
                 }))
                 .into(),
-            stop_after_row(settings.stop_after_minutes),
+        ],
+    )
+    .value(played)
+    .into()
+}
+
+/// How a dictation goes: when its words appear, what it sounds like and
+/// when it gives up.
+fn dictation(settings: &Settings) -> [Node; 2] {
+    [
+        header("Dictation"),
+        card([
             setting(Icon::Keyboard, "Type words as you say them")
-                .detail("With VinPUT Pro. A word that changes as you go on is corrected in place")
+                .detail("With VinPUT Pro. Otherwise the text comes when you stop")
                 .control(toggle(settings.live_typing, |on| {
                     Action::send(Command::Set(Change::LiveTyping(on)))
                 }))
                 .into(),
+            sounds_row(settings),
+            stop_after_row(settings.stop_after_minutes),
         ]),
+    ]
+}
+
+/// Whether `VinPUT` is there when Windows starts.
+fn startup(settings: &Settings) -> [Node; 2] {
+    [
+        header("Startup"),
+        card([setting(Icon::Power, "Start with Windows")
+            .detail("Ready in the tray when you sign in")
+            .control(toggle(settings.autostart, |on| {
+                Action::send(Command::Set(Change::Autostart(on)))
+            }))
+            .into()]),
     ]
 }
 
@@ -263,7 +204,7 @@ fn stop_after_row(chosen: u32) -> Node {
         minutes => format!("{minutes} minutes"),
     });
     setting(Icon::Timer, "Stop after silence")
-        .detail("Ends a forgotten dictation when nothing is said for this long")
+        .detail("Ends a dictation you forgot")
         .control(choice(
             "stop-after-silence",
             names.collect::<Vec<_>>(),
@@ -282,9 +223,23 @@ fn stop_after_row(chosen: u32) -> Node {
 mod tests {
     use std::collections::HashSet;
 
-    use super::super::common::probe::{
-        all, command, flipped, keys, scene, set, setting_row, typed,
-    };
+    use super::super::common::probe::{Seen, all, command, flipped, keys, scene, set, setting_row};
+    use crate::node::Expander;
+
+    /// The row that opens titled `title`.
+    fn opener<'a>(page: &'a Content, title: &str) -> &'a Expander {
+        fn find<'a>(nodes: &'a [Node], title: &str) -> Option<&'a Expander> {
+            nodes.iter().find_map(|node| match node {
+                Node::Expander(row) if row.title == title => Some(row),
+                Node::Card(children) => find(children, title),
+                _ => None,
+            })
+        }
+        let Some(row) = find(&page.body, title) else {
+            unreachable!("the page has no row that opens called {title:?}");
+        };
+        row
+    }
     use super::*;
     use crate::mock;
 
@@ -301,42 +256,47 @@ mod tests {
         let page = content(&scene("settings"));
         let nodes = all(&page.body);
         assert_eq!(page.title, "General");
-        let headers: Vec<_> = nodes
+        let headers: Vec<_> = page
+            .body
             .iter()
             .filter_map(|node| match node {
                 Node::Header(text) => Some(text.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(headers, ["Hotkeys", "Input", "Behavior"]);
+        assert_eq!(headers, ["Speech", "Dictation", "Startup"]);
         for title in [
-            "Dictate",
-            "Dictate, then press Enter",
-            "Dictate, then search the web",
-            "Record a voice memo",
-            "Audio input",
-            "Languages",
+            "Microphone",
             "Start with Windows",
-            "Play a sound when listening starts",
-            "Play a sound when listening stops",
+            "When listening starts",
+            "When listening stops",
             "Stop after silence",
+            "Type words as you say them",
         ] {
             let row = setting_row(&nodes, title);
             assert!(row.control.is_some(), "{title} has no control");
-            assert!(!row.detail.is_empty(), "{title} does not say what it does");
         }
         assert!(bars(&nodes).is_empty(), "a settled user sees no bars");
+        // What has more to it than a switch is closed until it is asked for,
+        // and says what is chosen meanwhile.
+        for (title, value) in [
+            (
+                "Languages",
+                "English (United States), Sloven\u{161}\u{10d}ina",
+            ),
+            ("Sounds", "Start and stop"),
+        ] {
+            let row = opener(&page, title);
+            assert!(!row.open, "{title} is open");
+            assert_eq!(row.value, value);
+        }
     }
 
     #[test]
     fn someone_with_one_language_and_vinput_pro_is_told_once_to_add_the_others() {
         let says_so = |view: &View| {
             let page = content(view);
-            let nodes = all(&page.body);
-            let below = &setting_row(&nodes, "Languages").below;
-            below.iter().any(
-                |node| matches!(node, Node::Text { text, .. } if text.contains("more than one")),
-            )
+            Seen::of(&opener(&page, "Languages").children).says("more than one")
         };
         assert!(says_so(&scene("one-language")));
         // Not to someone who has named two, nor to someone who dictates
@@ -356,12 +316,28 @@ mod tests {
     }
 
     #[test]
-    fn languages_are_counted_by_what_is_spoken() {
-        assert_eq!(spoken_languages(""), 0);
-        assert_eq!(spoken_languages(" , "), 0);
-        assert_eq!(spoken_languages("en-US"), 1);
-        assert_eq!(spoken_languages("en-US, EN_gb,en"), 1);
-        assert_eq!(spoken_languages("en-US, sl-SI, de"), 3);
+    fn the_row_of_the_sounds_says_which_are_played() {
+        let played = |start: bool, stop: bool| {
+            let mut view = scene("settings");
+            view.settings.ready_sound = start;
+            view.settings.stop_sound = stop;
+            opener(&content(&view), "Sounds").value.clone()
+        };
+        assert_eq!(played(true, true), "Start and stop");
+        assert_eq!(played(true, false), "Start");
+        assert_eq!(played(false, true), "Stop");
+        assert_eq!(played(false, false), "Off");
+    }
+
+    #[test]
+    fn the_languages_of_windows_are_offered_first() {
+        let page = content(&scene("settings"));
+        let seen = Seen::of(&opener(&page, "Languages").children);
+        assert!(seen.says("From Windows"));
+        let mut view = scene("settings");
+        view.system_languages.clear();
+        let page = content(&view);
+        assert!(!Seen::of(&opener(&page, "Languages").children).says("From Windows"));
     }
 
     #[test]
@@ -370,64 +346,16 @@ mod tests {
             let page = content(&scene(name));
             let keys = keys(&all(&page.body));
             let unique: HashSet<_> = keys.iter().collect();
-            assert_eq!(keys.len(), 7, "{name}");
+            assert_eq!(keys.len(), 5, "{name}");
             assert_eq!(unique.len(), keys.len(), "{name}: {keys:?}");
         }
     }
 
     #[test]
-    fn hotkeys_show_what_is_set_and_send_what_is_pressed() {
+    fn the_keys_are_on_a_page_of_their_own() {
         let page = content(&scene("settings"));
         let nodes = all(&page.body);
-        let shown: Vec<_> = nodes
-            .iter()
-            .filter_map(|node| match node {
-                Node::Hotkey {
-                    key,
-                    text,
-                    clearable,
-                    ..
-                } => Some((*key, text.as_str(), *clearable)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            shown,
-            [
-                ("hotkey", "F1", false),
-                ("hotkey-enter", "F2", true),
-                ("hotkey-search", "", true),
-                ("hotkey-memo", "Ctrl+Shift+M", true),
-            ]
-        );
-        assert_eq!(
-            typed(&nodes, "hotkey", "F8"),
-            Some(Change::Hotkey("F8".to_owned()))
-        );
-        assert_eq!(
-            typed(&nodes, "hotkey-enter", "Ctrl+F2"),
-            Some(Change::HotkeyEnter("Ctrl+F2".to_owned()))
-        );
-        assert_eq!(
-            typed(&nodes, "hotkey-search", "F4"),
-            Some(Change::HotkeySearch("F4".to_owned()))
-        );
-        assert_eq!(
-            typed(&nodes, "hotkey-memo", ""),
-            Some(Change::HotkeyMemo(String::new()))
-        );
-        assert_eq!(typed(&nodes, "hotkey", "F1"), None, "nothing changed");
-    }
-
-    #[test]
-    fn languages_are_sent_trimmed_and_only_when_changed() {
-        let page = content(&scene("settings"));
-        let nodes = all(&page.body);
-        assert_eq!(
-            typed(&nodes, "languages", " de-DE, en-US "),
-            Some(Change::Languages("de-DE, en-US".to_owned()))
-        );
-        assert_eq!(typed(&nodes, "languages", "en-US, sl-SI "), None);
+        assert!(!nodes.iter().any(|node| matches!(node, Node::Hotkey { .. })));
     }
 
     #[test]
@@ -439,11 +367,12 @@ mod tests {
             Some(Change::Autostart(false))
         );
         assert_eq!(
-            flipped(
-                setting_row(&nodes, "Play a sound when listening starts"),
-                true
-            ),
+            flipped(setting_row(&nodes, "When listening starts"), true),
             Some(Change::ReadySound(true))
+        );
+        assert_eq!(
+            flipped(setting_row(&nodes, "When listening stops"), false),
+            Some(Change::StopSound(false))
         );
         let on = |title| {
             matches!(
@@ -455,7 +384,7 @@ mod tests {
                 })
             )
         };
-        assert!(on("Start with Windows") && on("Play a sound when listening starts"));
+        assert!(on("Start with Windows") && on("When listening starts"));
     }
 
     #[test]
@@ -505,7 +434,7 @@ mod tests {
     fn microphones(view: &View) -> (Vec<String>, usize, Vec<Option<Change>>, Tone) {
         let page = content(view);
         let nodes = all(&page.body);
-        let row = setting_row(&nodes, "Audio input");
+        let row = setting_row(&nodes, "Microphone");
         let Some(Node::Choice {
             items,
             selected,
@@ -588,6 +517,9 @@ mod tests {
     #[test]
     fn a_notice_for_this_page_is_shown_and_can_be_dismissed() {
         let mut view = scene("notice");
+        if let Some(notice) = &mut view.notice {
+            notice.page = Page::General;
+        }
         let page = content(&view);
         let [
             Node::InfoBar {

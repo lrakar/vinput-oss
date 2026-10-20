@@ -4,14 +4,14 @@ default-members = ["crates/vinput"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.8"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.94"
-repository = "https://github.com/lrakar/vinput-oss"
-license = "GPL-3.0-only"
+repository = "https://github.com/lrakar/vinput"
 publish = false
 
 [workspace.dependencies]
+putlab-core = { path = "crates/putlab-core" }
 vinput-core = { path = "crates/vinput-core" }
 vinput-host = { path = "crates/vinput-host" }
 vinput-ui = { path = "crates/vinput-ui" }
@@ -42,10 +42,14 @@ print_stdout = "warn"
 # The shipping profile: `scripts/release.ps1` and the size check in CI build
 # with it. The executable is downloaded by every user and stays resident, and
 # it waits on the network and on Windows rather than on the processor, so it
-# is built for size. Measure before changing any of this (`cargo size`), and
-# keep `ci.yml`'s budget in step.
+# is built for the smallest size there is. Against `opt-level = "s"` that
+# saved 345 kB of Vinput and cost nothing that could be measured: hashing,
+# sealing a stream, base64, JSON and the sounds of a dictation all took the
+# same time within the noise of a run (`cargo run --release -p vinput-core
+# --example workload`). Measure before changing any of this (`cargo size`),
+# and keep `ci.yml`'s budgets in step.
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true
@@ -53,9 +57,18 @@ panic = "abort"
 debug = false
 incremental = false
 
-# Encrypts every byte on the wire and checks multi-gigabyte model downloads.
+# What is slow in ring is written in assembly, which no level changes: at
+# "z" a 64 MB hash and a 64 MB AES-GCM seal took what they took at 3.
 [profile.release.package.ring]
-opt-level = 3
+opt-level = "z"
+
+# The hub's and Voutput's own profile, which CI builds by name
+# (`cargo build --profile small -p putlab-hub` puts the hub in
+# `target\small\putlab.exe`, and `-p voutput` Voutput beside it). It is the
+# release profile as it stands; the name is kept so that the two can part
+# again.
+[profile.small]
+inherits = "release"
 
 # Everyday builds: enough to get file and line in a backtrace of our own
 # code, and nothing to write out for the dependencies.

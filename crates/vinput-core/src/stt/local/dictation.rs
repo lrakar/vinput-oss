@@ -128,6 +128,9 @@ pub(super) struct Dictation {
     doubtful: bool,
     /// Everything typed so far.
     said: String,
+    /// The words of the user's dictionary, as a line of text the engine
+    /// reads before it listens. Empty without a dictionary.
+    listened_for: String,
 }
 
 impl Dictation {
@@ -150,7 +153,16 @@ impl Dictation {
             agreed: None,
             doubtful: false,
             said: String::new(),
+            listened_for: String::new(),
         }
+    }
+
+    /// Has the engine listen for `terms`, the words of the user's
+    /// dictionary: names and terms it would otherwise write as the common
+    /// words they sound like.
+    pub(super) fn listening_for(mut self, terms: &[String]) -> Self {
+        self.listened_for = crate::words::glossary(terms);
+        self
     }
 
     /// The language of the last stretch that had speech in it.
@@ -283,15 +295,41 @@ impl Dictation {
         if detail == Detail::Language {
             fields.push(("no_language_probabilities", "true"));
         }
-        let prompt = if self.doubtful {
-            ""
+        let read = if self.doubtful {
+            String::new()
         } else {
-            prompt(&self.said)
+            self.read()
         };
-        if !prompt.is_empty() {
-            fields.push(("prompt", prompt));
+        // The first engine carries on from what it reads. The second takes
+        // it for words to listen for, which is all it is handed.
+        let field = if self.engine.led() {
+            "prompt"
+        } else {
+            "context"
+        };
+        if !read.is_empty() {
+            fields.push((field, &read));
         }
         self.engine.infer(&fields, wav)
+    }
+
+    /// What the engine reads before it listens: the words of the
+    /// dictionary, and for an engine that carries on from the text so far,
+    /// the end of that text after them. The dictionary comes first because
+    /// the engine reads only the end of a long prompt, and the text so far
+    /// is what must not be cut.
+    fn read(&self) -> String {
+        let said = if self.engine.led() {
+            prompt(&self.said)
+        } else {
+            ""
+        };
+        let apart = if self.listened_for.is_empty() || said.is_empty() {
+            ""
+        } else {
+            " "
+        };
+        format!("{}{apart}{said}", self.listened_for)
     }
 }
 
@@ -804,6 +842,59 @@ mod tests {
             asked(&engine, 2, "prompt").as_deref(),
             Some("We meet on Thursday,")
         );
+    }
+
+    #[test]
+    fn the_dictionary_is_read_before_the_text_so_far() {
+        let terms = ["VinPUT".to_owned(), "Soniox".to_owned()];
+        let (dictation, engine) = dictation(
+            &["en"],
+            vec![
+                json!({"text": " We use VinPUT,\n"}),
+                json!({"text": " every day.\n"}),
+                part(" Thank you.", "english", 0.9, -0.2),
+            ],
+        );
+        let mut dictation = dictation.listening_for(&terms);
+        assert!(dictation.stretch(LONG).is_ok() && dictation.stretch(LONG).is_ok());
+        assert_eq!(
+            asked(&engine, 0, "prompt").as_deref(),
+            Some("VinPUT, Soniox.")
+        );
+        assert_eq!(
+            asked(&engine, 1, "prompt").as_deref(),
+            Some("VinPUT, Soniox. We use VinPUT,")
+        );
+        // What may not be speech is still read nothing: the engine would
+        // say the words it was handed.
+        assert_eq!(careful(&mut dictation, DOUBTFUL), Some(String::new()));
+        assert_eq!(asked(&engine, 2, "prompt"), None);
+        assert_eq!(asked(&engine, 2, "context"), None);
+    }
+
+    #[test]
+    fn the_second_engine_is_handed_the_dictionary_alone() {
+        let engine = Arc::new(Scripted {
+            answers: Mutex::new(
+                vec![
+                    json!({"text": "We use VinPUT.", "language": "english"}),
+                    json!({"text": "Every day.", "language": "english"}),
+                ]
+                .into(),
+            ),
+            sure_of_noise: true,
+            ..Scripted::default()
+        });
+        let mut dictation = Dictation::new(engine.clone(), vec!["en".to_owned()], None)
+            .listening_for(&["VinPUT".to_owned()]);
+        assert!(dictation.stretch(LONG).is_ok() && dictation.stretch(LONG).is_ok());
+        for request in 0..2 {
+            assert_eq!(
+                asked(&engine, request, "context").as_deref(),
+                Some("VinPUT.")
+            );
+            assert_eq!(asked(&engine, request, "prompt"), None);
+        }
     }
 
     #[test]

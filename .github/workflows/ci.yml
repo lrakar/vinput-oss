@@ -27,34 +27,98 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The line above lints the programs built together, where each sees
+      # the features the others ask of the crates they share. These lint
+      # each one as it ships, with its own features and nothing else.
+      - run: cargo clippy -p vinput --all-targets --locked -- -D warnings
+      - run: cargo clippy -p putlab-hub --all-targets --locked -- -D warnings
+      - run: cargo clippy -p voutput --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
-  # Builds the executable that ships, says how big it is and fails when it has
-  # outgrown its budget. See "How big a release may be" in docs/release.md.
+  # Builds each executable that ships, says how big it is and fails when it
+  # has outgrown its budget. See "How big a release may be" in docs/release.md.
   size:
     runs-on: windows-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Raise a budget in the commit that needs the room, and say there
+          # what the bytes buy.
+          #
+          # 2,646,528 bytes when its budget was first set; 3,453,440 once
+          # what it shares with the other programs was a crate of its own;
+          # 3,023,872 since it is built for the smallest size, its network
+          # thread runs a single-threaded runtime and its speech streams
+          # trust the certificates of Windows. 3,084,288 as 0.5.0: the
+          # dictionary, snippets and spoken formatting, Enter ending a
+          # dictation and VinPUT Pro carrying on out of reach. 3,185,152 with
+          # the Settings that fold (rows that open, lists that scroll inside
+          # the page, the picker of 68 languages, the way to the hub) and
+          # Cleanup (tidying a dictation, the key that edits the selection,
+          # the model that does both on the server or on this PC, and its
+          # page): 100,864 bytes for both. 3,192,832 as 0.5.1 merged, with
+          # the transcript event of the local API. 3,243,520 with actions of
+          # the user's own (a key that hands what was said to a program, its
+          # page in Settings, running the program with a time limit and
+          # typing or copying what it writes): 50,688 bytes.
+          - package: vinput
+            exe: vinput
+            profile: release
+            budget: 3255000
+          # 995,328 bytes when this was set, and under one megabyte is the
+          # point of it. 1,068,032 as 0.5.0, with the check of the
+          # publisher's signature on every program it installs (57 kB).
+          # 914,944 built with the profile `small`, without the line to a
+          # background process it does not have (the feature `line` of
+          # vinput-ui) and without the parts of a page only the other
+          # programs use (`pickers`).
+          - package: putlab-hub
+            exe: putlab
+            profile: small
+            budget: 925000
+          # 1,189,888 bytes when this was set; 1,193,984 with what Vinput
+          # 0.5.0 added to the windows of every program. 1,292,800 with the
+          # two voices that a server of their own speaks, a summary model
+          # that stays loaded, the Settings that fold, and the selection and
+          # the request to a model moved to the shared crate. 1,297,408 with
+          # summary instructions of the user's own (a field of several lines).
+          # 1,298,432 with what 0.5.1 added to the view. 1,304,576 with the
+          # changes and settings of the actions of Vinput, which the shared
+          # view crate carries for every program. 1,310,720 with the speed,
+          # the speaker and a sentence to try them under the voice in use
+          # (6,144 bytes, the thirty names of Gemini's voices among them).
+          # 1,323,008 with a summary of the window in front when nothing is
+          # selected: its text asked for through UI Automation, or read off
+          # the screen by the text recognition of Windows (12,288 bytes).
+          # 1,328,128 with Higgs TTS 3 and Zonos2 brought to the speed that
+          # is set, at the same pitch.
+          - package: voutput
+            exe: voutput
+            profile: small
+            budget: 1332000
     env:
-      # 2,646,528 bytes when this was set. Raise it in the commit that needs
-      # the room, and say there what the bytes buy.
-      BUDGET_BYTES: 3450000
+      BUDGET_BYTES: ${{ matrix.budget }}
+      EXE: ${{ matrix.exe }}
+      PROFILE: ${{ matrix.profile }}
     steps:
       - uses: actions/checkout@v5
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release
-      - run: cargo build --release --locked -p vinput
+          key: release-${{ matrix.package }}
+      - run: cargo build --profile ${{ matrix.profile }} --locked -p ${{ matrix.package }}
       - name: Report the size
         shell: pwsh
         run: |
-          $exe = Get-Item target\release\vinput.exe
+          $exe = Get-Item "target\$env:PROFILE\$env:EXE.exe"
           $budget = [long]$env:BUDGET_BYTES
           $image = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe.FullName))
           $needsRuntime = $image.IndexOf("VCRUNTIME140", [System.StringComparison]::OrdinalIgnoreCase) -ge 0
           $left = $budget - $exe.Length
           @(
-            "### vinput.exe"
+            "### $($exe.Name)"
             ""
             "| | bytes |"
             "| --- | ---: |"
@@ -64,14 +128,16 @@ jobs:
             ""
             "Needs the Visual C++ runtime: $(if ($needsRuntime) { 'yes' } else { 'no' })"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          # Also as a note on the run, where it is read without the log.
+          Write-Host "::notice title=$($exe.Name)::$($exe.Length) bytes, budget $budget"
           if ($needsRuntime) {
-            throw "vinput.exe imports VCRUNTIME140.dll; it must start on a PC with nothing but Windows (see .cargo/config.toml)"
+            throw "$($exe.Name) imports VCRUNTIME140.dll; it must start on a PC with nothing but Windows (see .cargo/config.toml)"
           }
           if ($left -lt 0) {
-            throw "vinput.exe is $($exe.Length) bytes, $(-$left) over its budget of $budget"
+            throw "$($exe.Name) is $($exe.Length) bytes, $(-$left) over its budget of $budget"
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: vinput-exe
-          path: target/release/vinput.exe
+          name: ${{ matrix.exe }}-exe
+          path: target/${{ matrix.profile }}/${{ matrix.exe }}.exe
           retention-days: 7

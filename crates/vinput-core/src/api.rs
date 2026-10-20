@@ -47,7 +47,7 @@ pub const MAX_ID: usize = 128;
 const MAX_NAME: usize = 48;
 
 /// The modes a session can be started in, as the API names them.
-pub const MODES: [&str; 5] = ["type", "type-enter", "capture", "search", "memo"];
+pub const MODES: [&str; 6] = ["type", "type-enter", "capture", "search", "memo", "command"];
 
 /// The commands Vinput understands, as the API names them.
 pub const COMMANDS: [&str; 4] = ["hello", "start", "stop", "toggle"];
@@ -61,6 +61,8 @@ pub fn mode_name(target: Target) -> &'static str {
         Target::Capture => "capture",
         Target::Search => "search",
         Target::Memo => "memo",
+        Target::Command => "command",
+        Target::Action(_) => "action",
     }
 }
 
@@ -73,6 +75,7 @@ pub fn mode_from_name(name: &str) -> Option<Target> {
         "capture" => Some(Target::Capture),
         "search" => Some(Target::Search),
         "memo" => Some(Target::Memo),
+        "command" => Some(Target::Command),
         _ => None,
     }
 }
@@ -381,6 +384,21 @@ pub enum Event<'a> {
         /// The id given when the dictation was started.
         id: Option<&'a str>,
     },
+    /// What a dictation has typed so far. Sent only if the user has switched
+    /// it on (`api_transcript` in the settings file).
+    Transcript {
+        /// Everything typed since the dictation started.
+        text: &'a str,
+        /// The mode of the dictation.
+        mode: Target,
+        /// A number that every event of one dictation carries and no other
+        /// dictation of this run does.
+        session: u64,
+        /// Whether the dictation has ended, so that this is all it typed.
+        last: bool,
+        /// The id given when the dictation was started over the API.
+        id: Option<&'a str>,
+    },
     /// A voice memo was saved, whoever started it.
     Memo {
         /// Full path of the MP3 file.
@@ -431,6 +449,22 @@ impl Event<'_> {
                 (json!({ "event": "state", "state": state(session) }), id)
             }
             Self::Dictation { text, id } => (json!({ "event": "dictation", "text": text }), id),
+            Self::Transcript {
+                text,
+                mode,
+                session,
+                last,
+                id,
+            } => (
+                json!({
+                    "event": "transcript",
+                    "text": text,
+                    "mode": mode_name(mode),
+                    "session": session,
+                    "final": last,
+                }),
+                id,
+            ),
             Self::Memo { path, seconds, id } => (
                 json!({
                     "event": "memo",
@@ -538,8 +572,8 @@ mod tests {
             "{parsed:?}"
         );
         assert_eq!(
-            printable("  Control\u{7}\r\nDeck\u{200b}  ", 48),
-            "ControlDeck\u{200b}"
+            printable("  Stream\u{7}\r\nDeck\u{200b}  ", 48),
+            "StreamDeck\u{200b}"
         );
         assert_eq!(printable("ab   cd", 3), "ab");
     }
@@ -648,7 +682,9 @@ mod tests {
     fn events_are_single_lines_of_json() {
         let hello = Event::Hello { session: None }.to_line();
         assert!(hello.contains(r#""event":"hello""#) && hello.contains(r#""state":"idle""#));
-        assert!(hello.contains(r#""modes":["type","type-enter","capture","search","memo"]"#));
+        assert!(
+            hello.contains(r#""modes":["type","type-enter","capture","search","memo","command"]"#)
+        );
         assert!(hello.contains(r#""max_line":65536"#) && !hello.contains("mode\""));
         let busy = Event::Hello {
             session: Some(Target::Memo),
@@ -682,6 +718,28 @@ mod tests {
                 .ok()
                 .and_then(|value| value.get("text").and_then(Value::as_str).map(str::to_owned)),
             Some("two\nlines \"quoted\" čšž".to_owned())
+        );
+        assert_eq!(
+            Event::Transcript {
+                text: "so far",
+                mode: Target::FocusedEnter,
+                session: 7,
+                last: false,
+                id: None,
+            }
+            .to_line(),
+            r#"{"event":"transcript","final":false,"mode":"type-enter","session":7,"text":"so far"}"#
+        );
+        assert_eq!(
+            Event::Transcript {
+                text: "all of it",
+                mode: Target::Focused,
+                session: 8,
+                last: true,
+                id: Some("t-1"),
+            }
+            .to_line(),
+            r#"{"event":"transcript","final":true,"id":"t-1","mode":"type","session":8,"text":"all of it"}"#
         );
         assert_eq!(
             Event::Memo {

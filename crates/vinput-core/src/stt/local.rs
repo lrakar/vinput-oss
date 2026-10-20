@@ -49,6 +49,7 @@
 //! suspending and ending are decided on one thread per engine
 //! ([`Server::unload_when_idle`]).
 
+mod cards;
 mod dictation;
 pub(crate) mod languages;
 mod pauses;
@@ -71,6 +72,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 
+pub use self::cards::fell_back;
 use self::dictation::{Care, Dictation, Inference};
 use self::pauses::Pauses;
 use self::phantoms::clean;
@@ -170,6 +172,8 @@ impl LocalSpeech {
         let program = models::usable_program(gpu, *runner).ok_or_else(not_installed)?;
         let model_file = models::model_path(file).ok_or_else(not_installed)?;
         let engine = match runner {
+            // It writes, and hears nothing.
+            Runner::Writer => return Err(not_installed()),
             Runner::Command => Engine::Command(Arc::new(Program {
                 executable: program,
                 model_file,
@@ -272,7 +276,8 @@ impl LocalSession {
         experience: Arc<Experience>,
     ) -> Result<Self> {
         let whole = !engine.led();
-        let dictation = Dictation::new(engine, languages, experience.language());
+        let dictation = Dictation::new(engine, languages, experience.language())
+            .listening_for(&crate::words::listened_for());
         Ok(Self::AtPauses {
             pauses: Pauses::new(),
             stretches: Stretches::start(dictation, Arc::clone(&experience))?,
@@ -411,7 +416,11 @@ impl Program {
             .arg("-t")
             .arg(threads().to_string())
             .stdin(Stdio::null());
-        if !self.gpu {
+        if self.gpu {
+            command
+                .arg("-dev")
+                .arg(cards::number(&self.executable, false).to_string());
+        } else {
             command.arg("-ng");
         }
         engine_folder(&mut command, &self.executable);
@@ -771,15 +780,30 @@ impl Server {
         if let Some(ears) = &self.ears {
             key = secret().map_err(|err| failed(err.to_string()))?;
             let set = std::env::vars_os().map(|(name, _)| name);
-            listener(&mut command, ears, self.gpu, &key, set);
-        } else if !self.gpu {
+            let card = self.gpu.then(|| cards::number(&self.program, true));
+            listener(&mut command, ears, card, &key, set);
+        } else if self.gpu {
+            // Which card, not whichever comes first: see `cards`.
+            command
+                .arg("-dev")
+                .arg(cards::number(&self.program, false).to_string());
+        } else {
             // The build at hand may be one for graphics cards while the user
             // wants the processor.
             command.arg("-ng");
         }
+        // The first engine says, as it loads the model, whether it uses the
+        // card it was told; that is listened for, and nothing else is.
+        let heeded = self.gpu && self.ears.is_none();
+        if heeded {
+            command.stderr(Stdio::piped());
+        }
         engine_folder(&mut command, &self.program);
         hide_console(&mut command);
-        let child = command.spawn().map_err(|err| failed(err.to_string()))?;
+        let mut child = command.spawn().map_err(|err| failed(err.to_string()))?;
+        if let Some(printed) = child.stderr.take().filter(|_| heeded) {
+            cards::heed(printed, &self.program);
+        }
         let (mut server, watcher) = Running::of(child, address, key);
         // The server listens once the model is loaded.
         let started = Instant::now();
@@ -981,7 +1005,10 @@ const SAID: &str = "<asr_text>";
 /// down what it hears. Its answer starts with the language. When the
 /// language is known the answer is started for it, and it goes on in that
 /// language. The text so far is not handed to it: it is taught to take such
-/// text for words to listen for, not for the sentence to carry on.
+/// text for words to listen for, not for the sentence to carry on. Words to
+/// listen for are what the field `context` holds, the user's dictionary,
+/// and they go where the model was taught to find them: in a message of
+/// the system, before the recording.
 fn converse(
     (address, key): (SocketAddr, &str),
     fields: &[(&str, &str)],
@@ -993,11 +1020,16 @@ fn converse(
         .and_then(|(_, code)| languages::taught(code))
         .map(|name| format!(r#",{{"role":"assistant","content":"language {name}{SAID}"}}"#))
         .unwrap_or_default();
+    let listened_for = fields
+        .iter()
+        .find(|(name, _)| *name == "context")
+        .map(|(_, words)| format!(r#"{{"role":"system","content":{}}},"#, Value::from(*words)))
+        .unwrap_or_default();
     // A model that loses its way repeats itself for as long as it may, so
     // it may write no more than fits in the recording at any pace of speech.
     let most = 64 + 16 * wav.len() / (2 * SAMPLE_RATE_HZ as usize);
     let request = format!(
-        r#"{{"messages":[{{"role":"user","content":[{{"type":"input_audio","input_audio":{{"data":"{}","format":"wav"}}}}]}}{begun}],"temperature":0,"max_tokens":{most}}}"#,
+        r#"{{"messages":[{listened_for}{{"role":"user","content":[{{"type":"input_audio","input_audio":{{"data":"{}","format":"wav"}}}}]}}{begun}],"temperature":0,"max_tokens":{most}}}"#,
         BASE64.encode(wav)
     );
     let (status, reply) = exchange(
@@ -1042,9 +1074,9 @@ fn secret() -> std::io::Result<String> {
 
 /// What the second engine is started with besides its model and its port.
 ///
-/// One dictation at a time, no page for a browser, and the first graphics
-/// card or none: left to itself this engine spreads a model over every card
-/// it finds.
+/// One dictation at a time, no page for a browser, and one graphics card,
+/// the one with the number `card`, or none: left to itself this engine
+/// spreads a model over every card it finds.
 ///
 /// It takes its settings from the environment as well as from its command
 /// line, under names that start with `LLAMA_`. Of the variables `set` for
@@ -1056,15 +1088,15 @@ fn secret() -> std::io::Result<String> {
 fn listener(
     command: &mut Command,
     ears: &Path,
-    gpu: bool,
+    card: Option<u32>,
     key: &str,
     set: impl Iterator<Item = OsString>,
 ) {
-    let device = if gpu { "Vulkan0" } else { "none" };
+    let device = card.map_or_else(|| "none".to_owned(), |number| format!("Vulkan{number}"));
     command
         .arg("--mmproj")
         .arg(ears)
-        .args(["--no-webui", "-np", "1", "--device", device]);
+        .args(["--no-webui", "-np", "1", "--device", &device]);
     // Windows does not tell the names of variables apart by their case.
     let theirs = |name: &OsString| {
         name.to_string_lossy()
@@ -1345,6 +1377,7 @@ mod tests {
                 "500 Internal Server Error",
                 r#"{"error":{"message":"no room"}}"#,
             ),
+            written("language English<asr_text>VinPUT."),
         ];
         let (address, engine) = fake_engine(answers, Duration::ZERO)?;
         let wav = wav_bytes(&[1, 2, 3]);
@@ -1363,6 +1396,9 @@ mod tests {
         assert!(languages::code_of(reply["language"].as_str().unwrap_or_default()).is_none());
         let failed = ask("auto");
         assert!(matches!(failed, Err(Error::Transcription(why)) if why.contains("no room")));
+        // The words of the user's dictionary go in a message of the system.
+        let fields = [("language", "en"), ("context", "VinPUT, \"Lovro\".")];
+        converse((address, "Zm9v"), &fields, &wav, RECOGNIZE_TIMEOUT)?;
 
         let requests = engine.join().unwrap_or_default();
         let request = |index: usize| String::from_utf8_lossy(&requests[index]).into_owned();
@@ -1375,6 +1411,10 @@ mod tests {
         assert!(request(0).contains("language English<asr_text>"));
         assert!(!request(1).contains("<asr_text>"));
         assert!(!request(2).contains("<asr_text>"));
+        assert!(!request(0).contains(r#""role":"system""#));
+        assert!(request(3).contains(
+            r#"{"messages":[{"role":"system","content":"VinPUT, \"Lovro\"."},{"role":"user","#
+        ));
         Ok(())
     }
 
@@ -1573,7 +1613,7 @@ mod tests {
         listener(
             &mut command,
             Path::new("ears.gguf"),
-            false,
+            None,
             &key,
             set.into_iter().map(OsString::from),
         );
@@ -1608,6 +1648,19 @@ mod tests {
                 "--DEVICE",
                 "NONE"
             ]
+        );
+        // On a graphics card it is told which one, by the engine's number.
+        let mut on_a_card = Command::new("llama-server");
+        listener(
+            &mut on_a_card,
+            Path::new("ears.gguf"),
+            Some(2),
+            &key,
+            std::iter::empty(),
+        );
+        assert_eq!(
+            on_a_card.get_args().last().map(text),
+            Some("VULKAN2".into())
         );
         // The key is on no command line, where any program could read it,
         assert!(!args.contains(&key.to_ascii_uppercase()));

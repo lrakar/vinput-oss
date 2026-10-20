@@ -21,6 +21,9 @@ pub enum Error {
     Injection(String),
     /// Recording or saving a voice memo failed.
     Memo(String),
+    /// Rewriting text with a language model failed: tidying up what was
+    /// dictated, or editing a selection. In words for the user.
+    Rewrite(String),
     /// Downloading or installing a speech model, or an update, failed.
     Install(String),
     /// The background host (hidden window, hotkey, tray icon) failed.
@@ -34,6 +37,7 @@ impl fmt::Display for Error {
             Self::Transcription(msg) | Self::Setup(msg) => write!(f, "transcription failed: {msg}"),
             Self::Injection(msg) => write!(f, "text injection failed: {msg}"),
             Self::Memo(msg) => write!(f, "voice memo failed: {msg}"),
+            Self::Rewrite(msg) => f.write_str(msg),
             Self::Install(msg) => write!(f, "install failed: {msg}"),
             Self::Host(msg) => write!(f, "background host failed: {msg}"),
         }

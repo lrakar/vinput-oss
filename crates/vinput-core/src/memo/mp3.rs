@@ -6,13 +6,13 @@
 //! Windows puts a tag in front of the audio that says, for players that join
 //! tracks without a gap, how many samples at the start and at the end are
 //! not part of the recording. Its count for the end is wrong whenever the
-//! encoder changed the sample rate, as it always does here: a number near
-//! four thousand million, where some two thousand are meant. A player that
-//! goes by the tag has nothing left to play. The players of Windows do not
-//! go by it (a test here plays a memo with their decoder), but a memo is made
-//! to be sent to someone else. So the tag is taken off again
-//! ([`without_tag`]): an MP3 needs none, and without it every player plays
-//! what is in the file.
+//! encoder changed the sample rate, as it does for a microphone at 16 kHz:
+//! a number near four thousand million, where some two thousand are meant.
+//! A player that goes by the tag has nothing left to play. The players of
+//! Windows do not go by it (a test here plays a memo with their decoder),
+//! but a memo is made to be sent to someone else. So the tag is taken off
+//! again ([`without_tag`]): an MP3 needs none, and without it every player
+//! plays what is in the file.
 #![allow(unsafe_code)]
 
 use std::path::Path;
@@ -28,28 +28,43 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::core::HSTRING;
 use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 
-use crate::audio::SAMPLE_RATE_HZ;
 use crate::{Error, Result};
 
-/// Sample rate of the MP3. The system encoder takes the standard MPEG-1
-/// rates, of which this is the lowest; Windows converts the recording to it.
-const MP3_RATE_HZ: u32 = 32_000;
-/// 64 kbit/s, which is transparent for one voice.
-const MP3_BYTES_PER_SECOND: u32 = 8_000;
-/// Samples handed to the encoder at a time: one second.
-const CHUNK_SAMPLES: usize = SAMPLE_RATE_HZ as usize;
+/// The sample rates of MPEG-1 layer III, the ones the system encoder takes.
+const MP3_RATES_HZ: [u32; 3] = [32_000, 44_100, 48_000];
+/// The bit rates a memo is encoded at, in bytes per second, the best that
+/// the encoder takes. 128 kbit/s is the most the encoder of Windows does for
+/// one channel, at 32, 44.1 and 48 kHz alike, and a voice recorded at 48 kHz
+/// sounds at it as it did. 64 kbit/s, which memos used to have, is there for
+/// an encoder that will not.
+const BYTES_PER_SECOND: [u32; 2] = [16_000, 8_000];
 /// Media Foundation counts time in units of 100 nanoseconds.
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
-/// Encodes mono 16-bit samples at the pipeline rate into an MP3 file at `path`.
+/// The sample rate of the MP3 of a recording at `rate`: the same if MP3 has
+/// it, otherwise the next one up, to which Windows converts the recording.
+pub(super) fn mp3_rate(rate: u32) -> u32 {
+    MP3_RATES_HZ
+        .into_iter()
+        .find(|&mp3| mp3 >= rate)
+        .unwrap_or(MP3_RATES_HZ[2])
+}
+
+/// Encodes mono 16-bit samples at `rate` into an MP3 file at `path`.
+/// `next` fills the buffer it is given with the next samples and says how
+/// many; 0 is the end.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Memo`] if the encoder is not available (Windows editions
 /// without the media features) or the file cannot be written. A partial file
 /// is removed.
-pub(super) fn encode(samples: &[i16], path: &Path) -> Result<()> {
-    let tidied = encode_tagged(samples, path).and_then(|()| {
+pub(super) fn encode(
+    rate: u32,
+    path: &Path,
+    next: &mut dyn FnMut(&mut [i16]) -> usize,
+) -> Result<()> {
+    let tidied = encode_tagged(rate, path, next).and_then(|()| {
         let file = std::fs::read(path).map_err(|err| err.to_string())?;
         let audio = without_tag(&file);
         if audio.is_empty() {
@@ -66,8 +81,13 @@ pub(super) fn encode(samples: &[i16], path: &Path) -> Result<()> {
     })
 }
 
-/// Has Windows encode `samples` into an MP3 file at `path`, tag and all.
-fn encode_tagged(samples: &[i16], path: &Path) -> std::result::Result<(), String> {
+/// Has Windows encode what `next` gives into an MP3 file at `path`, tag
+/// and all.
+fn encode_tagged(
+    rate: u32,
+    path: &Path,
+    next: &mut dyn FnMut(&mut [i16]) -> usize,
+) -> std::result::Result<(), String> {
     if !encoder_present() {
         return Err(
             "this edition of Windows has no MP3 encoder; install the Media Feature Pack".into(),
@@ -79,7 +99,7 @@ fn encode_tagged(samples: &[i16], path: &Path) -> std::result::Result<(), String
     let written = unsafe {
         let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
         let result = MFStartup(MF_VERSION, MFSTARTUP_LITE).and_then(|()| {
-            let result = write(samples, path);
+            let result = write(rate, path, next);
             let _ = MFShutdown();
             result
         });
@@ -148,25 +168,59 @@ unsafe fn audio_type(
     }
 }
 
-unsafe fn write(samples: &[i16], path: &Path) -> windows::core::Result<()> {
+/// A writer of an MP3 file at `path` from mono 16-bit PCM at `rate`, at
+/// the best of [`BYTES_PER_SECOND`] the encoder takes, and its stream.
+///
+/// # Safety
+///
+/// COM and Media Foundation must be started.
+unsafe fn writer(rate: u32, path: &Path) -> windows::core::Result<(IMFSinkWriter, u32)> {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let input = audio_type(&MFAudioFormat_PCM, rate, rate * 2)?;
+        input.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        input.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 2)?;
+        input.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        let mut refused = None;
+        for bytes_per_second in BYTES_PER_SECOND {
+            let tried = (|| {
+                let writer: IMFSinkWriter =
+                    MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, None)?;
+                let output = audio_type(&MFAudioFormat_MP3, mp3_rate(rate), bytes_per_second)?;
+                let stream = writer.AddStream(&output)?;
+                writer.SetInputMediaType(stream, &input, None)?;
+                Ok((writer, stream))
+            })();
+            match tried {
+                Ok(writer) => return Ok(writer),
+                Err(err) => refused = Some(err),
+            }
+        }
+        Err(refused.unwrap_or_else(windows::core::Error::empty))
+    }
+}
+
+unsafe fn write(
+    rate: u32,
+    path: &Path,
+    next: &mut dyn FnMut(&mut [i16]) -> usize,
+) -> windows::core::Result<()> {
     // SAFETY: the caller has started COM and Media Foundation. Buffers are
     // locked only for the copy, which stays within the length they were
     // created with.
     unsafe {
-        let writer: IMFSinkWriter =
-            MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, None)?;
-        let output = audio_type(&MFAudioFormat_MP3, MP3_RATE_HZ, MP3_BYTES_PER_SECOND)?;
-        let stream = writer.AddStream(&output)?;
-
-        let input = audio_type(&MFAudioFormat_PCM, SAMPLE_RATE_HZ, SAMPLE_RATE_HZ * 2)?;
-        input.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-        input.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 2)?;
-        input.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-        writer.SetInputMediaType(stream, &input, None)?;
+        let (writer, stream) = writer(rate, path)?;
         writer.BeginWriting()?;
 
+        // Handed to the encoder a second at a time.
+        let mut samples = vec![0i16; rate as usize];
         let mut position = 0i64;
-        for chunk in samples.chunks(CHUNK_SAMPLES) {
+        loop {
+            let read = next(&mut samples).min(samples.len());
+            if read == 0 {
+                break;
+            }
+            let chunk = &samples[..read];
             let bytes = u32::try_from(chunk.len() * 2).unwrap_or(0);
             let buffer = MFCreateMemoryBuffer(bytes)?;
             let mut data = std::ptr::null_mut();
@@ -175,8 +229,8 @@ unsafe fn write(samples: &[i16], path: &Path) -> windows::core::Result<()> {
             buffer.Unlock()?;
             buffer.SetCurrentLength(bytes)?;
 
-            let duration = i64::try_from(chunk.len()).unwrap_or(0) * TICKS_PER_SECOND
-                / i64::from(SAMPLE_RATE_HZ);
+            let duration =
+                i64::try_from(chunk.len()).unwrap_or(0) * TICKS_PER_SECOND / i64::from(rate);
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime(position)?;
@@ -197,9 +251,11 @@ mod tests {
 
     use super::*;
 
+    use crate::audio::SAMPLE_RATE_HZ;
+
     /// Decodes an MP3 file with the decoder of Windows, the one its own
-    /// players use, to mono 16-bit samples at the rate of the file.
-    fn decode(path: &Path) -> windows::core::Result<Vec<i16>> {
+    /// players use, to mono 16-bit samples at `rate`, the rate of the file.
+    fn decode(path: &Path, rate: u32) -> windows::core::Result<Vec<i16>> {
         // The reader's name for the first audio stream, as the bits it takes.
         let stream = u32::from_ne_bytes(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0.to_ne_bytes());
         let ended = u32::from_ne_bytes(MF_SOURCE_READERF_ENDOFSTREAM.0.to_ne_bytes());
@@ -217,7 +273,7 @@ mod tests {
                 pcm.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
                 pcm.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
                 pcm.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 1)?;
-                pcm.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, MP3_RATE_HZ)?;
+                pcm.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate)?;
                 reader.SetCurrentMediaType(stream, None, &pcm)?;
                 let mut samples = Vec::new();
                 loop {
@@ -275,23 +331,42 @@ mod tests {
     }
 
     #[test]
+    fn a_memo_is_an_mp3_at_the_rate_of_its_microphone_or_the_next_one_up() {
+        assert_eq!(mp3_rate(48_000), 48_000);
+        assert_eq!(mp3_rate(44_100), 44_100);
+        assert_eq!(mp3_rate(32_000), 32_000);
+        // Headsets and the speech rate.
+        assert_eq!(mp3_rate(SAMPLE_RATE_HZ), 32_000);
+        assert_eq!(mp3_rate(8_000), 32_000);
+        // Nothing records a memo above 48 kHz, but the MP3 would hold it.
+        assert_eq!(mp3_rate(96_000), 48_000);
+    }
+
+    #[test]
     fn a_memo_plays_in_full_in_the_players_of_windows() -> std::result::Result<(), String> {
         let dir = std::env::temp_dir().join(format!("vinput-mp3-play-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         let recording = recording();
         let path = dir.join("memo.mp3");
-        let encoded = encode(&recording, &path);
+        let mut rest = &recording[..];
+        let encoded = encode(SAMPLE_RATE_HZ, &path, &mut |buf| {
+            let count = buf.len().min(rest.len());
+            buf[..count].copy_from_slice(&rest[..count]);
+            rest = &rest[count..];
+            count
+        });
         if encoded.is_err() && std::env::var_os("CI").is_some() {
             // Server editions of Windows can come without the media features.
             eprintln!("skipped: {encoded:?}");
             return std::fs::remove_dir_all(dir).map_err(|err| err.to_string());
         }
         encoded.map_err(|err| err.to_string())?;
-        let played = decode(&path).map_err(|err| err.message())?;
+        let mp3 = mp3_rate(SAMPLE_RATE_HZ);
+        let played = decode(&path, mp3).map_err(|err| err.message())?;
 
         // As long as the recording, give or take the frame the encoder
         // needs to start and the one it ends in, and as loud.
-        let rate = f64::from(MP3_RATE_HZ / SAMPLE_RATE_HZ);
+        let rate = f64::from(mp3 / SAMPLE_RATE_HZ);
         #[expect(clippy::cast_precision_loss, reason = "a length, to compare")]
         let (length, expected) = (played.len() as f64, recording.len() as f64 * rate);
         assert!(

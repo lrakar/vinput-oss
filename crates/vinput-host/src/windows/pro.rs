@@ -42,7 +42,7 @@ use crate::win::{is_page, open};
 use vinput_core::cloud::{self, Account, AccountInfo, Failure, Plan, Prices, Reason, Tier};
 use vinput_core::session::Controller;
 use vinput_core::settings::Settings;
-use vinput_core::stt::{ProviderKind, Standby};
+use vinput_core::stt::{Cause, ProviderKind, Served, Standby};
 use vinput_core::{log, models};
 use vinput_view::{self as wire, Page};
 
@@ -185,6 +185,9 @@ pub(super) struct Pro {
     /// Until when it is not said again that the hours are used up, in
     /// seconds since 1970.
     told_until: u64,
+    /// Whether it was said that the server is out of reach, since it last
+    /// was: said once, not with every dictation.
+    told_out_of_reach: bool,
 }
 
 /// For how long at least it is not said again that the hours are used up.
@@ -210,19 +213,33 @@ impl Pro {
         );
     }
 
+    /// Why a model on this PC serves in place of `VinPUT` Pro right now,
+    /// if one does: the month's hours are used up, or the last dictation
+    /// found the server out of reach. Two numbers read from memory.
+    fn carrying(&self) -> Option<Cause> {
+        if self.standby.until() != 0 {
+            Some(Cause::UsedUp)
+        } else if self.standby.out_of_reach() {
+            Some(Cause::OutOfReach)
+        } else {
+            None
+        }
+    }
+
     /// Name of the model on this PC that serves in place of `VinPUT` Pro
-    /// right now, because the month's hours are used up; `None` while Pro
-    /// serves, which is all that is looked at then.
-    pub(super) fn carrying_with(&self, settings: &Settings) -> Option<&'static str> {
-        if settings.provider != ProviderKind::Cloud || self.standby.until() == 0 {
+    /// right now, and why it does; `None` while Pro serves, which is all
+    /// that is looked at then.
+    pub(super) fn carrying_with(&self, settings: &Settings) -> Option<(&'static str, Cause)> {
+        if settings.provider != ProviderKind::Cloud {
             return None;
         }
-        models::spare(
+        let cause = self.carrying()?;
+        let model = models::spare(
             &settings.last_local_model,
             &settings.languages,
             settings.use_gpu(),
-        )
-        .map(|model| model.name)
+        )?;
+        Some((model.name, cause))
     }
 
     /// Why `VinPUT` Pro cannot serve a dictation as things stand, as far as
@@ -240,6 +257,18 @@ impl Pro {
     /// only while one has to.
     pub(super) fn lacks(&self, settings: &Settings) -> Option<&'static str> {
         self.lacks_unless(|| self.carrying_with(settings).is_some())
+    }
+
+    /// Whether the model that comes with the subscription cannot be had,
+    /// as far as is known without asking: nobody is signed in, or the
+    /// server has said that whoever is has no plan. The hours of the month
+    /// have no say in it: rewriting is not counted against them.
+    pub(super) fn lacks_plan(&self) -> bool {
+        self.email.is_none()
+            || self
+                .info
+                .as_ref()
+                .is_some_and(|(info, _)| !info.entitled && !info.complimentary)
     }
 
     /// [`Pro::lacks`], where `carries` says whether a model on this PC
@@ -268,6 +297,7 @@ impl Pro {
             doing: ProDoing::Nothing,
             payment: Arc::default(),
             problem: None,
+            told_out_of_reach: false,
             asked: None,
             prices: Prices::default(),
             prices_asked: None,
@@ -293,7 +323,7 @@ impl Pro {
             doing: self.doing,
             problem: self.problem.as_deref(),
             prices: &self.prices,
-            carrying: self.standby.until() != 0,
+            carrying: self.carrying(),
         }
     }
 
@@ -591,6 +621,20 @@ fn carrying_on(model: &str, whole: bool) -> String {
     text
 }
 
+/// What is said when the server was out of reach and a dictation was
+/// carried on with `model`. `whole` says whether everything that was said
+/// reached it.
+fn standing_in(model: &str, whole: bool) -> String {
+    let mut text = format!(
+        "Dictation carried on with {model}, on this PC. VinPUT Pro is used again once it can \
+         be reached."
+    );
+    if !whole {
+        text.push_str(" What was said just before the switch may be missing.");
+    }
+    text
+}
+
 /// Sleeps for `time` unless `stop` is set first. Says whether it was.
 fn stopped_within(stop: &AtomicBool, time: Duration) -> bool {
     let started = Instant::now();
@@ -776,12 +820,26 @@ impl Host {
         }));
     }
 
-    /// A session has ended. If the model on this PC served it, because the
-    /// hours of the month are used up, that is said, once for a month and
-    /// not with every dictation, and the account is asked until when.
+    /// A session has ended. If the model on this PC served it, that is
+    /// said, and not with every dictation: once for a month when the hours
+    /// are used up, and the account is asked until when; once for as long
+    /// as the server stays out of reach when it was that. The tray and the
+    /// windows say which model is at work for as long as it is.
     pub(super) fn pro_after_session(&mut self) {
-        let Some(whole) = self.pro.standby.take_served() else {
-            return;
+        let served = self.pro.standby.take_served();
+        if !self.pro.standby.out_of_reach() && self.pro.told_out_of_reach {
+            // VinPUT Pro has served a dictation again.
+            self.pro.told_out_of_reach = false;
+            self.refresh_tip();
+            self.show_state();
+        }
+        let whole = match served {
+            None => return,
+            Some(Served {
+                cause: Cause::OutOfReach,
+                whole,
+            }) => return self.pro_stood_in(whole),
+            Some(Served { whole, .. }) => whole,
         };
         let known = self.pro.info.as_ref();
         if !known.is_some_and(|(info, _)| info.over_allowance()) {
@@ -799,8 +857,26 @@ impl Host {
         self.tray.inform(
             About::Settings(Page::Pro),
             "VinPUT Pro hours used up",
-            &carrying_on(model.unwrap_or("a model on this PC"), whole),
+            &carrying_on(model.map_or("a model on this PC", |(name, _)| name), whole),
         );
+        self.refresh_tip();
+        self.show_state();
+    }
+
+    /// The model on this PC served a dictation because the server was out
+    /// of reach. That is said the first time, without a sound, and then
+    /// only by the tray and the windows, until the server has served again.
+    fn pro_stood_in(&mut self, whole: bool) {
+        // Some of what was said missing is worth saying each time.
+        if !self.pro.told_out_of_reach || !whole {
+            let model = self.pro.carrying_with(&self.settings);
+            self.tray.mention(
+                About::Settings(Page::Models),
+                "VinPUT Pro could not be reached",
+                &standing_in(model.map_or("a model", |(name, _)| name), whole),
+            );
+        }
+        self.pro.told_out_of_reach = true;
         self.refresh_tip();
         self.show_state();
     }
@@ -1546,7 +1622,7 @@ mod tests {
     #[test]
     fn used_up_hours_hand_dictation_to_this_pc_and_hours_that_are_back_hand_it_back() {
         let mut pro = pro(Some("ana@example.com"));
-        assert!(!pro.facts().carrying);
+        assert_eq!(pro.facts().carrying, None);
         let session = pro.session;
         // Hours left: VinPUT Pro serves.
         let mut account = info(true);
@@ -1556,7 +1632,7 @@ mod tests {
             pro.take(session, Report::Info(Ok(account.clone())))
                 .is_empty()
         );
-        assert!(!pro.facts().carrying);
+        assert_eq!(pro.facts().carrying, None);
         // None left: the model on this PC does, and that is all that
         // changes. Nothing is to be done besides: no other model is chosen,
         // nothing is set up again, the settings are not touched.
@@ -1565,7 +1641,7 @@ mod tests {
             pro.take(session, Report::Info(Ok(account.clone())))
                 .is_empty()
         );
-        assert!(pro.facts().carrying);
+        assert_eq!(pro.facts().carrying, Some(Cause::UsedUp));
         assert_eq!(pro.standby.until(), u64::MAX);
         // A tier with more hours, or a new month: Pro again, by itself.
         account.cap_seconds *= 2;
@@ -1573,18 +1649,18 @@ mod tests {
             pro.take(session, Report::Info(Ok(account.clone())))
                 .is_empty()
         );
-        assert!(!pro.facts().carrying);
+        assert_eq!(pro.facts().carrying, None);
         // An account that cannot use Pro has no hours to have run out, and
         // neither has nobody.
         account.used_seconds = account.cap_seconds;
         account.entitled = false;
         pro.take(session, Report::Info(Ok(account.clone())));
-        assert!(!pro.facts().carrying);
+        assert_eq!(pro.facts().carrying, None);
         account.complimentary = true;
         pro.take(session, Report::Info(Ok(account)));
-        assert!(pro.facts().carrying);
+        assert_eq!(pro.facts().carrying, Some(Cause::UsedUp));
         pro.reset();
-        assert!(!pro.facts().carrying);
+        assert_eq!(pro.facts().carrying, None);
     }
 
     #[test]
@@ -1601,6 +1677,22 @@ mod tests {
         // Another model chosen: its hours are nobody's business.
         settings.provider = ProviderKind::Local;
         assert_eq!(pro.carrying_with(&settings), None);
+    }
+
+    #[test]
+    fn what_is_said_when_the_server_is_out_of_reach_names_the_model_and_what_may_be_missing() {
+        assert_eq!(
+            standing_in("Whisper base", true),
+            "Dictation carried on with Whisper base, on this PC. VinPUT Pro is used again \
+             once it can be reached."
+        );
+        assert!(
+            standing_in("Whisper base", false)
+                .ends_with("reached. What was said just before the switch may be missing.")
+        );
+        // Windows shows no more than this of a notification.
+        let longest = standing_in("Whisper large-v3 turbo (compact)", false);
+        assert!(longest.encode_utf16().count() < 256, "{longest}");
     }
 
     #[test]

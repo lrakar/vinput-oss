@@ -12,7 +12,7 @@ use crate::Result;
 pub const GEMINI_API_KEY: &str = "gemini-api-key";
 
 /// A service account key for Google Cloud Speech-to-Text, cut down to what
-/// asking for access tokens needs; see [`crate::stt::check`].
+/// asking for access tokens needs.
 pub const GOOGLE_CLOUD_KEY: &str = "google-cloud-key";
 
 /// The session with `VinPUT` Pro: its refresh token and whose it is; see

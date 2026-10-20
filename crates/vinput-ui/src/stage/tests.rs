@@ -4,6 +4,7 @@ use vinput_view::{Change, Dialog, GoogleStep, Settings, Setup};
 
 use super::*;
 use crate::hotkey::{self, Modifiers};
+use crate::layout::Memory;
 use crate::layout::ruler::Ruler;
 use crate::mock;
 use crate::scene::Asking;
@@ -23,6 +24,18 @@ fn stage(page: Page) -> Stage {
         Box::new(Ruler),
     )
 }
+
+/// A stage on `page` with the row that opens called `key` open.
+fn opened(page: Page, key: &str) -> Stage {
+    let mut stage = stage(page);
+    let mut memory = Memory::default();
+    memory.set_open(key, true);
+    stage.remember(memory);
+    stage
+}
+
+/// What the field of the Shortcuts page that these tests type in holds.
+const SEARCH: &str = "https://www.google.com/search?q=%s";
 
 fn find(stage: &Stage, test: impl Fn(&Control) -> bool) -> usize {
     let found = stage.frame().controls.iter().position(test);
@@ -86,7 +99,11 @@ fn the_pane_turns_pages_and_keeps_the_keyboard() {
         stage.frame().controls[models].kind,
         Kind::Nav { selected: true, .. }
     ));
-    // Arrows move within the pane, Enter opens.
+    // Arrows move within the pane, past Words and Cleanup, and Enter opens.
+    let (used, _) = stage.key_down(vk::DOWN, NONE);
+    assert!(used);
+    let (used, _) = stage.key_down(vk::DOWN, NONE);
+    assert!(used);
     let (used, _) = stage.key_down(vk::DOWN, NONE);
     assert!(used);
     let (_, effects) = stage.key_down(vk::ENTER, NONE);
@@ -242,7 +259,7 @@ fn a_paste_into_any_other_field_waits_for_enter() {
 
 #[test]
 fn tab_walks_every_control_once_and_stops_in_the_pane_once() {
-    let mut stage = stage(Page::General);
+    let mut stage = stage(Page::Shortcuts);
     let stops = stage
         .frame()
         .controls
@@ -274,20 +291,26 @@ fn tab_walks_every_control_once_and_stops_in_the_pane_once() {
 
 #[test]
 fn a_field_hands_in_what_was_typed_only_if_it_changed() {
-    let mut stage = stage(Page::General);
-    let field = find(&stage, |c| c.key == Some("languages"));
+    let mut stage = opened(Page::Shortcuts, "search-with");
+    let field = find(&stage, |c| c.key == Some("search-url"));
     let effects = click(&mut stage, field);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Edit(Editing { key: "languages", text, select_all: false, .. })] if text == "en-US, sl-SI"
+        [Effect::Edit(Editing { key: "search-url", text, select_all: false, .. })] if text == SEARCH
     ));
     assert!(stage.edit_rect().is_some_and(|(_, seen)| seen));
     // Enter without a change says nothing.
     assert!(stage.edit_enter().is_empty());
-    stage.typed("de-DE".to_owned());
+    assert!(
+        stage
+            .typed("https://example.com/?q=%s".to_owned())
+            .is_empty()
+    );
     assert_eq!(
         sends(&stage.edit_enter()),
-        [Command::Set(Change::Languages("de-DE".to_owned()))]
+        [Command::Set(Change::SearchUrl(
+            "https://example.com/?q=%s".to_owned()
+        ))]
     );
     // Nor does leaving after that; the edit control goes away.
     assert_eq!(stage.edit_lost(), [Effect::EndEdit]);
@@ -296,30 +319,27 @@ fn a_field_hands_in_what_was_typed_only_if_it_changed() {
 
 #[test]
 fn escape_puts_a_field_back_and_a_rebuild_keeps_what_is_typed() {
-    let mut stage = stage(Page::General);
-    let field = find(&stage, |c| c.key == Some("languages"));
+    let mut stage = opened(Page::Shortcuts, "search-with");
+    let field = find(&stage, |c| c.key == Some("search-url"));
     click(&mut stage, field);
     stage.typed("fr".to_owned());
     // A new view arrives in the middle of typing.
-    let mut view = mock::scene("listening").unwrap_or_default();
-    view.settings.languages = "en-US, sl-SI".to_owned();
+    let view = mock::scene("listening").unwrap_or_default();
+    assert_eq!(view.settings.search_url, SEARCH);
     assert!(stage.set_view(view).is_empty());
     assert!(matches!(
         &stage.frame().controls[field].kind,
         Kind::Field { text, .. } if text == "fr"
     ));
     assert_eq!(stage.look().editing, Some(field));
-    assert_eq!(
-        stage.edit_escape(),
-        [Effect::Retype("en-US, sl-SI".to_owned())]
-    );
+    assert_eq!(stage.edit_escape(), [Effect::Retype(SEARCH.to_owned())]);
     assert_eq!(stage.edit_lost(), [Effect::EndEdit]);
 }
 
 #[test]
 fn what_was_handed_in_gives_way_to_what_the_view_says() {
-    let mut stage = stage(Page::General);
-    let field = find(&stage, |c| c.key == Some("languages"));
+    let mut stage = opened(Page::Shortcuts, "search-with");
+    let field = find(&stage, |c| c.key == Some("search-url"));
     click(&mut stage, field);
     stage.typed("xx".to_owned());
     let lost = stage.edit_lost();
@@ -328,7 +348,7 @@ fn what_was_handed_in_gives_way_to_what_the_view_says() {
     stage.set_view(mock::scene("settings").unwrap_or_default());
     assert!(matches!(
         &stage.frame().controls[field].kind,
-        Kind::Field { text, .. } if text == "en-US, sl-SI"
+        Kind::Field { text, .. } if text == SEARCH
     ));
 }
 
@@ -354,8 +374,57 @@ fn a_button_beside_a_field_reads_what_is_typed_in_it() {
 }
 
 #[test]
+fn adding_an_entry_reads_both_fields_and_empties_them_for_the_next() {
+    let mut stage = stage(Page::Words);
+    let field = |stage: &Stage, key: &str| find(stage, |c| c.key == Some(key));
+    let reads = |stage: &Stage, key: &str| match &stage.frame().controls[field(stage, key)].kind {
+        Kind::Field { text, .. } => text.clone(),
+        _ => unreachable!("a field was expected"),
+    };
+    let word = field(&stage, "word");
+    click(&mut stage, word);
+    stage.typed("VinPUT".to_owned());
+    let sounds_like = field(&stage, "word-sounds-like");
+    click(&mut stage, sounds_like);
+    stage.typed("vin put".to_owned());
+    // Enter in the second field adds the word, as the button would.
+    let effects = stage.edit_enter();
+    let added = Change::AddWord("VinPUT".to_owned(), "vin put".to_owned());
+    assert_eq!(sends(&effects), [Command::Set(added)]);
+    assert_eq!(reads(&stage, "word"), "");
+    assert_eq!(reads(&stage, "word-sounds-like"), "");
+    // The first field is typed in again, and starts out empty.
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Edit(Editing { key: "word", text, .. }) if text.is_empty()
+    )));
+
+    // The button reads the fields of its own list, though nothing of
+    // theirs is being typed in.
+    stage.typed("my email".to_owned());
+    let text = field(&stage, "snippet-text");
+    click(&mut stage, text);
+    stage.typed("someone@example.com".to_owned());
+    let trigger = field(&stage, "snippet-trigger");
+    click(&mut stage, trigger);
+    stage.typed("my email".to_owned());
+    let add = stage
+        .frame()
+        .controls
+        .iter()
+        .rposition(|c| c.name() == "Add");
+    let effects = click(&mut stage, add.unwrap_or_default());
+    let added = Change::AddSnippet("my email".to_owned(), "someone@example.com".to_owned());
+    assert_eq!(sends(&effects), [Command::Set(added)]);
+    assert_eq!(reads(&stage, "snippet-trigger"), "");
+    assert_eq!(reads(&stage, "snippet-text"), "");
+    // What was typed for a word and not added is still there.
+    assert_eq!(reads(&stage, "word"), "my email");
+}
+
+#[test]
 fn a_hotkey_field_takes_a_combination_and_lets_the_background_know() {
-    let mut stage = stage(Page::General);
+    let mut stage = stage(Page::Shortcuts);
     let field = find(&stage, |c| c.key == Some("hotkey-memo"));
     assert_eq!(
         click(&mut stage, field),
@@ -392,7 +461,7 @@ fn a_hotkey_field_takes_a_combination_and_lets_the_background_know() {
 
 #[test]
 fn the_main_hotkey_cannot_be_cleared() {
-    let mut stage = stage(Page::General);
+    let mut stage = stage(Page::Shortcuts);
     let field = find(&stage, |c| c.key == Some("hotkey"));
     click(&mut stage, field);
     let (_, effects) = stage.key_down(hotkey::VK_DELETE, NONE);
@@ -431,7 +500,7 @@ fn a_list_opens_picks_and_closes() {
 
 #[test]
 fn what_is_pinned_stays_in_reach_while_the_page_scrolls_under_it() {
-    let mut stage = stage(Page::Models);
+    let mut stage = opened(Page::Models, "speech-model");
     let plans = find(&stage, |c| c.name() == "See plans");
     let place = stage.rect_of(plans).unwrap_or_default();
     assert!(stage.frame().scroll_range() > 0.0);
@@ -452,7 +521,7 @@ fn what_is_pinned_stays_in_reach_while_the_page_scrolls_under_it() {
 
 #[test]
 fn the_wheel_and_the_keys_scroll_within_bounds() {
-    let mut stage = stage(Page::General);
+    let mut stage = stage(Page::Shortcuts);
     let range = stage.frame().scroll_range();
     assert!(range > 0.0);
     stage.wheel(1.0);
@@ -488,6 +557,9 @@ fn focus_survives_a_rebuild_by_key_or_by_place() {
         autostart: false,
         ..view.settings
     };
+    if let Some(notice) = &mut view.notice {
+        notice.page = Page::General;
+    }
     // The notice adds a bar with a button above everything: the list
     // moves down the order but keeps the focus.
     stage.set_view(view);
@@ -545,7 +617,7 @@ fn escape_does_not_close_settings_and_back_goes_back() {
 
 #[test]
 fn a_tooltip_belongs_to_a_button_without_a_caption() {
-    let mut stage = stage(Page::Models);
+    let mut stage = opened(Page::Models, "speech-model");
     let remove = find(&stage, |c| c.tip().is_some());
     stage.reveal(remove);
     let center = stage.rect_of(remove).unwrap_or_default().center();
@@ -562,7 +634,7 @@ fn a_tooltip_belongs_to_a_button_without_a_caption() {
 
 #[test]
 fn a_hotkey_field_refuses_keys_that_type_and_lets_tab_leave() {
-    let mut stage = stage(Page::General);
+    let mut stage = stage(Page::Shortcuts);
     let field = find(&stage, |c| c.key == Some("hotkey-memo"));
     click(&mut stage, field);
     // A letter by itself, or with Shift, would never type again: the field
@@ -603,7 +675,7 @@ fn a_hotkey_field_refuses_keys_that_type_and_lets_tab_leave() {
 
 #[test]
 fn the_background_hears_once_that_a_hotkey_field_waits_and_once_that_none_does() {
-    let mut stage = stage(Page::General);
+    let mut stage = stage(Page::Shortcuts);
     let first = find(&stage, |c| c.key == Some("hotkey"));
     let second = find(&stage, |c| c.key == Some("hotkey-enter"));
     let mut said = sends(&click(&mut stage, first));
@@ -672,4 +744,184 @@ fn a_list_opens_with_the_keys_windows_gives_it() {
     let list = find(&stage, |c| c.key == Some("microphone"));
     stage.focus_on(list);
     assert!(!stage.key_down(vk::F4, alt).0);
+}
+
+#[test]
+fn a_row_that_opens_is_opened_and_closed_by_a_click_and_by_the_keyboard() {
+    let mut stage = stage(Page::Models);
+    let count = stage.frame().controls.len();
+    let head = find(&stage, |c| c.key == Some("speech-model"));
+    assert!(matches!(
+        stage.frame().controls[head].kind,
+        Kind::Expander { open: false, .. }
+    ));
+    let shape = stage.shape();
+    assert!(click(&mut stage, head).is_empty());
+    let head = find(&stage, |c| c.key == Some("speech-model"));
+    assert!(matches!(
+        stage.frame().controls[head].kind,
+        Kind::Expander { open: true, .. }
+    ));
+    assert!(stage.frame().controls.len() > count);
+    assert_ne!(stage.shape(), shape, "rows came");
+    // The keyboard stays on the row, and Enter closes it again.
+    assert_eq!(stage.focused(), Some(head));
+    let (used, _) = stage.key_down(vk::ENTER, NONE);
+    assert!(used);
+    assert_eq!(stage.frame().controls.len(), count);
+    // It stays as the user left it when a new view arrives.
+    click(&mut stage, head);
+    stage.set_view(mock::scene("listening").unwrap_or_default());
+    assert!(stage.frame().controls.len() > count);
+    // And is as the page says again on another visit.
+    stage.show(Page::About);
+    stage.show(Page::Models);
+    assert_eq!(stage.frame().controls.len(), count);
+}
+
+#[test]
+fn a_list_scrolls_by_itself_under_the_wheel_and_then_the_page_goes_on() {
+    let mut stage = opened(Page::Models, "speech-model");
+    let [pane] = stage.frame().panes() else {
+        unreachable!("the list of models was expected to scroll");
+    };
+    let (area, range) = (pane.rect, pane.range());
+    assert!(range > 0.0);
+    let first = find(&stage, |c| c.pane() == Some(0));
+    let before = stage.rect_of(first).unwrap_or_default();
+    // Over the list, the wheel moves the list and not the page.
+    stage.mouse_move(area.center());
+    stage.wheel(-1.0);
+    assert!((stage.look().pane(0) - metric::WHEEL.min(range)).abs() < 0.01);
+    assert!(stage.look().scroll.abs() < f32::EPSILON);
+    let after = stage.rect_of(first).unwrap_or_default();
+    assert!((before.y - after.y - metric::WHEEL.min(range)).abs() < 0.01);
+    // At its end the page takes over.
+    for _ in 0..40 {
+        stage.wheel(-1.0);
+    }
+    assert!((stage.look().pane(0) - range).abs() < 0.01);
+    assert!(stage.look().scroll > 0.0);
+    // Elsewhere on the page the wheel never touches the list.
+    stage.key_down(vk::HOME, NONE);
+    stage.mouse_move(Point::new(area.center().x, 30.0));
+    stage.wheel(1.0);
+    assert!((stage.look().pane(0) - range).abs() < 0.01);
+}
+
+#[test]
+fn what_is_scrolled_out_of_a_list_takes_no_click_and_tab_brings_it_back() {
+    let mut stage = opened(Page::Models, "speech-model");
+    let area = stage.frame().panes()[0].rect;
+    let inside: Vec<usize> = (0..stage.frame().controls.len())
+        .filter(|index| stage.frame().controls[*index].pane() == Some(0))
+        .collect();
+    let (first, last) = (inside[0], inside[inside.len() - 1]);
+    // The last row is below the edge of the list: nothing of it is hit,
+    // though the page under the list has things there.
+    let below = stage.rect_of(last).unwrap_or_default();
+    assert!(below.y > area.bottom());
+    assert_ne!(stage.control_at(below.center()), Some(last));
+    // Giving it the keyboard scrolls the list, and only the list, to it.
+    stage.focus_on(last);
+    let shown = stage.rect_of(last).unwrap_or_default();
+    assert!(shown.y >= area.y && shown.bottom() <= area.bottom() + 0.01);
+    assert!(stage.look().pane(0) > 0.0);
+    assert_eq!(stage.control_at(shown.center()), Some(last));
+    // Now the first row is above the list, and is not hit there.
+    let above = stage.rect_of(first).unwrap_or_default();
+    assert!(above.bottom() <= area.y + 0.01);
+    assert_ne!(stage.control_at(above.center()), Some(first));
+}
+
+#[test]
+fn the_scroll_bar_of_a_list_is_dragged_and_clicked_like_that_of_the_page() {
+    let mut stage = opened(Page::Models, "speech-model");
+    let pane = &stage.frame().panes()[0];
+    let (area, range) = (pane.rect, pane.range());
+    let lane = Point::new(area.right() - 4.0, area.y + 12.0);
+    stage.mouse_move(area.center());
+    assert_eq!(stage.look().pane_bar, None);
+    stage.mouse_move(lane);
+    assert_eq!(stage.look().pane_bar, Some(0));
+    // Dragging the thumb to the bottom shows the end of the list.
+    stage.mouse_down(lane);
+    stage.mouse_move(Point::new(lane.x, area.bottom() + 200.0));
+    assert!((stage.look().pane(0) - range).abs() < 0.01);
+    assert_eq!(stage.look().pane_bar, Some(0), "held while it is dragged");
+    stage.mouse_up(Point::new(lane.x, area.bottom() + 200.0));
+    // A click above the thumb goes back by the height of the list.
+    stage.mouse_move(lane);
+    stage.mouse_down(lane);
+    stage.mouse_up(lane);
+    assert!((stage.look().pane(0) - (range - area.h).max(0.0)).abs() < 0.01);
+    assert!(stage.look().scroll.abs() < f32::EPSILON);
+}
+
+#[test]
+fn typing_in_a_search_narrows_its_list_at_every_key() {
+    let mut stage = opened(Page::General, "languages");
+    let rows = |stage: &Stage| {
+        let controls = stage.frame().controls.iter();
+        controls
+            .filter(|c| matches!(c.kind, Kind::Row { .. }))
+            .count()
+    };
+    let all = rows(&stage);
+    assert!(all > 60);
+    // The list is scrolled, to see that a search starts it from its top.
+    let area = stage.frame().panes()[0].rect;
+    stage.reveal(find(&stage, |c| c.key == Some("language-search")));
+    let field = find(&stage, |c| c.key == Some("language-search"));
+    let effects = click(&mut stage, field);
+    assert!(matches!(effects.as_slice(), [Effect::Edit(editing)] if editing.text.is_empty()));
+    let _ = area;
+    assert!(stage.typed("slov".to_owned()).is_empty());
+    assert_eq!(rows(&stage), 2, "Slovak and Slovenian");
+    assert!(stage.look().pane(0).abs() < f32::EPSILON);
+    // The field keeps the keyboard and what was typed through the rebuild.
+    let field = find(&stage, |c| c.key == Some("language-search"));
+    assert_eq!(stage.look().editing, Some(field));
+    assert!(matches!(
+        &stage.frame().controls[field].kind,
+        Kind::Field { text, .. } if text == "slov"
+    ));
+    // Enter and leaving send nothing: the search is nobody's setting.
+    assert!(stage.edit_enter().is_empty());
+    assert_eq!(stage.edit_lost(), [Effect::EndEdit]);
+    assert_eq!(rows(&stage), 2, "the search stays while the page does");
+    // Clicking a row adds its language.
+    let slovak = find(&stage, |c| {
+        matches!(c.kind, Kind::Row { .. }) && c.label == "Sloven\u{10d}ina"
+    });
+    assert_eq!(
+        sends(&click(&mut stage, slovak)),
+        [Command::Set(Change::Languages(
+            "en-US, sl-SI, sk-SK".to_owned()
+        ))]
+    );
+}
+
+#[test]
+fn the_cross_of_a_chip_takes_its_language_away() {
+    let mut stage = opened(Page::General, "languages");
+    let chip = find(
+        &stage,
+        |c| matches!(&c.kind, Kind::Chip { label, .. } if label.starts_with("English")),
+    );
+    assert_eq!(
+        stage.frame().controls[chip].name(),
+        "Remove English (United States)"
+    );
+    assert_eq!(
+        sends(&click(&mut stage, chip)),
+        [Command::Set(Change::Languages("sl-SI".to_owned()))]
+    );
+    // The only language left has no cross, and Tab passes it by.
+    let mut view = mock::scene("settings").unwrap_or_default();
+    "sl-SI".clone_into(&mut view.settings.languages);
+    stage.set_view(view);
+    let last = find(&stage, |c| matches!(c.kind, Kind::Chip { .. }));
+    assert!(!stage.frame().controls[last].enabled);
+    assert!(click(&mut stage, last).is_empty());
 }

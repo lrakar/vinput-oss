@@ -28,8 +28,9 @@
 //! [`Failure`] says what went wrong in terms the app acts on. The words of
 //! a failure are for people; no token is ever part of them.
 
-#[cfg(test)]
-pub(crate) mod fake;
+#[cfg(any(test, feature = "fake"))]
+#[allow(missing_docs, clippy::pedantic)]
+pub mod fake;
 mod loopback;
 mod turn;
 
@@ -44,7 +45,7 @@ use ring::digest;
 use ring::rand::{SecureRandom as _, SystemRandom};
 use serde_json::{Value, json};
 
-use crate::net::{Request, Target};
+use crate::net::{Request, Response, Target};
 use crate::{log, secrets};
 
 /// Where the server is. A build that ships is given the address in
@@ -171,7 +172,8 @@ impl Server {
     }
 
     /// The address of the audio stream: the same server, as a WebSocket.
-    pub(crate) fn stream_url(&self) -> String {
+    #[must_use]
+    pub fn stream_url(&self) -> String {
         let address = match self.base.strip_prefix("https://") {
             Some(rest) => format!("wss://{rest}"),
             None => self.base.replacen("http://", "ws://", 1),
@@ -240,7 +242,9 @@ pub enum Code {
 }
 
 impl Code {
-    pub(crate) fn named(name: &str) -> Option<Self> {
+    /// The code the server calls `name`, if this version knows it.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
         Some(match name {
             "unauthorized" => Self::Unauthorized,
             "bad_request" => Self::BadRequest,
@@ -366,7 +370,7 @@ impl Failure {
 }
 
 /// What the server's answer to a failed request means.
-pub(crate) fn refusal(status: u16, body: &[u8]) -> Failure {
+pub fn refusal(status: u16, body: &[u8]) -> Failure {
     let answer: Value = serde_json::from_slice(body).unwrap_or_default();
     let error = &answer["error"];
     let code = error["code"]
@@ -1397,6 +1401,59 @@ impl Account {
         }
     }
 
+    /// Posts `json` to `path` as the signed-in person and returns the
+    /// answer once it has begun, for the caller to read as it arrives: the
+    /// server may take `quiet` over its first bytes and between any two
+    /// pieces. A token the server refuses is traded for a new one once, as
+    /// for every other request.
+    ///
+    /// Someone is waiting with a key just let go, so a token that has to
+    /// be traded first is traded without trying again.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no answer began, which includes every answer that is a
+    /// refusal.
+    pub fn open(&self, path: &str, json: &str, quiet: Duration) -> Result<Response, Failure> {
+        let url = self.server.url(path);
+        let mut retried = false;
+        loop {
+            let token = self.token(EXPIRY_MARGIN, Patience::None)?;
+            let authorization = format!("Bearer {token}");
+            let mut response = Request {
+                json: Some(json),
+                headers: &[("Authorization", &authorization)],
+                connect_timeout: TIMEOUT,
+                stall_timeout: quiet,
+                ..Request::get(&url, TIMEOUT)
+            }
+            .send()
+            .map_err(Failure::Unreachable)?;
+            let status = response.status();
+            if (200..300).contains(&status) {
+                return Ok(response);
+            }
+            let body = response.body(ANSWER_LIMIT, TIMEOUT).unwrap_or_default();
+            match refusal(status, &body) {
+                Failure::Refused {
+                    code: Code::Unauthorized,
+                    ..
+                } if !retried => {
+                    self.refused(&token);
+                    retried = true;
+                }
+                Failure::Refused {
+                    code: Code::Unauthorized,
+                    ..
+                } => {
+                    self.forget();
+                    return Err(Failure::SignedOut);
+                }
+                other => return Err(other),
+            }
+        }
+    }
+
     /// Asks the server how the account stands.
     ///
     /// # Errors
@@ -2312,9 +2369,8 @@ mod tests {
         let (first, second) = (random_token(), random_token());
         assert!(first.as_ref().is_some_and(|token| token.len() == 43));
         assert_ne!(first, second);
-        let request: Value =
-            serde_json::from_str(&app_code_request("c", "v", Some("ANA \"PC\"")))
-                .unwrap_or_default();
+        let request: Value = serde_json::from_str(&app_code_request("c", "v", Some("ANA \"PC\"")))
+            .unwrap_or_default();
         assert_eq!(
             request,
             json!({

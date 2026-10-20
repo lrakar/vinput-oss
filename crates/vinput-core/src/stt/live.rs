@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -40,29 +40,46 @@ pub(super) type Socket = WebSocketStream<Stream>;
 
 /// The thread the streams of one provider run on.
 ///
+/// It is one thread, so the runtime on it is the single-threaded one: the
+/// thread is started here, runs the runtime until this is dropped, and is
+/// the only one that polls what is spawned on it. (The scheduler for several
+/// workers, asked for one worker, did the same and cost the executable
+/// 48 kB.)
+///
 /// A provider is let go of on the thread of the message loop, when another
 /// model is chosen or someone signs in. Dropping a runtime waits for what
 /// runs on its blocking threads, which here are requests that may wait ten
 /// seconds for an answer; so this one is shut down without waiting, and
 /// whatever was under way ends by itself.
 pub(super) struct Network {
-    /// `None` only while it is being dropped.
-    runtime: Option<Runtime>,
+    /// Tells the thread to shut the runtime down. `None` only while this is
+    /// being dropped.
+    stop: Option<oneshot::Sender<()>>,
     handle: Handle,
 }
 
 impl Network {
     /// Starts the thread.
     pub(super) fn start() -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("vinput-stt")
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(failed("starting the network runtime"))?;
+        let handle = runtime.handle().clone();
+        let (stop, stopped) = oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name("vinput-stt".to_owned())
+            .spawn(move || {
+                // Until `stop` is used or dropped; either way it is over.
+                runtime.block_on(async {
+                    let _ = stopped.await;
+                });
+                runtime.shutdown_background();
+            })
+            .map_err(failed("starting the network runtime"))?;
         Ok(Self {
-            handle: runtime.handle().clone(),
-            runtime: Some(runtime),
+            handle,
+            stop: Some(stop),
         })
     }
 
@@ -71,8 +88,9 @@ impl Network {
         &self.handle
     }
 
-    /// Runs `work` on the thread and waits for what it comes to: for
-    /// connecting once, when the provider starts.
+    /// Runs `work` to its end and waits for what it comes to: for connecting
+    /// once, when the provider starts. The caller's thread polls it; the
+    /// network thread wakes it.
     pub(super) fn wait_for<F: Future>(&self, work: F) -> F::Output {
         self.handle.block_on(work)
     }
@@ -80,17 +98,27 @@ impl Network {
 
 impl Drop for Network {
     fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
         }
     }
 }
 
 /// The TLS settings every stream of a provider shares, so that each one
 /// after the first resumes the session of the one before.
+///
+/// A server is trusted if Windows trusts it: the roots are read from the
+/// certificate store once, here, which is when a provider starts and not
+/// when a key is pressed. That is the store every other request of Vinput
+/// is checked against (`net.rs` asks Windows itself), so a PC whose
+/// employer inspects its traffic can dictate as well as sign in, and a root
+/// Windows has dropped is dropped here too. A list of roots built into the
+/// executable was 54 kB of it and as old as the build. A certificate the
+/// store holds and that cannot be read is left out; with none at all every
+/// connection fails as one to an unknown server.
 pub(super) fn tls() -> Result<Arc<rustls::ClientConfig>> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let _ = roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -165,9 +193,9 @@ pub(super) struct Session {
     /// `None` once `finish` has ended the audio.
     audio: Option<UnboundedSender<Vec<u8>>>,
     results: std_mpsc::Receiver<Result<Transcript>>,
-    /// Whether the audio last fed was not taken, because the task had let
-    /// go of the stream by then.
-    pub(super) unsent: bool,
+    /// The audio that was fed and not taken, because the task had let go
+    /// of the stream by then: whoever carries the dictation on takes it.
+    unsent: Vec<i16>,
     /// The newest guess at what follows the settled text, if one has come
     /// since the last settled text and nobody has taken it yet.
     guess: Option<String>,
@@ -190,7 +218,7 @@ pub(super) fn session(what: &'static str, piece: usize) -> (Session, Client) {
         piece: piece.max(2),
         audio: Some(audio_tx),
         results: result_rx,
-        unsent: false,
+        unsent: Vec::new(),
         guess: None,
         failed: None,
         _alive: alive,
@@ -208,9 +236,24 @@ impl Session {
         Error::Transcription(format!("the {} closed unexpectedly", self.what))
     }
 
-    /// The transcripts the task left behind that were not handed on yet.
-    pub(super) fn rest(&mut self) -> impl Iterator<Item = Transcript> + '_ {
-        self.results.try_iter().flatten()
+    /// What the task left behind that was not handed on yet: transcripts,
+    /// and the failure it ended with, if it ended with one.
+    pub(super) fn rest(&mut self) -> (Vec<Transcript>, Option<Error>) {
+        let mut transcripts = Vec::new();
+        let mut failed = self.failed.take();
+        for result in self.results.try_iter() {
+            match result {
+                Ok(transcript) => transcripts.push(transcript),
+                Err(why) => failed = Some(why),
+            }
+        }
+        (transcripts, failed)
+    }
+
+    /// The audio that was fed after the task had let go of the stream,
+    /// in the order it was fed. It is not kept here after this.
+    pub(super) fn take_unsent(&mut self) -> Vec<i16> {
+        std::mem::take(&mut self.unsent)
     }
 
     /// The service's guess at what follows the text handed back so far, if
@@ -233,7 +276,7 @@ impl Transcriber for Session {
     fn feed(&mut self, pcm: &[i16]) -> Result<Option<Transcript>> {
         if let Some(failed) = self.failed.take() {
             // The task had ended before this audio could be handed to it.
-            self.unsent = true;
+            self.unsent.extend_from_slice(pcm);
             return Err(failed);
         }
         let Some(audio) = &self.audio else {
@@ -241,11 +284,16 @@ impl Transcriber for Session {
         };
         // The samples become bytes here, on the thread that has them, and
         // the network thread only passes them on.
+        // Once the task has let go, nothing more is taken: what is fed
+        // from then on is kept, also by a call that still has settled text
+        // to hand back and so does not fail.
         let mut sent = true;
         for piece in pcm.chunks(self.piece / 2) {
-            sent &= audio.send(bytes_of(piece)).is_ok();
+            sent = sent && audio.send(bytes_of(piece)).is_ok();
+            if !sent {
+                self.unsent.extend_from_slice(piece);
+            }
         }
-        self.unsent = !sent;
         // Hand back all the settled text that is ready, as one piece, else
         // the newest interim, and keep the guess that came after the
         // settled text for whoever asks: the two belong together, and a

@@ -3,7 +3,7 @@
 use vinput_view::Command;
 
 use super::{Effect, Stage, vk};
-use crate::geometry::Point;
+use crate::geometry::{Point, Rect};
 use crate::hotkey::{self, Modifiers};
 use crate::layout::{Kind, Region};
 use crate::look::ScrollBar;
@@ -19,13 +19,75 @@ impl Stage {
         let in_body = self.frame.viewport.contains(point);
         self.frame.controls.iter().rposition(|control| {
             let body = control.region == Region::Body;
-            (!body || in_body) && self.placed(control).contains(point)
+            (!body || in_body)
+                && control
+                    .pane()
+                    .is_none_or(|pane| self.pane_at(pane).contains(point))
+                && self.placed(control).contains(point)
         })
     }
 
+    /// The area that scrolls by itself at `point`, if it has anywhere to
+    /// scroll to.
+    fn pane_under(&self, point: Point) -> Option<usize> {
+        let in_body = self.frame.viewport.contains(point);
+        self.frame.panes().iter().position(|pane| {
+            (pane.region != Region::Body || in_body)
+                && pane.range() > 0.0
+                && pane
+                    .rect
+                    .moved(0.0, self.shift_of(pane.region))
+                    .contains(point)
+        })
+    }
+
+    /// How far down what is in `region` is moved by the scrolling of the
+    /// page.
+    fn shift_of(&self, region: Region) -> f32 {
+        match region {
+            Region::Fixed => 0.0,
+            Region::Body => -self.scroll,
+        }
+    }
+
+    /// The area that scrolls by itself whose scroll bar is at `point`.
+    fn pane_lane(&self, point: Point) -> Option<usize> {
+        let pane = self.pane_under(point)?;
+        (point.x >= self.pane_at(pane).right() - metric::SCROLL_LANE).then_some(pane)
+    }
+
+    /// Where the thumb of an area that scrolls by itself is right now.
+    fn pane_thumb(&self, index: usize, scroll: f32) -> Option<Rect> {
+        let pane = self.frame.panes().get(index)?;
+        crate::look::pane_thumb(pane, self.pane_at(index), scroll, true)
+    }
+
+    /// Scrolls the area with this index to `to`. Returns whether it moved.
+    fn scroll_pane_to(&mut self, index: usize, to: f32) -> bool {
+        let Some(pane) = self.frame.panes().get(index) else {
+            return false;
+        };
+        let to = to.clamp(0.0, pane.range());
+        let Some(offset) = self.offsets.get_mut(index) else {
+            return false;
+        };
+        if (to - *offset).abs() <= f32::EPSILON {
+            return false;
+        }
+        *offset = to;
+        self.dirty = true;
+        self.rehover();
+        true
+    }
+
     pub(super) fn rehover(&mut self) {
-        let before = (self.hover, self.bar, self.over_clear);
+        let before = (self.hover, self.bar, self.over_clear, self.pane_bar);
         self.hover = self.mouse.and_then(|point| self.at(point));
+        self.pane_bar = match self.drag {
+            _ if self.frame.panes().is_empty() => None,
+            Some((pane, _)) => pane,
+            None => self.mouse.and_then(|point| self.pane_lane(point)),
+        };
         self.over_clear = match (self.mouse, self.hover) {
             (Some(point), Some(index)) => {
                 let control = &self.frame.controls[index];
@@ -38,7 +100,7 @@ impl Stage {
         };
         let view = self.frame.viewport;
         self.bar = match self.mouse {
-            _ if self.drag.is_some() => ScrollBar::Wide,
+            _ if matches!(self.drag, Some((None, _))) => ScrollBar::Wide,
             Some(point) if view.contains(point) && self.frame.scroll_range() > 0.0 => {
                 if point.x >= view.right() - metric::SCROLL_LANE {
                     ScrollBar::Wide
@@ -48,14 +110,14 @@ impl Stage {
             }
             _ => ScrollBar::Hidden,
         };
-        self.dirty |= before != (self.hover, self.bar, self.over_clear);
+        self.dirty |= before != (self.hover, self.bar, self.over_clear, self.pane_bar);
     }
 
     /// The mouse moved to `point`.
     pub fn mouse_move(&mut self, point: Point) {
         self.mouse = Some(point);
-        if let Some(grab) = self.drag {
-            self.drag_to(point.y - grab);
+        if let Some((pane, grab)) = self.drag {
+            self.drag_to(pane, point.y - grab);
         }
         self.rehover();
     }
@@ -66,14 +128,22 @@ impl Stage {
         self.rehover();
     }
 
-    pub(super) fn drag_to(&mut self, thumb_top: f32) {
-        let Some(thumb) = crate::look::thumb(&self.frame, 0.0, true) else {
+    pub(super) fn drag_to(&mut self, pane: Option<usize>, thumb_top: f32) {
+        let part = |thumb: Rect, within: Rect| {
+            let lane = within.inset_xy(0.0, metric::GRID);
+            let travel = (lane.h - thumb.h).max(1.0);
+            ((thumb_top - lane.y) / travel).clamp(0.0, 1.0)
+        };
+        let Some(index) = pane else {
+            if let Some(thumb) = crate::look::thumb(&self.frame, 0.0, true) {
+                self.scroll_to(part(thumb, self.frame.viewport) * self.frame.scroll_range());
+            }
             return;
         };
-        let lane = self.frame.viewport.inset_xy(0.0, metric::GRID);
-        let travel = (lane.h - thumb.h).max(1.0);
-        let part = ((thumb_top - lane.y) / travel).clamp(0.0, 1.0);
-        self.scroll_to(part * self.frame.scroll_range());
+        if let Some(thumb) = self.pane_thumb(index, 0.0) {
+            let range = self.frame.panes()[index].range();
+            self.scroll_pane_to(index, part(thumb, self.pane_at(index)) * range);
+        }
     }
 
     /// The left button went down at `point`.
@@ -87,6 +157,21 @@ impl Stage {
             self.rehover();
             return effects;
         }
+        if let Some(pane) = self.pane_lane(point) {
+            let offset = self.offsets.get(pane).copied().unwrap_or(0.0);
+            if let Some(thumb) = self.pane_thumb(pane, offset) {
+                let page = self.pane_at(pane).h;
+                if point.y < thumb.y {
+                    self.scroll_pane_to(pane, offset - page);
+                } else if point.y >= thumb.bottom() {
+                    self.scroll_pane_to(pane, offset + page);
+                } else {
+                    self.drag = Some((Some(pane), point.y - thumb.y));
+                }
+                self.rehover();
+                return effects;
+            }
+        }
         if self.bar == ScrollBar::Wide
             && let Some(thumb) = crate::look::thumb(&self.frame, self.scroll, true)
             && point.x >= self.frame.viewport.right() - metric::SCROLL_LANE
@@ -96,7 +181,7 @@ impl Stage {
             } else if point.y >= thumb.bottom() {
                 self.scroll_by(self.frame.viewport.h);
             } else {
-                self.drag = Some(point.y - thumb.y);
+                self.drag = Some((None, point.y - thumb.y));
             }
             self.rehover();
             return effects;
@@ -147,7 +232,16 @@ impl Stage {
     /// The wheel turned by `notches`, away from the user if positive.
     pub fn wheel(&mut self, notches: f32) -> Vec<Effect> {
         let effects = self.close_choice();
-        self.scroll_by(-notches * metric::WHEEL);
+        let by = -notches * metric::WHEEL;
+        // A list that scrolls by itself takes the wheel while it has
+        // somewhere to go; at its end the page goes on.
+        if let Some(pane) = self.mouse.and_then(|point| self.pane_under(point)) {
+            let offset = self.offsets.get(pane).copied().unwrap_or(0.0);
+            if self.scroll_pane_to(pane, offset + by) {
+                return effects;
+            }
+        }
+        self.scroll_by(by);
         effects
     }
 
@@ -318,7 +412,7 @@ impl Stage {
         }
         let mut effects = self.focus_on(index);
         effects.push(Effect::Retype(text.clone()));
-        self.typed(text);
+        effects.extend(self.typed(text));
         effects.extend(self.commit());
         effects
     }

@@ -88,14 +88,29 @@ impl Stage {
     /// Scrolls so that the control with this index is in sight.
     pub(super) fn reveal(&mut self, index: usize) {
         let control = &self.frame.controls[index];
-        if control.region != Region::Body {
+        let (region, mut rect) = (control.region, control.rect);
+        // First within the list it is in, if that scrolls by itself.
+        if let Some(pane) = control.pane()
+            && let Some(area) = self.frame.panes().get(pane)
+            && let Some(offset) = self.offsets.get_mut(pane)
+        {
+            let (top, bottom) = (rect.y - area.rect.y, rect.bottom() - area.rect.y);
+            if top < *offset || rect.h > area.rect.h {
+                *offset = top;
+            } else if bottom > *offset + area.rect.h {
+                *offset = bottom - area.rect.h;
+            }
+            *offset = offset.clamp(0.0, area.range());
+            rect = rect.moved(0.0, -*offset);
+        }
+        if region != Region::Body {
             return;
         }
         let view = self.frame.viewport;
         let margin = metric::GAP;
-        let top = control.rect.y - margin - view.y;
-        let bottom = control.rect.bottom() + margin - view.y;
-        if top < self.scroll || control.rect.h + 2.0 * margin > view.h {
+        let top = rect.y - margin - view.y;
+        let bottom = rect.bottom() + margin - view.y;
+        if top < self.scroll || rect.h + 2.0 * margin > view.h {
             self.scroll = top;
         } else if bottom > self.scroll + view.h {
             self.scroll = bottom - view.h;
@@ -143,7 +158,16 @@ impl Stage {
 
     pub(super) fn begin_edit(&mut self, index: usize, select_all: bool) -> Vec<Effect> {
         let control = &self.frame.controls[index];
-        let (Some(key), Kind::Field { text, secret, .. }) = (control.key, &control.kind) else {
+        let (
+            Some(key),
+            Kind::Field {
+                text,
+                secret,
+                lines,
+                ..
+            },
+        ) = (control.key, &control.kind)
+        else {
             return Vec::new();
         };
         let draft = self.drafts.entry(key).or_insert_with(|| Draft {
@@ -157,6 +181,7 @@ impl Stage {
             key,
             text: draft.text.clone(),
             secret: *secret,
+            lines: *lines,
             select_all,
         };
         self.editing = Some(key);
@@ -165,12 +190,35 @@ impl Stage {
         vec![Effect::Edit(editing)]
     }
 
-    /// The edit control reads `text` now.
-    pub fn typed(&mut self, text: String) {
-        if let Some(draft) = self.editing.and_then(|key| self.drafts.get_mut(key)) {
-            draft.text = text;
-            draft.sent = false;
+    /// The edit control reads `text` now. Where a list follows what is
+    /// typed, the page is laid out again.
+    pub fn typed(&mut self, text: String) -> Vec<Effect> {
+        let Some(key) = self.editing else {
+            return Vec::new();
+        };
+        let Some(draft) = self.drafts.get_mut(key) else {
+            return Vec::new();
+        };
+        draft.text.clone_from(&text);
+        draft.sent = false;
+        let live = self.keyed(key).is_some_and(|index| {
+            matches!(
+                self.frame.controls[index].kind,
+                Kind::Field { live: Some(_), .. }
+            )
+        });
+        if !live {
+            return Vec::new();
         }
+        self.memory.set_typed(key, text);
+        // The list starts from its top for every new search.
+        let panes = self.frame.panes().iter().zip(&mut self.offsets);
+        for (pane, offset) in panes {
+            if pane.key == key {
+                *offset = 0.0;
+            }
+        }
+        self.rebuild()
     }
 
     /// Hands what was typed to the page, if it changed since the edit began.

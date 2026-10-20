@@ -10,10 +10,15 @@
 
 use std::path::Path;
 
+use vinput_core::actions::{self, Action, Field};
 use vinput_core::keys::Hotkey;
+use vinput_core::rewrite::Mode;
 use vinput_core::search;
 use vinput_core::settings::{STOP_AFTER_MINUTES, Settings, parse_languages};
-use vinput_view::{Change, Notice, NoticeKind, Page};
+use vinput_core::words::{
+    MAX_SNIPPET, MAX_SNIPPETS, MAX_SOUNDS_LIKE, MAX_WORD, MAX_WORDS, Refused,
+};
+use vinput_view::{Change, Notice, NoticeKind, Page, Then, Tidy};
 
 const VK_BACK: u16 = 0x08;
 const VK_TAB: u16 = 0x09;
@@ -88,24 +93,90 @@ fn is_language(code: &str) -> bool {
     code.len() <= 35 && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// The four hotkeys, by what they are for.
+/// What the window calls a way to tidy a dictation, as the settings keep
+/// it.
+pub(crate) fn mode_of(tidy: Tidy) -> Mode {
+    match tidy {
+        Tidy::Plain => Mode::Plain,
+        Tidy::Clean => Mode::Clean,
+        Tidy::Prompt => Mode::Prompt,
+        Tidy::Email => Mode::Email,
+    }
+}
+
+/// A way to tidy a dictation, as the window is told of it.
+pub(crate) fn tidy_of(mode: Mode) -> Tidy {
+    match mode {
+        Mode::Plain => Tidy::Plain,
+        Mode::Clean => Tidy::Clean,
+        Mode::Prompt => Tidy::Prompt,
+        Mode::Email => Tidy::Email,
+    }
+}
+
+/// The page a change is made on, which is where what is wrong with it is
+/// said.
+pub(crate) fn page_of(change: &Change) -> Page {
+    match change {
+        Change::Cleanup(_) | Change::CleanupEnter(_) => Page::Cleanup,
+        Change::Hotkey(_)
+        | Change::HotkeyEnter(_)
+        | Change::HotkeySearch(_)
+        | Change::HotkeyMemo(_)
+        | Change::HotkeyCommand(_)
+        | Change::MemoDir(_)
+        | Change::MemoToClipboard(_)
+        | Change::SearchUrl(_)
+        | Change::AddAction
+        | Change::RemoveAction(_)
+        | Change::ActionName(..)
+        | Change::ActionHotkey(..)
+        | Change::ActionProgram(..)
+        | Change::ActionArguments(..)
+        | Change::ActionThen(..)
+        | Change::ActionCleanup(..)
+        | Change::ActionTimeout(..) => Page::Shortcuts,
+        _ => Page::General,
+    }
+}
+
+/// The hotkeys, by what they are for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Key {
     Dictate,
     Enter,
     Search,
     Memo,
+    Command,
+    /// The key of the action of the user's own at this place.
+    Action(usize),
 }
 
 impl Key {
-    const ALL: [Self; 4] = [Self::Dictate, Self::Enter, Self::Search, Self::Memo];
+    /// Every hotkey there is with `settings`.
+    fn all(settings: &Settings) -> impl Iterator<Item = Self> {
+        [
+            Self::Dictate,
+            Self::Enter,
+            Self::Search,
+            Self::Memo,
+            Self::Command,
+        ]
+        .into_iter()
+        .chain((0..settings.actions.len()).map(Self::Action))
+    }
 
-    fn purpose(self) -> &'static str {
+    fn purpose(self, settings: &Settings) -> String {
         match self {
-            Self::Dictate => "dictating",
-            Self::Enter => "dictating and pressing Enter",
-            Self::Search => "dictating a web search",
-            Self::Memo => "recording a voice memo",
+            Self::Dictate => "dictating".to_owned(),
+            Self::Enter => "dictating and pressing Enter".to_owned(),
+            Self::Search => "dictating a web search".to_owned(),
+            Self::Memo => "recording a voice memo".to_owned(),
+            Self::Command => "editing the selected text".to_owned(),
+            Self::Action(index) => settings.actions.get(index).map_or_else(
+                || "an action".to_owned(),
+                |action| format!("the action {}", action.name),
+            ),
         }
     }
 
@@ -115,23 +186,25 @@ impl Key {
             Self::Enter => settings.hotkey_enter,
             Self::Search => settings.hotkey_search,
             Self::Memo => settings.hotkey_memo,
+            Self::Command => settings.hotkey_command,
+            Self::Action(index) => settings.actions.get(index).and_then(|action| action.hotkey),
         }
     }
 }
 
-/// Reads a hotkey as the window wrote it. Empty is no hotkey.
-fn hotkey(text: &str) -> Result<Option<Hotkey>, Notice> {
+/// Reads a hotkey as the window wrote it on `page`. Empty is no hotkey.
+fn hotkey(page: Page, text: &str) -> Result<Option<Hotkey>, Notice> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(None);
     }
     let hotkey: Hotkey = text
         .parse()
-        .map_err(|_| refused(Page::General, format!("{text} is not a key Vinput knows.")))?;
+        .map_err(|_| refused(page, format!("{text} is not a key Vinput knows.")))?;
     let bare = !(hotkey.ctrl || hotkey.alt || hotkey.shift || hotkey.win);
     if bare && NEEDED_FOR_TYPING.contains(&hotkey.vk) {
         return Err(refused(
-            Page::General,
+            page,
             format!("{hotkey} on its own is needed for typing. Add Ctrl, Alt or Shift to it."),
         ));
     }
@@ -140,10 +213,10 @@ fn hotkey(text: &str) -> Result<Option<Hotkey>, Notice> {
 
 /// Sets one of the hotkeys, unless another one already has that key.
 fn set_hotkey(settings: &mut Settings, key: Key, text: &str) -> Result<Applied, Notice> {
-    let wanted = hotkey(text)?;
+    let wanted = hotkey(Page::Shortcuts, text)?;
     if key == Key::Dictate && wanted.is_none() {
         return Err(refused(
-            Page::General,
+            Page::Shortcuts,
             "The key for dictating cannot be empty.",
         ));
     }
@@ -151,15 +224,14 @@ fn set_hotkey(settings: &mut Settings, key: Key, text: &str) -> Result<Applied, 
         return Ok(Applied::Unchanged);
     }
     if let Some(wanted) = wanted
-        && let Some(other) = Key::ALL
-            .into_iter()
-            .find(|other| *other != key && other.of(settings) == Some(wanted))
+        && let Some(other) =
+            Key::all(settings).find(|other| *other != key && other.of(settings) == Some(wanted))
     {
         return Err(refused(
-            Page::General,
+            Page::Shortcuts,
             format!(
                 "{wanted} is the key for {} already. Pick another key.",
-                other.purpose()
+                other.purpose(settings)
             ),
         ));
     }
@@ -168,6 +240,11 @@ fn set_hotkey(settings: &mut Settings, key: Key, text: &str) -> Result<Applied, 
         Key::Enter => settings.hotkey_enter = wanted,
         Key::Search => settings.hotkey_search = wanted,
         Key::Memo => settings.hotkey_memo = wanted,
+        Key::Command => settings.hotkey_command = wanted,
+        Key::Action(index) => match settings.actions.get_mut(index) {
+            Some(action) => action.hotkey = wanted,
+            None => return Ok(Applied::Unchanged),
+        },
     }
     Ok(Applied::Changed(Follow::Hotkeys))
 }
@@ -198,6 +275,11 @@ pub(crate) fn apply(
         Change::HotkeyEnter(text) => set_hotkey(settings, Key::Enter, &text)?,
         Change::HotkeySearch(text) => set_hotkey(settings, Key::Search, &text)?,
         Change::HotkeyMemo(text) => set_hotkey(settings, Key::Memo, &text)?,
+        Change::HotkeyCommand(text) => set_hotkey(settings, Key::Command, &text)?,
+        Change::Cleanup(tidy) => put(&mut settings.cleanup, mode_of(tidy), Follow::Nothing),
+        Change::CleanupEnter(tidy) => {
+            put(&mut settings.cleanup_enter, mode_of(tidy), Follow::Nothing)
+        }
         Change::Microphone(id) => {
             let id = one_line(Page::General, "That microphone", &id)?;
             put(&mut settings.microphone, id.to_owned(), Follow::Nothing)
@@ -235,13 +317,14 @@ pub(crate) fn apply(
         Change::GraphicsCard(_) if !ground.graphics_card => Applied::Unchanged,
         Change::GraphicsCard(on) => put(&mut settings.local_gpu, on, Follow::Engine),
         Change::ApiEnabled(on) => put(&mut settings.api_enabled, on, Follow::Api),
+        Change::ApiTranscript(on) => put(&mut settings.api_transcript, on, Follow::Nothing),
         Change::MemoDir(text) => {
             // The default folder is stored as "not set", so it keeps
             // following the Documents folder if that moves.
-            let folder = one_line(Page::Advanced, "That folder", &text)?;
+            let folder = one_line(Page::Shortcuts, "That folder", &text)?;
             if !folder.is_empty() && !Path::new(folder).is_absolute() {
                 return Err(refused(
-                    Page::Advanced,
+                    Page::Shortcuts,
                     "The folder for voice memos needs its whole path, such as D:\\Memos.",
                 ));
             }
@@ -259,7 +342,7 @@ pub(crate) fn apply(
                 address
             } else {
                 return Err(refused(
-                    Page::Advanced,
+                    Page::Shortcuts,
                     "That is not a web address a search can open. It starts with https:// and \
                      has %s where the words go.",
                 ));
@@ -270,18 +353,195 @@ pub(crate) fn apply(
                 Follow::Nothing,
             )
         }
+        Change::SpokenFormatting(on) => put(&mut settings.words.commands, on, Follow::Nothing),
+        Change::AddWord(word, sounds_like) => add_word(settings, &word, &sounds_like)?,
+        Change::RemoveWord(word) => changed(settings.words.remove_word(&word)),
+        Change::AddSnippet(trigger, text) => add_snippet(settings, &trigger, &text)?,
+        Change::RemoveSnippet(trigger) => changed(settings.words.remove_snippet(&trigger)),
+        change @ (Change::AddAction
+        | Change::RemoveAction(_)
+        | Change::ActionHotkey(..)
+        | Change::ActionName(..)
+        | Change::ActionProgram(..)
+        | Change::ActionArguments(..)
+        | Change::ActionThen(..)
+        | Change::ActionCleanup(..)
+        | Change::ActionTimeout(..)) => change_action(settings, change)?,
     })
+}
+
+/// Makes one change to the actions of the user's own.
+fn change_action(settings: &mut Settings, change: Change) -> Result<Applied, Notice> {
+    Ok(match change {
+        Change::AddAction => add_action(settings)?,
+        Change::RemoveAction(index) if index < settings.actions.len() => {
+            settings.actions.remove(index);
+            Applied::Changed(Follow::Hotkeys)
+        }
+        Change::ActionHotkey(index, text) => set_hotkey(settings, Key::Action(index), &text)?,
+        Change::ActionName(index, text) => {
+            let name = action_text(Field::Name, &text)?;
+            if name.is_empty() {
+                return Err(refused(Page::Shortcuts, "An action needs a name."));
+            }
+            edit(settings, index, |action| {
+                put(&mut action.name, name.to_owned(), Follow::Nothing)
+            })
+        }
+        Change::ActionProgram(index, text) => {
+            let program = action_text(Field::Program, &text)?;
+            edit(settings, index, |action| {
+                put(&mut action.program, program.to_owned(), Follow::Nothing)
+            })
+        }
+        Change::ActionArguments(index, text) => {
+            let arguments = action_text(Field::Arguments, &text)?;
+            edit(settings, index, |action| {
+                put(&mut action.arguments, arguments.to_owned(), Follow::Nothing)
+            })
+        }
+        Change::ActionThen(index, then) => edit(settings, index, |action| {
+            put(&mut action.then, then_of(then), Follow::Nothing)
+        }),
+        Change::ActionCleanup(index, tidy) => edit(settings, index, |action| {
+            put(&mut action.cleanup, mode_of(tidy), Follow::Nothing)
+        }),
+        Change::ActionTimeout(_, seconds) if !actions::TIMEOUTS.contains(&seconds) => {
+            Applied::Unchanged
+        }
+        Change::ActionTimeout(index, seconds) => edit(settings, index, |action| {
+            put(&mut action.timeout, seconds, Follow::Nothing)
+        }),
+        // Another change, or the place of an action that is not there.
+        _ => Applied::Unchanged,
+    })
+}
+
+/// Adds an action of the user's own, set up as the example, or says why
+/// there is no room for one.
+fn add_action(settings: &mut Settings) -> Result<Applied, Notice> {
+    if settings.actions.len() >= actions::MAX_ACTIONS {
+        return Err(refused(
+            Page::Shortcuts,
+            format!(
+                "There can be {} actions. Remove one to add another.",
+                actions::MAX_ACTIONS
+            ),
+        ));
+    }
+    let mut action = Action::default();
+    let taken = |name: &str| settings.actions.iter().any(|other| other.name == name);
+    if taken(&action.name) {
+        let first = action.name.clone();
+        if let Some(name) = (2..=actions::MAX_ACTIONS + 1)
+            .map(|number| format!("{first} {number}"))
+            .find(|name| !taken(name))
+        {
+            action.name = name;
+        }
+    }
+    settings.actions.push(action);
+    Ok(Applied::Changed(Follow::Nothing))
+}
+
+/// What a window sent for a part of an action that is typed, trimmed, or
+/// why it cannot be kept.
+fn action_text(field: Field, text: &str) -> Result<&str, Notice> {
+    let text = text.trim();
+    match actions::problem(field, text) {
+        Some(why) => Err(refused(Page::Shortcuts, why)),
+        None => Ok(text),
+    }
+}
+
+/// Changes the action at `index` with `change`; nothing if there is none.
+fn edit(
+    settings: &mut Settings,
+    index: usize,
+    change: impl FnOnce(&mut Action) -> Applied,
+) -> Applied {
+    settings
+        .actions
+        .get_mut(index)
+        .map_or(Applied::Unchanged, change)
+}
+
+/// What the window calls what is done with the output of an action, as
+/// the settings keep it.
+pub(crate) fn then_of(then: Then) -> actions::Then {
+    match then {
+        Then::Nothing => actions::Then::Nothing,
+        Then::Type => actions::Then::Type,
+        Then::Copy => actions::Then::Copy,
+    }
+}
+
+/// The same, as the window is told of it.
+pub(crate) fn then_to(then: actions::Then) -> Then {
+    match then {
+        actions::Then::Nothing => Then::Nothing,
+        actions::Then::Type => Then::Type,
+        actions::Then::Copy => Then::Copy,
+    }
+}
+
+/// Adds a word to the dictionary, or says why it cannot be kept.
+fn add_word(settings: &mut Settings, word: &str, sounds_like: &str) -> Result<Applied, Notice> {
+    let added = settings.words.add_word(word, sounds_like);
+    Ok(changed(added.map_err(|why| {
+        refused(
+            Page::Words,
+            match why {
+                Refused::Empty | Refused::Unspoken => "Type the word first.".to_owned(),
+                Refused::TooLong => format!(
+                    "That is too long. A word can have {MAX_WORD} characters, and what \
+                     it sounds like {MAX_SOUNDS_LIKE}."
+                ),
+                Refused::Full => format!(
+                    "The dictionary is full. It holds {MAX_WORDS} words. Remove one \
+                     to add another."
+                ),
+            },
+        )
+    })?))
+}
+
+/// Adds a snippet, or says why it cannot be kept.
+fn add_snippet(settings: &mut Settings, trigger: &str, text: &str) -> Result<Applied, Notice> {
+    let added = settings.words.add_snippet(trigger, text);
+    Ok(changed(added.map_err(|why| {
+        refused(
+            Page::Words,
+            match why {
+                Refused::Empty => "A snippet needs both what you say and what is typed.".to_owned(),
+                Refused::Unspoken => "What you say needs at least one letter or number.".to_owned(),
+                Refused::TooLong => format!(
+                    "That is too long. What you say can have {MAX_WORD} characters, \
+                     and what is typed {MAX_SNIPPET}."
+                ),
+                Refused::Full => format!(
+                    "There is no room for another snippet. There can be \
+                     {MAX_SNIPPETS}. Remove one to add another."
+                ),
+            },
+        )
+    })?))
+}
+
+/// What a change to the dictionary or the snippets came to.
+fn changed(changed: bool) -> Applied {
+    if changed {
+        Applied::Changed(Follow::Nothing)
+    } else {
+        Applied::Unchanged
+    }
 }
 
 /// The hotkeys `after` has that `before` did not have anywhere: the ones
 /// Windows has to be asked for.
 pub(crate) fn new_hotkeys(before: &Settings, after: &Settings) -> Vec<Hotkey> {
-    let had: Vec<Hotkey> = Key::ALL
-        .into_iter()
-        .filter_map(|key| key.of(before))
-        .collect();
-    Key::ALL
-        .into_iter()
+    let had: Vec<Hotkey> = Key::all(before).filter_map(|key| key.of(before)).collect();
+    Key::all(after)
         .filter_map(|key| key.of(after))
         .filter(|hotkey| !had.contains(hotkey))
         .collect()
@@ -346,6 +606,70 @@ mod tests {
     }
 
     #[test]
+    fn the_key_that_edits_is_a_hotkey_like_the_others_and_is_spoken_of_with_them() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            made(&mut settings, Change::HotkeyCommand("F8".into())),
+            Applied::Changed(Follow::Hotkeys)
+        );
+        assert_eq!(settings.hotkey_command, Some(Hotkey::plain(0x77)));
+        // It cannot be a key another purpose has, and no other purpose can
+        // take its key.
+        let (page, why) = refusal(&settings, &Change::HotkeyCommand("F1".into()));
+        assert_eq!(page, Page::Shortcuts);
+        assert!(why.contains("dictating"), "{why}");
+        let (page, why) = refusal(&settings, &Change::HotkeyMemo("F8".into()));
+        assert_eq!(page, Page::Shortcuts);
+        assert!(why.contains("editing the selected text"), "{why}");
+        let (page, _) = refusal(&settings, &Change::HotkeyCommand("Nonsense".into()));
+        assert_eq!(page, Page::Shortcuts);
+        assert_eq!(
+            new_hotkeys(&Settings::default(), &settings),
+            [Hotkey::plain(0x77)]
+        );
+        assert_eq!(
+            made(&mut settings, Change::HotkeyCommand(String::new())),
+            Applied::Changed(Follow::Hotkeys)
+        );
+        assert_eq!(settings.hotkey_command, None);
+    }
+
+    #[test]
+    fn each_key_that_types_is_given_its_own_way_to_tidy() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            made(&mut settings, Change::Cleanup(Tidy::Clean)),
+            Applied::Changed(Follow::Nothing)
+        );
+        assert_eq!(
+            made(&mut settings, Change::CleanupEnter(Tidy::Prompt)),
+            Applied::Changed(Follow::Nothing)
+        );
+        assert_eq!(
+            (settings.cleanup, settings.cleanup_enter),
+            (Mode::Clean, Mode::Prompt)
+        );
+        assert_eq!(
+            made(&mut settings, Change::Cleanup(Tidy::Clean)),
+            Applied::Unchanged
+        );
+        for mode in Mode::ALL {
+            assert_eq!(mode_of(tidy_of(mode)), mode);
+        }
+        assert_eq!(page_of(&Change::Cleanup(Tidy::Email)), Page::Cleanup);
+        assert_eq!(page_of(&Change::Autostart(true)), Page::General);
+        assert_eq!(page_of(&Change::SearchUrl(String::new())), Page::Shortcuts);
+        assert_eq!(
+            page_of(&Change::HotkeyCommand(String::new())),
+            Page::Shortcuts
+        );
+        assert_eq!(
+            page_of(&Change::ActionName(0, String::new())),
+            Page::Shortcuts
+        );
+    }
+
+    #[test]
     fn every_hotkey_but_the_first_is_switched_off_by_emptying_it() {
         let mut settings = Settings::default();
         assert!(settings.hotkey_enter.is_some());
@@ -359,7 +683,7 @@ mod tests {
             Applied::Unchanged
         );
         let (page, why) = refusal(&settings, &Change::Hotkey(String::new()));
-        assert_eq!(page, Page::General);
+        assert_eq!(page, Page::Shortcuts);
         assert!(why.contains("cannot be empty"), "{why}");
     }
 
@@ -367,7 +691,7 @@ mod tests {
     fn a_hotkey_that_cannot_be_used_is_refused_with_a_reason() {
         let settings = Settings::default();
         let (page, why) = refusal(&settings, &Change::Hotkey("Ctrl+Nonsense".into()));
-        assert_eq!(page, Page::General);
+        assert_eq!(page, Page::Shortcuts);
         assert!(why.contains("Ctrl+Nonsense"), "{why}");
         // F2 dictates and presses Enter in the settings a new user has.
         let (_, why) = refusal(&settings, &Change::Hotkey("F2".into()));
@@ -431,6 +755,7 @@ mod tests {
             (Change::CheckUpdates(false), Follow::UpdateTimer),
             (Change::GraphicsCard(false), Follow::Engine),
             (Change::ApiEnabled(false), Follow::Api),
+            (Change::ApiTranscript(true), Follow::Nothing),
             (Change::MemoToClipboard(false), Follow::Nothing),
         ];
         for (change, follow) in cases {
@@ -516,7 +841,7 @@ mod tests {
         assert_eq!(settings.search_url, "https://duckduckgo.com/?q=%s");
         for bad in ["calc.exe", "file:///C:/x", "https://", "https://a b"] {
             let (page, _) = refusal(&settings, &Change::SearchUrl(bad.into()));
-            assert_eq!(page, Page::Advanced, "{bad}");
+            assert_eq!(page, Page::Shortcuts, "{bad}");
         }
         made(&mut settings, Change::SearchUrl("  ".into()));
         assert_eq!(settings.search_url, search::DEFAULT_TEMPLATE);
@@ -542,11 +867,192 @@ mod tests {
     }
 
     #[test]
+    fn words_and_snippets_are_added_changed_and_removed() {
+        let mut settings = Settings::default();
+        let changed = Applied::Changed(Follow::Nothing);
+        let word = |word: &str, sounds: &str| Change::AddWord(word.into(), sounds.into());
+        let snippet = |said: &str, text: &str| Change::AddSnippet(said.into(), text.into());
+        assert_eq!(made(&mut settings, word(" VinPUT ", "vin put")), changed);
+        assert_eq!(
+            made(&mut settings, word("VinPUT", "vin put")),
+            Applied::Unchanged
+        );
+        assert_eq!(made(&mut settings, word("vinput", "")), changed);
+        assert_eq!(settings.words.dictionary.len(), 1);
+        assert_eq!(made(&mut settings, snippet("my email", "a@b.c")), changed);
+        assert_eq!(made(&mut settings, snippet("My email", "d@e.f")), changed);
+        assert_eq!(settings.words.snippets.len(), 1);
+        assert_eq!(settings.words.snippets[0].text, "d@e.f");
+        assert_eq!(
+            made(&mut settings, Change::SpokenFormatting(false)),
+            changed
+        );
+        // All of it is in the file, which reads back as it was written.
+        assert_eq!(Settings::parse(&settings.serialize()), settings);
+
+        assert_eq!(
+            made(&mut settings, Change::RemoveWord("vinput".into())),
+            changed
+        );
+        assert_eq!(
+            made(&mut settings, Change::RemoveWord("vinput".into())),
+            Applied::Unchanged
+        );
+        assert_eq!(
+            made(&mut settings, Change::RemoveSnippet("My email".into())),
+            changed
+        );
+        assert!(settings.words.dictionary.is_empty() && settings.words.snippets.is_empty());
+    }
+
+    #[test]
+    fn a_word_or_a_snippet_that_cannot_be_kept_is_refused_on_its_page() {
+        let settings = Settings::default();
+        let long = "x".repeat(MAX_SNIPPET + 1);
+        for change in [
+            Change::AddWord("  ".into(), "sound".into()),
+            Change::AddWord(long.clone(), String::new()),
+            Change::AddSnippet(String::new(), "text".into()),
+            Change::AddSnippet("phrase".into(), " ".into()),
+            Change::AddSnippet("?!".into(), "text".into()),
+            Change::AddSnippet("phrase".into(), long),
+        ] {
+            let (page, why) = refusal(&settings, &change);
+            assert_eq!(page, Page::Words, "{change:?}");
+            assert!(why.ends_with('.'), "{why:?}");
+        }
+        // A line break in a word cannot start a line of its own in the file.
+        let mut changed = settings;
+        made(
+            &mut changed,
+            Change::AddWord("Vin\nhotkey = F9".into(), "a | b\n".into()),
+        );
+        assert_eq!(changed.words.dictionary[0].word, "Vin hotkey = F9");
+        assert_eq!(Settings::parse(&changed.serialize()), changed);
+    }
+
+    #[test]
     fn the_memo_folder_needs_its_whole_path() {
         let settings = Settings::default();
         for folder in ["Memos", r"..\Memos", "calc.exe"] {
             let (page, _) = refusal(&settings, &Change::MemoDir(folder.into()));
-            assert_eq!(page, Page::Advanced, "{folder}");
+            assert_eq!(page, Page::Shortcuts, "{folder}");
         }
+    }
+
+    #[test]
+    fn an_action_is_added_as_the_example_up_to_as_many_as_there_can_be() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            made(&mut settings, Change::AddAction),
+            Applied::Changed(Follow::Nothing)
+        );
+        assert_eq!(settings.actions, [Action::default()]);
+        made(&mut settings, Change::AddAction);
+        let names: Vec<_> = settings.actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Add to my notes", "Add to my notes 2"]);
+        for _ in 2..actions::MAX_ACTIONS {
+            made(&mut settings, Change::AddAction);
+        }
+        assert_eq!(settings.actions.len(), actions::MAX_ACTIONS);
+        let (page, why) = refusal(&settings, &Change::AddAction);
+        assert_eq!(page, Page::Shortcuts);
+        assert!(why.contains("Remove one"), "{why}");
+    }
+
+    #[test]
+    fn each_part_of_an_action_is_changed_and_checked() {
+        let mut settings = Settings::default();
+        made(&mut settings, Change::AddAction);
+        made(&mut settings, Change::ActionName(0, " Translate ".into()));
+        made(
+            &mut settings,
+            Change::ActionProgram(0, r"C:\Tools\tr.exe".into()),
+        );
+        made(
+            &mut settings,
+            Change::ActionArguments(0, "--to en {text}".into()),
+        );
+        made(&mut settings, Change::ActionThen(0, Then::Copy));
+        made(&mut settings, Change::ActionCleanup(0, Tidy::Clean));
+        made(&mut settings, Change::ActionTimeout(0, 60));
+        assert_eq!(
+            settings.actions,
+            [Action {
+                name: "Translate".into(),
+                hotkey: None,
+                program: r"C:\Tools\tr.exe".into(),
+                arguments: "--to en {text}".into(),
+                then: actions::Then::Copy,
+                cleanup: Mode::Clean,
+                timeout: 60,
+            }]
+        );
+        // A time that is not on offer, or an action that is not there,
+        // changes nothing.
+        assert_eq!(
+            made(&mut settings, Change::ActionTimeout(0, 7)),
+            Applied::Unchanged
+        );
+        assert_eq!(
+            made(&mut settings, Change::ActionName(3, "x".into())),
+            Applied::Unchanged
+        );
+        assert_eq!(
+            made(&mut settings, Change::RemoveAction(3)),
+            Applied::Unchanged
+        );
+        for bad in [
+            Change::ActionName(0, "  ".into()),
+            Change::ActionName(0, "a | b".into()),
+            Change::ActionProgram(0, String::new()),
+            Change::ActionArguments(0, "-Command \"echo {text}\"".into()),
+            Change::ActionArguments(0, "two\nlines".into()),
+        ] {
+            let (page, _) = refusal(&settings, &bad);
+            assert_eq!(page, Page::Shortcuts, "{bad:?}");
+        }
+        assert_eq!(
+            made(&mut settings, Change::RemoveAction(0)),
+            Applied::Changed(Follow::Hotkeys)
+        );
+        assert!(settings.actions.is_empty());
+    }
+
+    #[test]
+    fn the_key_of_an_action_is_one_no_other_has() {
+        let mut settings = Settings::default();
+        made(&mut settings, Change::AddAction);
+        made(&mut settings, Change::AddAction);
+        assert_eq!(
+            made(&mut settings, Change::ActionHotkey(0, "Ctrl+Alt+N".into())),
+            Applied::Changed(Follow::Hotkeys)
+        );
+        assert_eq!(
+            settings.actions[0].hotkey.map(|key| key.to_string()),
+            Some("Ctrl+Alt+N".to_owned())
+        );
+        // Not one a built-in key has, nor one of another action.
+        let (_, why) = refusal(&settings, &Change::ActionHotkey(1, "F1".into()));
+        assert!(why.contains("for dictating"), "{why}");
+        let (_, why) = refusal(&settings, &Change::ActionHotkey(1, "Ctrl+Alt+N".into()));
+        assert!(why.contains("the action Add to my notes"), "{why}");
+        let (_, why) = refusal(&settings, &Change::HotkeySearch("Ctrl+Alt+N".into()));
+        assert!(why.contains("the action Add to my notes"), "{why}");
+        // Nor one typing needs.
+        refusal(&settings, &Change::ActionHotkey(1, "Space".into()));
+        // A key that is new is asked of Windows.
+        let before = settings.clone();
+        made(&mut settings, Change::ActionHotkey(1, "F9".into()));
+        let new: Vec<_> = new_hotkeys(&before, &settings)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(new, ["F9"]);
+        assert_eq!(
+            made(&mut settings, Change::ActionHotkey(1, String::new())),
+            Applied::Changed(Follow::Hotkeys)
+        );
+        assert_eq!(settings.actions[1].hotkey, None);
     }
 }

@@ -30,6 +30,8 @@ const MENU_GRAPHICS_CARD: usize = 7;
 const MENU_STATUS: usize = 8;
 /// The item under the models that opens the Models page.
 const MENU_DOWNLOAD_MODELS: usize = 9;
+/// Opens the PUTLAB hub, or the page it is downloaded from.
+const MENU_HUB: usize = 10;
 /// Tray menu ids of the models, by their place in the catalog.
 const MENU_MODELS: usize = 100;
 /// Tray menu ids of the microphones: the default one, then the connected ones.
@@ -123,6 +125,8 @@ impl Host {
             ),
             None => menu.item(MENU_CHECK_UPDATE, "Check for updates…", Mark::None),
         };
+        menu.separator()
+            .item(MENU_HUB, vinput_core::hub::caption(), Mark::None);
         menu.separator().item(MENU_QUIT, "Quit", Mark::None);
         Some(menu)
     }
@@ -147,6 +151,7 @@ impl Host {
                 self.apply_choices(chosen, controller);
             }
             MENU_DOWNLOAD_MODELS => self.open_settings(Page::Models),
+            MENU_HUB => vinput_core::hub::open(),
             item if (MENU_MODELS..MENU_MICROPHONES).contains(&item) => {
                 // The list is the one the menu was just built from.
                 let Some(model) = tray_models().get(item - MENU_MODELS).copied() else {
@@ -207,6 +212,7 @@ mod tests {
             MENU_GRAPHICS_CARD,
             MENU_STATUS,
             MENU_DOWNLOAD_MODELS,
+            MENU_HUB,
         ];
         assert!(fixed.iter().all(|id| *id > 0 && *id < MENU_MODELS));
         // However many models people add, none takes the id of a microphone.

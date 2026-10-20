@@ -15,6 +15,7 @@ use crate::error::Result;
 use crate::geometry::Size;
 use crate::gfx::Gfx;
 use crate::imaging::Imaging;
+use crate::layout::Memory;
 use crate::look::Look;
 use crate::paint;
 use crate::scene::Showing;
@@ -33,6 +34,11 @@ pub struct Shot<'a> {
     pub size: Option<(f32, f32)>,
     /// What the user is in the middle of.
     pub look: Look<'a>,
+    /// Which rows the user opened or closed, and what they search for.
+    pub memory: Option<&'a Memory>,
+    /// How far down every list that scrolls by itself is scrolled, in
+    /// units.
+    pub lists: f32,
 }
 
 impl Shot<'_> {
@@ -48,6 +54,8 @@ impl Shot<'_> {
                 phase: 0.55,
                 ..Look::default()
             },
+            memory: None,
+            lists: 0.0,
         }
     }
 }
@@ -78,11 +86,13 @@ pub fn save(showing: &Showing, view: &View, shot: &Shot<'_>, path: &Path) -> Res
         let width = metric::DIALOG_W;
         (width, shell::compact_height(&content, width, gfx.fonts()))
     });
-    let frame = shell::frame(
+    let nothing = Memory::default();
+    let frame = shell::frame_with(
         content,
         showing.chrome(view),
         Size::new(width, height),
         gfx.fonts(),
+        shot.memory.unwrap_or(&nothing),
     );
     let bitmap = imaging.bitmap(pixels(width, scale), pixels(height, scale))?;
     let mut canvas = gfx.bitmap_canvas(&bitmap, scale)?;
@@ -91,8 +101,14 @@ pub fn save(showing: &Showing, view: &View, shot: &Shot<'_>, path: &Path) -> Res
     }
     // A page cannot be scrolled past its end, in a picture no more than on
     // screen.
+    let lists: Vec<f32> = frame
+        .panes()
+        .iter()
+        .map(|pane| shot.lists.clamp(0.0, pane.range()))
+        .collect();
     let look = Look {
         scroll: shot.look.scroll.clamp(0.0, frame.scroll_range()),
+        panes: &lists,
         ..shot.look
     };
     canvas.begin(paint::background(&frame, &shot.theme, &look));

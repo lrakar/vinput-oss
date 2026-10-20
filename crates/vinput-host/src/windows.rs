@@ -17,6 +17,7 @@
 //! - [`updates`]: looking for, downloading and handing over to a newer version
 //! - [`pro`]: the account and the subscription of `VinPUT` Pro
 //! - [`google`]: the setup of a Google service of one's own
+//! - [`actions`]: running the actions of the user's own
 //!
 //! Only this thread touches the host. Other threads leave what they have
 //! found where the host looks for it and post one of the messages below.
@@ -39,6 +40,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW,
 };
 
+mod actions;
 mod apiserve;
 mod children;
 mod commands;
@@ -62,6 +64,7 @@ pub use run::{Launch, run};
 
 pub(crate) use crate::win::{last_error, wide};
 
+use self::actions::Actions;
 use self::children::Windows;
 use self::google::Google;
 use self::hotkeys::Hotkeys;
@@ -129,8 +132,16 @@ const PRO_HEARD: u32 = WM_APP + 16;
 /// Posted by a thread that asked Google whether a key or a project works,
 /// when it has the answer.
 const GOOGLE_CHECKED: u32 = WM_APP + 17;
+/// Sent, not posted, by the thread of a session around every Enter it
+/// types; `wParam` is whether it is about to or has done. The procedure of
+/// the hidden window answers it, so the session can wait for the answer.
+const TYPING_ENTER: u32 = WM_APP + 18;
+/// Posted by the thread that runs an action of the user's own, when its
+/// program has finished.
+const ACTION_DONE: u32 = WM_APP + 19;
 
 /// Owns every Win32 resource of the background process and releases them on drop.
+#[expect(clippy::struct_excessive_bools, reason = "independent on/off switches")]
 struct Host {
     hwnd: HWND,
     settings: Settings,
@@ -151,6 +162,9 @@ struct Host {
     /// the events about it.
     session: Option<(Target, Option<String>)>,
     ticking: bool,
+    /// Whether Enter ended a dictation whose last words are still on their
+    /// way, and which presses it after them.
+    entered: bool,
     /// The windows that are open, each in a process of its own.
     windows: Windows,
     /// Whether a hotkey field in Settings has the keys: the hotkeys are let
@@ -170,11 +184,16 @@ struct Host {
     api: Option<api::Server>,
     /// Installs local speech models; outlives the windows.
     installer: Installer,
+    /// The model that writes whose download was asked for in a window and
+    /// is put to use when it is here.
+    text_model_on_its_way: Option<&'static str>,
     updates: Updates,
     /// The account of `VinPUT` Pro.
     pro: Pro,
     /// The setup of a Google service of one's own.
     google: Google,
+    /// The actions of the user's own that have finished.
+    actions: Actions,
     /// The page a key press that could not dictate turned Settings to. Until
     /// that window closes, no press turns it there or brings it to the front
     /// again.
@@ -244,6 +263,7 @@ impl Host {
             on_screen: false,
             session: None,
             ticking: false,
+            entered: false,
             windows: Windows::default(),
             capturing: false,
             notice: None,
@@ -265,9 +285,11 @@ impl Host {
                 .then(|| apiserve::start_api(hwnd))
                 .flatten(),
             installer: Installer::new(),
+            text_model_on_its_way: None,
             updates: Updates::default(),
             pro: Pro::new(&settings),
             google: Google::default(),
+            actions: Actions::default(),
             led_to: None,
             found: Cell::new(false),
             settings,
@@ -386,6 +408,7 @@ impl Drop for Host {
         sessions::publish_state(false);
         self.hotkeys.unregister();
         self.hotkeys.hold_cancel(false);
+        hotkeys::hold_finish(false);
         // The windows are closed, and their processes gone, before the
         // hidden window is: whoever waits for this copy to exit, such as
         // setup, finds nothing of it running once that window has gone.
@@ -429,6 +452,8 @@ mod tests {
             SESSION_ENDED,
             PRO_HEARD,
             GOOGLE_CHECKED,
+            TYPING_ENTER,
+            ACTION_DONE,
         ];
         let count = messages.len();
         messages.sort_unstable();

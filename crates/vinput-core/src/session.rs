@@ -30,6 +30,14 @@ pub enum Target {
     Search,
     /// Not recognized at all: recorded and saved as a voice memo.
     Memo,
+    /// Not typed as it is: taken for an instruction, and carried out on the
+    /// text that is selected in the focused window, which the result takes
+    /// the place of ([`crate::rewrite`]).
+    Command,
+    /// Not typed anywhere: handed to the program of the action of the
+    /// user's own at this place in the settings ([`crate::actions`]) once
+    /// the session ends.
+    Action(u8),
 }
 
 impl Target {
@@ -37,8 +45,23 @@ impl Target {
     /// indicator belongs. Other sessions show it at the bottom of the screen.
     #[must_use]
     pub fn types_at_caret(self) -> bool {
-        matches!(self, Self::Focused | Self::FocusedEnter)
+        matches!(self, Self::Focused | Self::FocusedEnter | Self::Command)
     }
+}
+
+/// Something to tell the user about a session that did what it could: a
+/// dictation that was typed as it was said because it could not be tidied,
+/// a selection that was left as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Told {
+    /// What it is about, in a few words.
+    pub title: &'static str,
+    /// What happened and what to do about it, in words for the user.
+    pub message: String,
+    /// Whether it comes back with every press until something is done in
+    /// Settings: no model to rewrite with is chosen, downloaded or paid
+    /// for.
+    pub setup: bool,
 }
 
 /// What a finished session leaves behind for the host to pass on.
@@ -67,6 +90,36 @@ pub enum Outcome {
         /// The id the session was started with, if any.
         id: Option<String>,
     },
+    /// A [`Target::Action`] session ended; this is what to hand over.
+    Action {
+        /// Where the action is in the settings.
+        slot: u8,
+        /// Everything recognized, tidied if the action asks for it, or
+        /// empty if nothing was said.
+        text: String,
+        /// What there is to tell the user about tidying it, if it could not
+        /// be tidied and is handed over as it was said.
+        told: Option<Told>,
+    },
+    /// A session did what it could and has something to say about it.
+    Told(Told),
+}
+
+/// What a dictation has typed so far, for the programs connected to the
+/// local API that the user lets read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    /// A number that is the same for everything one dictation types and
+    /// different for the next.
+    pub session: u64,
+    /// Where the text of the dictation goes.
+    pub target: Target,
+    /// The id the dictation was started with, if any.
+    pub id: Option<String>,
+    /// Everything typed since the dictation started.
+    pub text: String,
+    /// Whether the dictation has ended, so that this is all it typed.
+    pub last: bool,
 }
 
 /// A session that ended badly, for the host to tell the user and the
@@ -90,6 +143,11 @@ pub struct Failure {
 /// the thread of that session, so all it may do is wake whoever asked.
 pub type Ended = Arc<dyn Fn() + Send + Sync>;
 
+/// What a [`Controller`] calls around every Enter a session types: with
+/// `true` just before, and with `false` when it has been typed. It is called
+/// on the thread of that session, which waits for it to return.
+pub type TypingEnter = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// What the host drives: something that can start and stop dictation sessions.
 pub trait Controller {
     /// Starts a session whose text goes to `target`. `id` is whatever the
@@ -103,6 +161,12 @@ pub trait Controller {
     fn held(&mut self, _held: bool) {}
     /// Asks the running session to finish; it flushes its last words by itself.
     fn stop(&mut self);
+    /// The user pressed Enter while the running session listens, and the key
+    /// was kept from the program it was meant for. The session presses it
+    /// in their place once its last words are typed, whichever key started
+    /// it; one that ends with Enter anyway presses it once, not twice.
+    /// [`stop`](Self::stop) follows.
+    fn enter(&mut self) {}
     /// Calls off the running session and every stopped one that is still at
     /// work: from here on none of them types anything, saves a memo or opens
     /// a search, and none reports a failure. Each still ends, and says so,
@@ -124,11 +188,22 @@ pub trait Controller {
     /// [`is_active`](Self::is_active) and
     /// [`is_finishing`](Self::is_finishing) no longer count it.
     fn on_session_end(&mut self, notify: Ended);
+    /// Sets what is called around every Enter a session types, for whoever
+    /// keeps that key from other programs while a dictation listens and has
+    /// to let this one through.
+    fn on_typing_enter(&mut self, _around: TypingEnter) {}
     /// Loudness of the latest audio, from 0.0 to 1.0.
     fn level(&self) -> f32;
     /// Takes the sessions that ended badly since the last call, oldest
     /// first, each with the id it was started with.
     fn take_failures(&mut self) -> Vec<Failure>;
+    /// Takes what dictations have typed so far, where that has changed
+    /// since the last call: the latest of each, oldest dictation first.
+    /// Nothing unless the settings let programs connected to the local API
+    /// read it, as they stand now.
+    fn take_said(&mut self) -> Vec<Said> {
+        Vec::new()
+    }
     /// Takes what sessions have left behind since the last call.
     fn take_outcomes(&mut self) -> Vec<Outcome>;
     /// Applies changed settings to future sessions. With `reconnect`, the

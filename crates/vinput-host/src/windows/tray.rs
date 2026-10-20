@@ -24,8 +24,8 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    NIF_GUID, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD,
-    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_GUID, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_NOSOUND, NIIF_WARNING,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, GetSystemMetrics, HICON, ICONINFO, IMAGE_ICON, LoadImageW,
@@ -37,6 +37,7 @@ use super::{Host, TRAY_CALLBACK};
 use crate::draw;
 use crate::win::copy_text;
 use vinput_core::settings::Settings;
+use vinput_core::stt::Cause;
 use vinput_core::{Error, Result, log, models};
 use vinput_view::Page;
 
@@ -185,9 +186,9 @@ pub(super) enum About {
 }
 
 /// The tray tooltip: the keys, and the model that is at work. `spare` is
-/// the model on this PC that serves in place of `VinPUT` Pro while the
-/// month's hours are used up.
-pub(super) fn tooltip(settings: &Settings, spare: Option<&str>) -> String {
+/// the model on this PC that serves in place of `VinPUT` Pro, and why it
+/// does: the month's hours are used up, or the server is out of reach.
+pub(super) fn tooltip(settings: &Settings, spare: Option<(&str, Cause)>) -> String {
     let keys = match settings.hotkey_enter {
         Some(enter) => format!(
             "Vinput: {} to dictate, {enter} to dictate and send",
@@ -195,13 +196,18 @@ pub(super) fn tooltip(settings: &Settings, spare: Option<&str>) -> String {
         ),
         None => format!("Vinput: {} to dictate", settings.hotkey),
     };
-    match models::name_in_use(settings.provider, &settings.model) {
-        Some(model) if spare.is_some() => format!(
-            "{keys}\n{model} hours used up, using {}",
-            spare.unwrap_or_default()
-        ),
-        Some(model) => format!("{keys}\nModel: {model}"),
-        None => format!("{keys}\nNo speech model chosen yet"),
+    match (
+        models::name_in_use(settings.provider, &settings.model),
+        spare,
+    ) {
+        (Some(model), Some((spare, Cause::UsedUp))) => {
+            format!("{keys}\n{model} hours used up, using {spare}")
+        }
+        (Some(model), Some((spare, Cause::OutOfReach))) => {
+            format!("{keys}\n{model} out of reach, using {spare}")
+        }
+        (Some(model), None) => format!("{keys}\nModel: {model}"),
+        (None, _) => format!("{keys}\nNo speech model chosen yet"),
     }
 }
 
@@ -308,6 +314,13 @@ impl Tray {
     /// opens.
     pub(super) fn inform(&mut self, about: About, title: &str, text: &str) {
         self.notify(about, Kind::Answer, NIIF_INFO, title, text);
+    }
+
+    /// Shows a notification for information without the sound Windows
+    /// plays with one: for what is worth knowing and asks for nothing.
+    /// `about` is what a click on it opens.
+    pub(super) fn mention(&mut self, about: About, title: &str, text: &str) {
+        self.notify(about, Kind::Answer, NIIF_INFO | NIIF_NOSOUND, title, text);
     }
 
     /// Shows a warning. `about` is what a click on it opens.
@@ -640,9 +653,17 @@ mod tests {
         // While the hours of VinPUT Pro are used up, it says what types.
         settings.provider = vinput_core::stt::ProviderKind::Cloud;
         settings.model = vinput_core::cloud::MODEL_ID.to_owned();
-        let tip = tooltip(&settings, Some("Whisper large-v3 turbo (compact)"));
+        let spare = "Whisper large-v3 turbo (compact)";
+        let tip = tooltip(&settings, Some((spare, Cause::UsedUp)));
         assert!(
             tip.ends_with("\nVinPUT Pro hours used up, using Whisper large-v3 turbo (compact)"),
+            "{tip}"
+        );
+        assert!(tip.encode_utf16().count() < 128);
+        // And so it does while the server is out of reach.
+        let tip = tooltip(&settings, Some((spare, Cause::OutOfReach)));
+        assert!(
+            tip.ends_with("\nVinPUT Pro out of reach, using Whisper large-v3 turbo (compact)"),
             "{tip}"
         );
         assert!(tip.encode_utf16().count() < 128);

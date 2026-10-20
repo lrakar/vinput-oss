@@ -1,4 +1,5 @@
-//! Putting a file on the clipboard, the way copying it in Explorer does.
+//! Putting a file on the clipboard, the way copying it in Explorer does, and
+//! text, for an action of the user's own.
 //!
 //! A program that accepts pasted files (a messenger, a mail window, a folder)
 //! then takes the file itself on Ctrl+V.
@@ -18,6 +19,8 @@ use crate::{Error, Result};
 
 /// The clipboard format for a list of files.
 const CF_HDROP: u32 = 15;
+/// The clipboard format for text.
+const CF_UNICODETEXT: u32 = 13;
 /// Size of the `DROPFILES` header that precedes the file names.
 const HEADER_BYTES: usize = 20;
 
@@ -43,13 +46,34 @@ fn file_list(path: &Path) -> Vec<u8> {
 /// Returns [`Error::Memo`] if the clipboard is held by another program or
 /// refuses the data.
 pub(super) fn put_file(path: &Path) -> Result<()> {
-    let refused = || {
-        Error::Memo(format!(
-            "putting the memo on the clipboard failed: {}",
-            std::io::Error::last_os_error()
-        ))
-    };
-    let data = file_list(path);
+    put(CF_HDROP, &file_list(path))
+        .map_err(|err| Error::Memo(format!("putting the memo on the clipboard failed: {err}")))
+}
+
+/// Replaces the contents of the clipboard with `text`, with every line
+/// ended the way Windows ends one.
+///
+/// # Errors
+///
+/// Returns what Windows said if the clipboard is held by another program
+/// or refuses the text.
+pub(crate) fn put_text(text: &str) -> std::io::Result<()> {
+    put(CF_UNICODETEXT, &wide_text(text))
+}
+
+/// The clipboard data for `text`: UTF-16 with Windows line ends, and the
+/// terminator.
+fn wide_text(text: &str) -> Vec<u8> {
+    let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    text.encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+/// Replaces the contents of the clipboard with `data` in `format`.
+fn put(format: u32, data: &[u8]) -> std::io::Result<()> {
+    let refused = std::io::Error::last_os_error;
     // SAFETY: the memory block is as large as `data`, is locked only for the
     // copy, and belongs to the clipboard once `SetClipboardData` succeeds; it
     // is freed here only if it was not handed over. The clipboard is closed on
@@ -72,7 +96,7 @@ pub(super) fn put_file(path: &Path) -> Result<()> {
             return Err(refused());
         }
         EmptyClipboard();
-        let placed = !SetClipboardData(CF_HDROP, block).is_null();
+        let placed = !SetClipboardData(format, block).is_null();
         let error = (!placed).then(refused);
         CloseClipboard();
         if let Some(error) = error {
@@ -98,5 +122,16 @@ mod tests {
             .collect();
         let expected: Vec<u16> = r"C:\a.mp3".encode_utf16().chain([0, 0]).collect();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn text_is_wide_with_windows_line_ends_and_a_terminator() {
+        let data = wide_text("a\nb\r\n\u{10d}");
+        let units: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let expected: Vec<u16> = "a\r\nb\r\n\u{10d}".encode_utf16().chain([0]).collect();
+        assert_eq!(units, expected);
     }
 }

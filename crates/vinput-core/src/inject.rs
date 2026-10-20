@@ -43,6 +43,31 @@ pub trait TextSink {
         self.type_text(text)
     }
 
+    /// Puts `text` at the caret by pasting it, which replaces what is
+    /// selected there and puts a line break where the text has one, in
+    /// every program. Says whether it was pasted; a sink that cannot paste,
+    /// or cannot just now, says no and has put nothing anywhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Injection`](crate::Error::Injection) if the input
+    /// cannot be sent.
+    fn paste(&mut self, _text: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Types `text` with every line break as one that sends nothing:
+    /// Shift+Enter, which is a new line where Enter alone would send the
+    /// message. For text of several lines that cannot be pasted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Injection`](crate::Error::Injection) if the input
+    /// cannot be sent.
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        self.type_text(text)
+    }
+
     /// Whether what was typed last may no longer be right before the caret:
     /// the focus has gone elsewhere, or the caret was moved. Taking text
     /// back would then delete something else.

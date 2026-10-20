@@ -201,6 +201,67 @@ fn window(error: &vinput_ui::Error) -> Error {
     Error::Host(error.to_string())
 }
 
+/// Puts the program `source` under the name `target`, so that at every
+/// moment there is a whole program under that name or, on a first install,
+/// none: never half of one.
+///
+/// The new program is copied to `<name>.new` beside the target and written
+/// through to the disk before anything is touched. Then the installed one is
+/// renamed to `<name>.old`, which Windows allows even for a program that was
+/// running a moment ago and is still locked, and the new one is renamed into
+/// its place. If that last step fails, the old one is renamed back. The old
+/// file is deleted here if it can be, and by [`tidy`] when the new version
+/// starts if it cannot.
+///
+/// # Errors
+///
+/// Returns what Windows said of the step that failed. The installed program
+/// is then what it was.
+fn replace_program(source: &Path, target: &Path) -> std::io::Result<()> {
+    replace_program_with(source, target, &|from, to| std::fs::rename(from, to))
+}
+
+/// [`replace_program`], renaming with `rename`: a test hands in one that
+/// fails where it wants to see what happens then.
+fn replace_program_with(
+    source: &Path,
+    target: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let fresh = target.with_extension("new");
+    let aside = target.with_extension("old");
+    if let Some(folder) = target.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let copied = std::fs::copy(source, &fresh).and_then(|_| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fresh)?
+            .sync_all()
+    });
+    if let Err(err) = copied {
+        let _ = std::fs::remove_file(&fresh);
+        return Err(err);
+    }
+    let installed = target.exists();
+    if installed {
+        let _ = std::fs::remove_file(&aside);
+        if let Err(err) = rename(target, &aside) {
+            let _ = std::fs::remove_file(&fresh);
+            return Err(err);
+        }
+    }
+    if let Err(err) = rename(&fresh, target) {
+        if installed {
+            let _ = rename(&aside, target);
+        }
+        let _ = std::fs::remove_file(&fresh);
+        return Err(err);
+    }
+    let _ = std::fs::remove_file(&aside);
+    Ok(())
+}
+
 /// Puts the running executable in place as the installed program and
 /// registers it with Windows.
 fn install_to(target: &Path) -> Result<()> {
@@ -209,24 +270,22 @@ fn install_to(target: &Path) -> Result<()> {
     };
     let source =
         std::env::current_exe().map_err(|err| failed("finding the setup program", &err))?;
+    let was_running = host::is_running();
     if !host::stop_running_instance() {
         return Err(Error::Install(
             "Vinput is still running; exit it from its tray icon and try again".into(),
         ));
     }
-    if source != target {
-        let dir = target.parent().unwrap_or(target);
-        std::fs::create_dir_all(dir).map_err(|err| failed("creating the program folder", &err))?;
-        // A program that was running a moment ago can still be locked. It can
-        // always be renamed, which frees its name for the new one; the old
-        // file is deleted the next time setup runs.
-        let aside = target.with_extension("old");
-        let _ = std::fs::remove_file(&aside);
-        if std::fs::copy(&source, target).is_err() {
-            let _ = std::fs::rename(target, &aside);
-            std::fs::copy(&source, target).map_err(|err| failed("copying the program", &err))?;
+    if source != target
+        && let Err(err) = replace_program(&source, target)
+    {
+        // The program that was installed is still the one installed. If it
+        // was running, it runs again: nobody is left without Vinput because
+        // an update did not go through.
+        if was_running && target.is_file() {
+            let _ = start(target, &["--background"]);
         }
-        let _ = std::fs::remove_file(&aside);
+        return Err(failed("putting the program in place", &err));
     }
     register(target);
     Ok(())
@@ -543,6 +602,104 @@ mod tests {
         }
         assert!(marker.exists());
         std::fs::remove_file(marker)
+    }
+
+    /// A folder of its own for one test, with a program of `old` in it if
+    /// one is given, and a setup program of `new` beside it.
+    fn programs(test: &str, old: Option<&str>) -> std::io::Result<(PathBuf, PathBuf)> {
+        let folder =
+            std::env::temp_dir().join(format!("vinput-replace-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(folder.join("Programs"))?;
+        let (source, target) = (folder.join("setup.exe"), folder.join("Programs/vinput.exe"));
+        std::fs::write(&source, "new")?;
+        if let Some(old) = old {
+            std::fs::write(&target, old)?;
+        }
+        Ok((source, target))
+    }
+
+    /// What is in the folder of the program, by name.
+    fn left_in(target: &Path) -> Vec<String> {
+        let mut names: Vec<String> = target
+            .parent()
+            .and_then(|folder| std::fs::read_dir(folder).ok())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_program_is_put_in_place_and_nothing_else_is_left_beside_it() -> std::io::Result<()> {
+        // A first install, into a folder that is not there yet.
+        let (source, target) = programs("first", None)?;
+        std::fs::remove_dir_all(target.parent().unwrap_or(&target))?;
+        replace_program(&source, &target)?;
+        assert_eq!(std::fs::read_to_string(&target)?, "new");
+        assert_eq!(left_in(&target), ["vinput.exe"]);
+
+        // An update, with what an earlier one left behind in the way.
+        let (source, target) = programs("update", Some("old"))?;
+        std::fs::write(target.with_extension("old"), "older")?;
+        std::fs::write(target.with_extension("new"), "half a download")?;
+        replace_program(&source, &target)?;
+        assert_eq!(std::fs::read_to_string(&target)?, "new");
+        assert_eq!(left_in(&target), ["vinput.exe"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_setup_program_that_cannot_be_copied_leaves_the_installed_one_whole() -> std::io::Result<()>
+    {
+        let (source, target) = programs("unreadable", Some("old"))?;
+        std::fs::remove_file(&source)?;
+        assert!(replace_program(&source, &target).is_err());
+        assert_eq!(std::fs::read_to_string(&target)?, "old");
+        assert_eq!(left_in(&target), ["vinput.exe"]);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_installed_program_that_cannot_be_moved_stays_and_the_new_one_is_taken_away()
+    -> std::io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (source, target) = programs("held", Some("old"))?;
+        // Held open by someone who shares it with nobody: it can be neither
+        // renamed nor written over.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&target)?;
+        assert!(replace_program(&source, &target).is_err());
+        drop(held);
+        assert_eq!(std::fs::read_to_string(&target)?, "old");
+        assert_eq!(left_in(&target), ["vinput.exe"]);
+        Ok(())
+    }
+
+    #[test]
+    fn when_the_new_program_cannot_take_the_name_the_old_one_has_it_back() -> std::io::Result<()> {
+        let (source, target) = programs("back", Some("old"))?;
+        // The installed program is moved aside, and then the new one cannot
+        // be given its name.
+        let renamed = std::cell::Cell::new(0);
+        let failing = |from: &Path, to: &Path| {
+            renamed.set(renamed.get() + 1);
+            if renamed.get() == 2 {
+                return Err(std::io::Error::other("the name could not be taken"));
+            }
+            std::fs::rename(from, to)
+        };
+        assert!(replace_program_with(&source, &target, &failing).is_err());
+        // Moved aside, refused, moved back.
+        assert_eq!(renamed.get(), 3);
+        assert_eq!(std::fs::read_to_string(&target)?, "old");
+        assert_eq!(left_in(&target), ["vinput.exe"]);
+        Ok(())
     }
 
     #[test]

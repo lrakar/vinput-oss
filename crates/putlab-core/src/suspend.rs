@@ -35,7 +35,7 @@ use std::process::Child;
 /// The threads of a suspended process. The process runs again when this is
 /// resumed or dropped, so losing track of one cannot leave a process stopped.
 #[derive(Debug)]
-pub(crate) struct Suspended(platform::Threads);
+pub struct Suspended(platform::Threads);
 
 /// Suspends every thread of `child`.
 ///
@@ -43,7 +43,7 @@ pub(crate) struct Suspended(platform::Threads);
 ///
 /// If the threads cannot all be suspended. The process is then left running
 /// as it was.
-pub(crate) fn suspend(child: &Child) -> io::Result<Suspended> {
+pub fn suspend(child: &Child) -> io::Result<Suspended> {
     platform::suspend(child).map(Suspended)
 }
 
@@ -55,7 +55,7 @@ impl Suspended {
     ///
     /// If a thread could not be resumed, or is still held suspended by some
     /// other program. Every other thread has been resumed all the same.
-    pub(crate) fn resume(mut self) -> io::Result<()> {
+    pub fn resume(mut self) -> io::Result<()> {
         self.0.resume()
     }
 }
@@ -65,15 +65,17 @@ impl Suspended {
 /// Windows does not say. A server that answers each request on a connection
 /// of its own is in the middle of one exactly when this is true, and must
 /// not be suspended then.
-pub(crate) fn has_connection(process: u32) -> Option<bool> {
+#[must_use]
+pub fn has_connection(process: u32) -> Option<bool> {
     platform::has_connection(process)
 }
 
 /// The processor time `child` has used since it started, in user and kernel
 /// mode together, for tests to tell a process at work from one that is not.
 /// `None` if Windows does not say.
-#[cfg(all(test, windows))]
-pub(crate) fn cpu_time(child: &Child) -> Option<std::time::Duration> {
+#[cfg(windows)]
+#[must_use]
+pub fn cpu_time(child: &Child) -> Option<std::time::Duration> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Foundation::FILETIME;
@@ -371,7 +373,7 @@ mod tests {
 
     use super::*;
     use crate::job::KillOnDrop;
-    use crate::models::hide_console;
+    use crate::process::hide_console;
 
     /// A harmless process that works without pause: the command interpreter
     /// in an endless empty loop. Ended when the test drops it.

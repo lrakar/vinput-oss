@@ -33,12 +33,14 @@ use crate::geometry::Size;
 use crate::gfx::{Gfx, failed};
 use crate::imaging::{Com, Imaging};
 use crate::layout::Measure;
+#[cfg(feature = "line")]
+use crate::link;
 #[cfg(any(debug_assertions, test))]
 use crate::mock;
 use crate::scene::Showing;
 use crate::stage::Stage;
 use crate::theme::metric;
-use crate::{Backend, Listener, Options, Source, app, link};
+use crate::{Backend, Listener, Options, Source, app};
 
 use super::messages::proc;
 use super::{
@@ -166,11 +168,27 @@ fn connect(
     #[cfg(not(any(debug_assertions, test)))]
     let _ = view;
     match source {
+        Source::Program(connect) => connect(listener),
         #[cfg(any(debug_assertions, test))]
         Source::Mock(_) => Box::new(mock::Fake::new(view.clone(), listener)),
         // The build that ships has no canned data to show a window over.
+        #[cfg(feature = "line")]
         _ => Box::new(link::connect_stdio(listener)),
+        #[cfg(not(feature = "line"))]
+        _ => {
+            drop(listener);
+            Box::new(Nobody)
+        }
     }
+}
+
+/// The backend of a window that has none: what is done in it goes nowhere.
+#[cfg(not(feature = "line"))]
+struct Nobody;
+
+#[cfg(not(feature = "line"))]
+impl Backend for Nobody {
+    fn send(&self, _: vinput_view::Command) {}
 }
 
 /// Makes the window for `showing`, not yet shown, sized or placed. Returns

@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use platform::{Launch, Setup};
 
 fn main() -> ExitCode {
+    vinput_core::log::record_panics();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args[..] {
@@ -275,7 +276,7 @@ mod platform {
 
     pub(crate) fn encode_file(wav: &str, mp3: &str) -> vinput_core::Result<()> {
         let samples = WavSource::open(Path::new(wav))?.into_samples();
-        memo::encode_to(&samples, Path::new(mp3))?;
+        memo::encode_to(&samples, SAMPLE_RATE_HZ, Path::new(mp3))?;
         eprintln!("wrote {mp3}");
         Ok(())
     }

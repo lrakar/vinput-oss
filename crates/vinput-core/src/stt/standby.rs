@@ -1,5 +1,9 @@
-//! What dictation with `VinPUT` Pro carries on with when the month's hours
-//! are used up: a model on this PC.
+//! What dictation with `VinPUT` Pro carries on with when `VinPUT` Pro cannot
+//! serve it: a model on this PC. There are two reasons it cannot. The month's
+//! hours are used up, or the server is out of reach: the connection is bad,
+//! or gone, or the server itself is failing.
+//!
+//! # When the hours are used up
 //!
 //! The choice in the settings stays `VinPUT` Pro. That the hours are used up
 //! is a state of the running app, kept here and nowhere else: a time until
@@ -18,11 +22,34 @@
 //! month ([`WARM_BELOW`]) or the hours have run out, the way a chosen local
 //! model is loaded when Vinput starts, and from then on it is let go and
 //! loaded again as any local model is (`stt/local.rs`). No timer runs here.
+//!
+//! # When the server is out of reach
+//!
+//! A dictation that `VinPUT` Pro could not open a stream for, or whose stream
+//! stalled or broke, is carried on by the same model ([`Standby::stand_in`]).
+//! Nothing lasting is concluded from that: a connection that failed a moment
+//! ago may work again. So the server is left alone only for a short rest,
+//! [`REST`] after the first dictation it could not serve and twice as long
+//! after each further one in a row, up to [`REST_MOST`]; a key press during
+//! the rest is served by the model at once ([`Standby::cover`]), and the
+//! first press after it tries the server again. The first dictation the
+//! server serves to its end forgets all of it ([`Standby::reached`]). This
+//! too is read from memory at a key press, and nothing is asked or timed
+//! while nobody dictates.
+//!
+//! The model is loaded ahead here as well, but only when a connection is
+//! seen to take longer than a healthy one does ([`Standby::warm`]): by the
+//! time it is given up, the model is ready or on its way.
+//!
+//! A session that takes over in the middle of a dictation is started on a
+//! thread of its own ([`Deferred`]): the thread that reads the microphone
+//! does not wait for a model to load.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::deferred::Deferred;
 use super::{Lazy, LocalSpeech, ProviderKind, SessionOptions, SpeechProvider, Transcriber};
 use crate::{log, models};
 
@@ -33,6 +60,37 @@ const WARM_BELOW: u64 = 5 * 60;
 /// so to a dictation and the account has not said until when: an hour,
 /// after which the server is asked again.
 const ASSUMED: u64 = 3600;
+/// For how long the server is left alone after the first dictation it could
+/// not serve. Long enough that the next sentence, dictated right after, does
+/// not wait for the same failure again; short enough that a connection that
+/// was only gone for a moment is back in use within the same paragraph.
+const REST: Duration = Duration::from_secs(15);
+/// The longest it is left alone, after several dictations in a row it could
+/// not serve: every two minutes one press finds out whether it is back.
+const REST_MOST: Duration = Duration::from_secs(120);
+
+/// Bits of [`Standby::served`].
+const SERVED: u8 = 1;
+const IN_PART: u8 = 2;
+const OUT_OF_REACH: u8 = 4;
+
+/// Why the model on this PC served a dictation in place of `VinPUT` Pro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// The month's hours are used up.
+    UsedUp,
+    /// The server could not be reached, or stopped answering.
+    OutOfReach,
+}
+
+/// A dictation that the model on this PC served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Served {
+    /// Why it did.
+    pub cause: Cause,
+    /// Whether all of what was said reached it.
+    pub whole: bool,
+}
 
 /// Finds the provider to carry on with, given the model last used on this
 /// PC, the configured languages and whether models run on the graphics
@@ -60,9 +118,17 @@ pub struct Standby {
     until: AtomicU64,
     /// Seconds of the month left, as far as known; zero while unknown.
     left: AtomicU64,
-    /// Whether a dictation was served here since [`Standby::take_served`]:
-    /// 1 if so, 2 if some of what was said could not be handed over.
+    /// Whether a dictation was served here since [`Standby::take_served`]
+    /// ([`SERVED`]), whether some of what was said could not be handed over
+    /// ([`IN_PART`]) and whether it was for want of a connection
+    /// ([`OUT_OF_REACH`]).
     served: AtomicU8,
+    /// How many dictations in a row the server could not serve for want of
+    /// a connection; zero while it is not known to be out of reach.
+    strikes: AtomicU32,
+    /// Until when the server is left alone after that, in milliseconds on
+    /// [`ticks`]; zero while it is not.
+    rest_until: AtomicU64,
     /// Whether the model was loaded ahead for the state the month is in.
     warmed: AtomicBool,
     local: Mutex<Local>,
@@ -80,6 +146,22 @@ fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
+}
+
+/// Milliseconds on a clock that only goes forward, and never reads zero.
+fn ticks() -> u64 {
+    static BEGAN: OnceLock<Instant> = OnceLock::new();
+    let since = BEGAN.get_or_init(Instant::now).elapsed();
+    u64::try_from(since.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+/// For how long the server is left alone after `strikes` dictations in a
+/// row that it could not serve.
+fn rest_after(strikes: u32) -> Duration {
+    let doubled = REST.saturating_mul(1 << strikes.saturating_sub(1).min(8));
+    doubled.min(REST_MOST)
 }
 
 /// A model that is on this PC, set up when it is first needed.
@@ -165,12 +247,72 @@ impl Standby {
     }
 
     /// Whether a dictation was served by the model on this PC since this
-    /// was last asked, and if so whether all of what was said reached it.
-    pub fn take_served(&self) -> Option<bool> {
-        match self.served.swap(0, Ordering::Relaxed) {
-            0 => None,
-            served => Some(served == 1),
+    /// was last asked, and if so why, and whether all of what was said
+    /// reached it.
+    pub fn take_served(&self) -> Option<Served> {
+        let served = self.served.swap(0, Ordering::Relaxed);
+        (served != 0).then_some(Served {
+            cause: if served & OUT_OF_REACH == 0 {
+                Cause::UsedUp
+            } else {
+                Cause::OutOfReach
+            },
+            whole: served & IN_PART == 0,
+        })
+    }
+
+    fn note_served(&self, cause: Cause, whole: bool) {
+        let mut served = SERVED;
+        if !whole {
+            served |= IN_PART;
         }
+        if cause == Cause::OutOfReach {
+            served |= OUT_OF_REACH;
+        }
+        self.served.fetch_or(served, Ordering::Relaxed);
+    }
+
+    /// Whether the last dictation found the server out of reach, and none
+    /// since has been served by it.
+    #[must_use]
+    pub fn out_of_reach(&self) -> bool {
+        self.strikes.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether there is anything here to look for a model with.
+    pub(super) fn looks(&self) -> bool {
+        self.find.is_some()
+    }
+
+    /// The server has served a dictation to its end: it is in reach.
+    pub(super) fn reached(&self) {
+        // Nearly always a look at a number that is zero already.
+        if self.strikes.load(Ordering::Relaxed) != 0 {
+            self.strikes.store(0, Ordering::Relaxed);
+            self.rest_until.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A connection is taking longer than a healthy one does: the model is
+    /// loaded now, once, so that it is ready if the connection is given up.
+    pub(super) fn warm(self: &Arc<Self>) {
+        if !self.warmed.swap(true, Ordering::Relaxed) {
+            self.load();
+        }
+    }
+
+    /// Has the model loaded on a thread of its own.
+    fn load(self: &Arc<Self>) {
+        let standby = Arc::clone(self);
+        // Should the thread not start, the dictation that needs the model
+        // loads it.
+        let _ = std::thread::Builder::new()
+            .name("vinput-connect".into())
+            .spawn(move || {
+                if let Some(Err(err)) = standby.provider().map(|local| local.warm_up()) {
+                    log::write(&format!("the model to carry on with is not ready: {err}"));
+                }
+            });
     }
 
     /// A stream has ended with this many seconds of it counted.
@@ -191,16 +333,7 @@ impl Standby {
         if !low {
             self.warmed.store(false, Ordering::Relaxed);
         } else if !self.warmed.swap(true, Ordering::Relaxed) {
-            let standby = Arc::clone(self);
-            // Should the thread not start, the dictation that needs the
-            // model loads it.
-            let _ = std::thread::Builder::new()
-                .name("vinput-connect".into())
-                .spawn(move || {
-                    if let Some(Err(err)) = standby.provider().map(|local| local.warm_up()) {
-                        log::write(&format!("the model to carry on with is not ready: {err}"));
-                    }
-                });
+            self.load();
         }
     }
 
@@ -213,16 +346,40 @@ impl Standby {
         local.ready.clone()
     }
 
+    /// The model did not start: it is looked for anew the next time.
+    fn did_not_start(&self, err: &crate::Error) {
+        log::write(&format!("the model to carry on with did not start: {err}"));
+        self.local().ready = None;
+    }
+
     /// A session of the model on this PC, if there is such a model and it
-    /// starts. One that does not is looked for anew the next time.
+    /// starts. One that does not is looked for anew the next time. This
+    /// waits for a model that is not loaded, so it is for a dictation that
+    /// is starting, which asks for its session on a thread of its own.
     fn start(&self, options: SessionOptions<'_>) -> Option<Box<dyn Transcriber + Send>> {
         let started = self.provider()?.start_session(options);
-        started
-            .map_err(|err| {
-                log::write(&format!("the model to carry on with did not start: {err}"));
-                self.local().ready = None;
-            })
-            .ok()
+        started.map_err(|err| self.did_not_start(&err)).ok()
+    }
+
+    /// A session of the model on this PC for a dictation that is under way,
+    /// if there is such a model. It does not wait for the model: what is
+    /// fed to the session before the model is loaded is kept and recognized
+    /// then. A model that does not start ends the dictation with why.
+    fn start_later(
+        self: &Arc<Self>,
+        options: SessionOptions<'_>,
+    ) -> Option<Box<dyn Transcriber + Send>> {
+        let provider = self.provider()?;
+        let standby = Arc::clone(self);
+        let languages = options.languages.to_vec();
+        Some(Box::new(Deferred::asking(move || {
+            let options = SessionOptions {
+                languages: &languages,
+            };
+            provider
+                .start_session(options)
+                .inspect_err(|err| standby.did_not_start(err))
+        })))
     }
 
     /// The session for a dictation that starts now, while the hours are
@@ -236,7 +393,44 @@ impl Standby {
             return None;
         }
         let session = self.start(options)?;
-        self.served.fetch_max(1, Ordering::Relaxed);
+        self.note_served(Cause::UsedUp, true);
+        Some(session)
+    }
+
+    /// The session for a dictation that starts now, while the server is
+    /// left alone after a dictation it could not serve; `None` while it is
+    /// not, which is all a key press costs then, and when no model on this
+    /// PC can serve.
+    pub(super) fn cover(&self, options: SessionOptions<'_>) -> Option<Box<dyn Transcriber + Send>> {
+        let until = self.rest_until.load(Ordering::Relaxed);
+        if until == 0 || ticks() >= until {
+            return None;
+        }
+        let session = self.start(options)?;
+        self.note_served(Cause::OutOfReach, true);
+        Some(session)
+    }
+
+    /// The server could not serve a dictation that is under way, for want
+    /// of a connection: the session that carries it on, if a model on this
+    /// PC can. The server is then left alone for a while, longer each time
+    /// this happens to dictations in a row. `whole` says whether all of
+    /// what the server did not settle can be handed to the session.
+    pub(super) fn stand_in(
+        self: &Arc<Self>,
+        options: SessionOptions<'_>,
+        whole: bool,
+    ) -> Option<Box<dyn Transcriber + Send>> {
+        let session = self.start_later(options)?;
+        let strikes = self
+            .strikes
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let rest = u64::try_from(rest_after(strikes).as_millis()).unwrap_or(u64::MAX);
+        self.rest_until
+            .store(ticks().saturating_add(rest), Ordering::Relaxed);
+        self.warmed.store(true, Ordering::Relaxed);
+        self.note_served(Cause::OutOfReach, whole);
         Some(session)
     }
 
@@ -250,13 +444,12 @@ impl Standby {
         options: SessionOptions<'_>,
         whole: bool,
     ) -> Option<Box<dyn Transcriber + Send>> {
-        let session = self.start(options)?;
+        let session = self.start_later(options)?;
         if self.until() == 0 {
             self.until.store(now() + ASSUMED, Ordering::Relaxed);
         }
         self.warmed.store(true, Ordering::Relaxed);
-        self.served
-            .fetch_max(if whole { 1 } else { 2 }, Ordering::Relaxed);
+        self.note_served(Cause::UsedUp, whole);
         Some(session)
     }
 }
@@ -342,6 +535,27 @@ pub(crate) mod tests {
         pub(crate) fn lapse(&self) {
             self.until.store(1, Ordering::Relaxed);
         }
+
+        /// As if the server had been left alone for long enough.
+        pub(crate) fn rested(&self) {
+            self.rest_until.store(1, Ordering::Relaxed);
+        }
+    }
+
+    /// What is found when the model served because the hours are used up.
+    pub(crate) fn used_up(whole: bool) -> Served {
+        Served {
+            cause: Cause::UsedUp,
+            whole,
+        }
+    }
+
+    /// What is found when it served because the server was out of reach.
+    pub(crate) fn out_of_reach(whole: bool) -> Served {
+        Served {
+            cause: Cause::OutOfReach,
+            whole,
+        }
     }
 
     const NONE: SessionOptions<'static> = SessionOptions { languages: &[] };
@@ -360,7 +574,7 @@ pub(crate) mod tests {
         standby.heard(72_000, 72_000, reset);
         assert_eq!(standby.until(), reset);
         assert!(standby.session(NONE).is_some());
-        assert_eq!(standby.take_served(), Some(true));
+        assert_eq!(standby.take_served(), Some(used_up(true)));
         assert_eq!(standby.take_served(), None);
         // The account says there are hours again: a tier with more of them.
         standby.heard(72_000, 144_000, reset);
@@ -394,17 +608,142 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_dictation_is_carried_on_and_the_model_serves_from_then() {
         let (standby, heard) = with_model();
-        assert!(standby.take_over(NONE, false).is_some());
-        assert_eq!(standby.take_served(), Some(false));
+        let first = standby.take_over(NONE, false);
+        assert!(first.is_some());
+        assert_eq!(standby.take_served(), Some(used_up(false)));
         let until = standby.until();
         assert!(until > now());
         assert!(standby.session(NONE).is_some());
         // A date the account gave is not replaced by a guess.
         let reset = now() + 50_000;
         standby.heard(9, 9, reset);
-        assert!(standby.take_over(NONE, true).is_some());
+        let second = standby.take_over(NONE, true);
+        assert!(second.is_some());
         assert_eq!(standby.until(), reset);
+        // A session that takes over starts on a thread of its own, and is
+        // there at the latest when the dictation ends.
+        for session in [first, second].into_iter().flatten() {
+            assert_eq!(finished(session), "Locally.");
+        }
         assert_eq!(heard.sessions(), 3);
+    }
+
+    /// Ends a session and returns what it settled.
+    fn finished(mut session: Box<dyn Transcriber + Send>) -> String {
+        let mut settled = String::new();
+        let ended = session.finish(&mut |transcript| {
+            settled.push_str(&transcript.text);
+            Ok(())
+        });
+        assert!(ended.is_ok(), "{ended:?}");
+        settled
+    }
+
+    #[test]
+    fn a_dictation_the_server_could_not_serve_is_carried_on_and_the_server_left_alone_a_while() {
+        let (standby, heard) = with_model();
+        // Nothing is known against the server: it is asked.
+        assert!(standby.cover(NONE).is_none());
+        assert!(!standby.out_of_reach());
+        let mut session = standby.stand_in(NONE, true);
+        assert!(session.is_some());
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        assert!(standby.out_of_reach());
+        // What is fed before the model is there is kept for it.
+        if let Some(session) = &mut session {
+            assert!(session.feed(&[1, 2, 3]).is_ok());
+        }
+        assert_eq!(session.take().map(finished).as_deref(), Some("Locally."));
+        assert_eq!(heard.fed(), [1, 2, 3]);
+        // A press during the rest is served here, without a word to the
+        // server, and the hours are not taken to be used up.
+        assert!(standby.cover(NONE).is_some());
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        assert_eq!(standby.until(), 0);
+        assert!(standby.session(NONE).is_none());
+        // After the rest the server is asked again; until it has served a
+        // dictation it still counts as out of reach.
+        standby.rested();
+        assert!(standby.cover(NONE).is_none());
+        assert!(standby.out_of_reach());
+        standby.reached();
+        assert!(!standby.out_of_reach());
+        assert!(standby.cover(NONE).is_none());
+        assert_eq!(standby.take_served(), None);
+        // Part of what was said could not be handed over: that is said.
+        assert!(standby.stand_in(NONE, false).is_some());
+        assert_eq!(standby.take_served(), Some(out_of_reach(false)));
+    }
+
+    #[test]
+    fn the_server_is_left_alone_longer_each_time_in_a_row_and_never_for_long() {
+        let seconds = |strikes| rest_after(strikes).as_secs();
+        assert_eq!(
+            [1, 2, 3, 4, 5, 40, u32::MAX].map(seconds),
+            [15, 30, 60, 120, 120, 120, 120]
+        );
+        let (standby, _heard) = with_model();
+        let rest = |standby: &Standby| {
+            standby
+                .rest_until
+                .load(Ordering::Relaxed)
+                .saturating_sub(ticks())
+        };
+        assert!(standby.stand_in(NONE, true).is_some());
+        assert!((14_000..=15_000).contains(&rest(&standby)));
+        assert!(standby.stand_in(NONE, true).is_some());
+        assert!((29_000..=30_000).contains(&rest(&standby)));
+        // One dictation the server serves, and it starts over.
+        standby.reached();
+        assert_eq!(standby.rest_until.load(Ordering::Relaxed), 0);
+        assert!(standby.stand_in(NONE, true).is_some());
+        assert!((14_000..=15_000).contains(&rest(&standby)));
+    }
+
+    #[test]
+    fn without_a_model_the_server_is_not_left_alone_either() {
+        let standby = Arc::new(Standby::new(|_, _, _| None));
+        assert!(standby.looks());
+        assert!(standby.stand_in(NONE, true).is_none());
+        assert!(!standby.out_of_reach());
+        assert_eq!(standby.take_served(), None);
+        assert!(!Standby::default().looks());
+    }
+
+    #[test]
+    fn a_model_that_does_not_start_midway_ends_the_dictation_and_is_looked_for_anew() {
+        let (standby, heard) = with_model();
+        heard.broken.store(true, Ordering::Relaxed);
+        let Some(mut session) = standby.stand_in(NONE, true) else {
+            unreachable!("a model was found");
+        };
+        let ended = session.finish(&mut |_| Ok(()));
+        assert!(
+            matches!(&ended, Err(Error::Transcription(why)) if why.contains("model is gone")),
+            "{ended:?}"
+        );
+        assert!(standby.local().ready.is_none());
+    }
+
+    #[test]
+    fn a_slow_connection_has_the_model_loaded_once() {
+        let loads = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&loads);
+        let standby = Arc::new(Standby::new(move |_, _, _| {
+            let counted = Arc::clone(&counted);
+            Some(Arc::new(Lazy::new(ProviderKind::Local, move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err(Error::Transcription("not for this test".into()))
+            })))
+        }));
+        standby.warm();
+        standby.warm();
+        let started = Instant::now();
+        while loads.load(Ordering::Relaxed) == 0 && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -479,13 +818,13 @@ pub(crate) mod tests {
             })))
         }));
         let loaded = |times: u64| {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             while loads.load(Ordering::Relaxed) < times
-                && started.elapsed() < std::time::Duration::from_secs(5)
+                && started.elapsed() < Duration::from_secs(5)
             {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(2));
             }
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::thread::sleep(Duration::from_millis(30));
             loads.load(Ordering::Relaxed)
         };
         // Plenty left: nothing is loaded, also not after a dictation.

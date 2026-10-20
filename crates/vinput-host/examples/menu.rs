@@ -10,8 +10,8 @@
 //! submenus without touching anything: a list such as `down,down,right`, or
 //! `-` for none. The menu opens at `x`, `y`, or at the pointer.
 //!
-//! The menu is private to the host, so its source is compiled into this
-//! example as it stands.
+//! The list of microphones is private to the host, so its source is
+//! compiled into this example as it stands.
 #![allow(unsafe_code)]
 
 #[cfg(windows)]
@@ -19,7 +19,7 @@
 #[path = "../src/menu.rs"]
 mod menu;
 
-/// The helper the menu takes from the host's main module.
+/// Text in the form Windows takes it.
 #[cfg(windows)]
 mod windows {
     pub(crate) fn wide(text: &str) -> Vec<u16> {
@@ -45,7 +45,9 @@ mod demo {
         WM_KEYDOWN, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
-    use crate::menu::{self, Mark, Menu, Theme};
+    use putlab_core::menu::Theme;
+
+    use crate::menu::{self, Mark, Menu};
     use crate::windows::wide;
 
     /// How often a key is pressed, in milliseconds.

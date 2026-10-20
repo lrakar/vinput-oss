@@ -11,7 +11,13 @@
 //! Escape calls a dictation off ([`Host::cancel`]): the session that listens
 //! and every stopped one that is still at work on its last words. Nothing
 //! more is typed, searched for or saved. The key is ours only while there is
-//! such a session ([`Host::hold_cancel_key`]).
+//! such a session ([`Host::hold_session_keys`]).
+//!
+//! Enter ends a dictation that types where the caret is ([`Host::enter`]),
+//! as the key that started it would, and is pressed again by the dictation
+//! after its last words: once, also after the kind that ends with Enter
+//! anyway. That key too is ours only while such a dictation listens or is
+//! at the last words Enter is to follow.
 //!
 //! That a session has ended is not polled for. Its thread posts
 //! `SESSION_ENDED` as the last thing it does, whether the session was
@@ -23,18 +29,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, PostMessageW, SetTimer};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    KillTimer, PostMessageW, SMTO_NORMAL, SendMessageTimeoutW, SetTimer,
+};
 
 use super::children::Which;
 use super::tray::{self, About};
-use super::{Host, SESSION_ENDED, TICK_MS, TICK_TIMER_ID, hotkeys};
+use super::{Host, SESSION_ENDED, TICK_MS, TICK_TIMER_ID, TYPING_ENTER, hotkeys};
 use crate::indicator::Indicator;
 use crate::win::{is_down, open};
 use vinput_core::api::{ClientId, ErrorCode, Event};
 use vinput_core::session::{Action, Controller, Failure, Outcome, Target, Trigger};
 use vinput_core::settings::{Settings, data_dir};
 use vinput_core::stt::{GeminiConfig, ProviderKind};
-use vinput_core::{log, models, search};
+use vinput_core::{log, models, rewrite, search};
 use vinput_view::Page;
 
 /// What it comes to for the host that a session has ended.
@@ -112,11 +120,32 @@ impl Host {
             // SAFETY: posting to a window that has gone away fails harmlessly.
             unsafe { PostMessageW(window as HWND, SESSION_ENDED, 0, 0) };
         }));
+        // An Enter that a session types is let through by this thread, to
+        // which the key belongs: the session waits until it has been, and
+        // not for long, should this thread be busy.
+        controller.on_typing_enter(Arc::new(move |typing| {
+            // SAFETY: sending to a window that has gone away fails
+            // harmlessly; no answer is asked for.
+            unsafe {
+                SendMessageTimeoutW(
+                    window as HWND,
+                    TYPING_ENTER,
+                    usize::from(typing),
+                    0,
+                    SMTO_NORMAL,
+                    TYPING_ENTER_WAIT_MS,
+                    std::ptr::null_mut(),
+                );
+            }
+        }));
     }
 
     pub(super) fn on_hotkey(&mut self, id: usize, controller: &mut dyn Controller) {
         if hotkeys::is_cancel(id) {
             return self.cancel(controller);
+        }
+        if hotkeys::is_finish(id) {
+            return self.enter(controller);
         }
         let Some((target, hotkey)) = hotkeys::pressed(&self.settings, id) else {
             return;
@@ -137,7 +166,9 @@ impl Host {
     ) {
         // Only a voice memo works without a speech model.
         let lacking = match action {
-            Action::Start { target } if target != Target::Memo => self.lacking(),
+            Action::Start { target } if target != Target::Memo => self
+                .lacking()
+                .or_else(|| self.cannot_edit().filter(|_| target == Target::Command)),
             _ => None,
         };
         if let Some((page, why, stay)) = lacking {
@@ -162,7 +193,7 @@ impl Host {
                 }
                 self.set_listening(true);
                 self.show_level(controller);
-                self.hold_cancel_key(controller);
+                self.hold_session_keys(controller);
             }
             Action::Stop => self.stop(controller),
             Action::None => {}
@@ -206,6 +237,19 @@ impl Host {
         Some((page, why, page == Page::Welcome))
     }
 
+    /// What stands between a press of the key that edits and an edit, as
+    /// far as is known without trying: the page of Settings on which it is
+    /// seen to, and why. A dictation that is only tidied is not turned
+    /// away for it: it is typed as it was said, and says so.
+    fn cannot_edit(&self) -> Option<(Page, &'static str, bool)> {
+        let why = cannot_rewrite(
+            &self.settings,
+            || self.pro.lacks_plan(),
+            models::is_installed,
+        )?;
+        Some((Page::Cleanup, why, false))
+    }
+
     /// Nothing can be dictated as things stand. A session would only fail,
     /// and fail again at every press after it, so none is started, and no
     /// sound says that listening has: whoever pressed the key is shown the
@@ -223,7 +267,7 @@ impl Host {
         if let Some((from, id)) = requester {
             self.answer(*from, ErrorCode::NoModel, why, id.as_deref());
             self.tray
-                .warn(About::Settings(page), "VinPUT cannot dictate yet", why);
+                .warn(About::Settings(page), cannot_title(page), why);
             // No window opens that would ask the account, and what is known
             // of it may be old: the next start finds what it says now.
             if page == Page::Pro {
@@ -250,11 +294,9 @@ impl Host {
     fn show_why(&mut self, page: Page, why: &str, stay: bool) {
         let open = self.windows.is_open(Which::Settings);
         if !turns(open, self.led_to, page, stay) {
-            return self.tray.warn_of_failure(
-                About::Settings(page),
-                "VinPUT cannot dictate yet",
-                why,
-            );
+            return self
+                .tray
+                .warn_of_failure(About::Settings(page), cannot_title(page), why);
         }
         if !matches!(page, Page::Pro | Page::Welcome) {
             self.tell(page, why);
@@ -290,12 +332,33 @@ impl Host {
                     let hint = if on_clipboard {
                         "Paste it anywhere with Ctrl+V."
                     } else {
-                        "Find it under Open voice memos in the tray menu."
+                        "Find it under Voice memos in the tray menu."
                     };
                     self.tray.inform(
                         About::Memo,
                         "Voice memo saved",
                         &format!("{name} ({}). {hint}", length(seconds)),
+                    );
+                }
+                Outcome::Action { slot, text, told } => {
+                    if let Some(told) = told {
+                        log::write(&format!("{}: {}", told.title, told.message));
+                        self.tray.warn_of_failure(
+                            About::Settings(Page::Shortcuts),
+                            told.title,
+                            &told.message,
+                        );
+                    }
+                    self.run_action(slot, text);
+                }
+                // The dictation was typed as it was said, or the selection
+                // left as it was: said quietly, and not over and over.
+                Outcome::Told(told) => {
+                    log::write(&format!("{}: {}", told.title, told.message));
+                    self.tray.warn_of_failure(
+                        About::Settings(Page::Cleanup),
+                        told.title,
+                        &told.message,
                     );
                 }
             }
@@ -333,6 +396,7 @@ impl Host {
         if !self.ticking {
             return;
         }
+        self.pass_on_said(controller);
         if self.trigger.is_held()
             && self.held_vk.is_none_or(|vk| !is_down(vk))
             && let_go(&mut self.trigger, Instant::now(), controller)
@@ -375,6 +439,28 @@ impl Host {
         if !controller.is_finishing() {
             self.on_session_ended(controller);
         }
+        // Enter is no longer for a dictation that has stopped listening.
+        self.hold_session_keys(controller);
+    }
+
+    /// Enter was pressed while it is ours. A dictation that types at the
+    /// caret and listens is ended by it, as by the key that started it, and
+    /// told to press Enter after its last words in place of this one, which
+    /// no program has seen. Pressed again while those words are on their
+    /// way, it does nothing: one Enter follows them, not two.
+    pub(super) fn enter(&mut self, controller: &mut dyn Controller) {
+        if !ends_at_enter(self.ticking, self.target()) {
+            return;
+        }
+        controller.enter();
+        self.entered = true;
+        self.trigger.session_ended();
+        self.stop(controller);
+    }
+
+    /// Where the text of the latest session goes.
+    fn target(&self) -> Option<Target> {
+        self.session.as_ref().map(|(target, _)| *target)
     }
 
     /// Calls off the session that is listening and every stopped one whose
@@ -384,6 +470,7 @@ impl Host {
     /// off like any other, with nothing to pass on.
     pub(super) fn cancel(&mut self, controller: &mut dyn Controller) {
         controller.cancel();
+        self.entered = false;
         self.trigger.session_ended();
         self.set_listening(false);
         self.hide_indicators();
@@ -392,18 +479,37 @@ impl Host {
         }
         // Nothing is left to call off, so Escape goes back now and not
         // when the recognizer has answered.
-        self.hold_cancel_key(controller);
+        self.hold_session_keys(controller);
     }
 
     /// Takes Escape while there is a session to call off and gives it back
-    /// to the other programs the moment there is none.
-    fn hold_cancel_key(&mut self, controller: &dyn Controller) {
+    /// to the other programs the moment there is none. Enter is taken while
+    /// a dictation that types at the caret listens, and kept while the one
+    /// it ended is at its last words, which it is to follow.
+    fn hold_session_keys(&mut self, controller: &dyn Controller) {
         self.hotkeys.hold_cancel(controller.can_cancel());
+        self.entered &= controller.is_finishing();
+        hotkeys::hold_finish(self.entered || ends_at_enter(self.ticking, self.target()));
+    }
+
+    /// Tells programs connected to the local API what dictations have typed
+    /// by now, where that has changed and they may know.
+    fn pass_on_said(&mut self, controller: &mut dyn Controller) {
+        for said in controller.take_said() {
+            self.send_event(Event::Transcript {
+                text: &said.text,
+                mode: said.target,
+                session: said.session,
+                last: said.last,
+                id: said.id.as_deref(),
+            });
+        }
     }
 
     /// A session has ended: what it leaves behind is passed on at once, and
     /// the indicator, the tray icon and what other programs are told follow.
     pub(super) fn on_session_ended(&mut self, controller: &mut dyn Controller) {
+        self.pass_on_said(controller);
         let left = Left::of(self.ticking, controller);
         let title = match left.ending {
             Ending::Broke => {
@@ -426,7 +532,7 @@ impl Host {
         };
         self.report(title, left.outcomes, &left.failures);
         self.pro_after_session();
-        self.hold_cancel_key(controller);
+        self.hold_session_keys(controller);
     }
 
     /// The indicator at the bottom of the screen, or the one at the caret.
@@ -485,7 +591,7 @@ impl Host {
         if !open(&address) {
             log::write("could not open the browser for a search");
             self.tray.warn(
-                About::Settings(Page::Advanced),
+                About::Settings(Page::Shortcuts),
                 "Search not opened",
                 "Windows could not open the search in a browser.",
             );
@@ -533,6 +639,47 @@ fn lacking(
         _ => None,
     };
     why.map(|why| (Page::Models, why))
+}
+
+/// How long a session that is about to type an Enter waits for the thread
+/// of the message loop to let the key through.
+const TYPING_ENTER_WAIT_MS: u32 = 1000;
+
+/// Whether Enter ends the session the host shows: one that is `listening`
+/// and whose text is typed where the caret is. A search, a voice memo and
+/// what a program asked for are not typed into what has the keyboard, and
+/// Enter is left to whatever the user is doing there meanwhile.
+fn ends_at_enter(listening: bool, target: Option<Target>) -> bool {
+    listening && target.is_some_and(Target::types_at_caret)
+}
+
+/// What the notification is called that says why a key press came to
+/// nothing, by the page it is put right on.
+fn cannot_title(page: Page) -> &'static str {
+    if page == Page::Cleanup {
+        "VinPUT cannot edit yet"
+    } else {
+        "VinPUT cannot dictate yet"
+    }
+}
+
+/// Why nothing can be rewritten with these settings, as far as is known
+/// without trying; `None` when it is worth a try. `no_plan` says whether
+/// the model of the subscription cannot be had, and `installed` whether a
+/// model that runs on this PC is there; neither is asked unless the
+/// settings choose that.
+fn cannot_rewrite(
+    settings: &Settings,
+    no_plan: impl FnOnce() -> bool,
+    installed: impl FnOnce(&models::Model, bool) -> bool,
+) -> Option<&'static str> {
+    if rewrite::uses_pro(settings) {
+        return no_plan()
+            .then_some("Editing by voice needs VinPUT Plus or Pro, or a text model on this PC.");
+    }
+    models::writer(&settings.text_model)
+        .is_none_or(|model| !installed(model, settings.use_gpu()))
+        .then_some("The text model is not on this PC. Download it, or choose another.")
 }
 
 /// The key that started the session has come up. Says whether that stops
@@ -604,6 +751,8 @@ mod tests {
         finishing: usize,
         /// Whether what is running was called off.
         cancelled: bool,
+        /// Whether the session that listens was told of an Enter.
+        entered: bool,
         /// What it was last told of the key being held.
         held: Option<bool>,
         outcomes: Vec<Outcome>,
@@ -665,6 +814,10 @@ mod tests {
             if std::mem::take(&mut self.active) {
                 self.finishing += 1;
             }
+        }
+
+        fn enter(&mut self) {
+            self.entered = self.active;
         }
 
         fn cancel(&mut self) {
@@ -867,6 +1020,32 @@ mod tests {
     }
 
     #[test]
+    fn editing_is_turned_away_only_for_want_of_a_model_to_edit_with() {
+        // The model of the subscription, which is what is used until
+        // another is chosen: only the account is looked at.
+        let settings = Settings::default();
+        let why = cannot_rewrite(&settings, || true, |_, _| unreachable!("the disk"));
+        assert!(why.is_some_and(|why| why.contains("VinPUT Plus or Pro")));
+        assert_eq!(cannot_rewrite(&settings, || false, |_, _| false), None);
+        // A model on this PC: only the disk is looked at.
+        let local = Settings {
+            text_model: "gemma-4-e2b".to_owned(),
+            ..Settings::default()
+        };
+        let why = cannot_rewrite(&local, || unreachable!("the account"), |_, _| false);
+        assert!(why.is_some_and(|why| why.contains("not on this PC")));
+        assert_eq!(cannot_rewrite(&local, || true, |_, _| true), None);
+        // One the list no longer has cannot be on this PC either.
+        let gone = Settings {
+            text_model: "banana".to_owned(),
+            ..Settings::default()
+        };
+        assert!(cannot_rewrite(&gone, || false, |_, _| true).is_some());
+        assert_eq!(cannot_title(Page::Cleanup), "VinPUT cannot edit yet");
+        assert_eq!(cannot_title(Page::Models), "VinPUT cannot dictate yet");
+    }
+
+    #[test]
     fn a_model_that_does_not_know_the_languages_does_not_stand_in_the_way() {
         // It types something, if not well, and Settings say so on its row:
         // a press is not turned away for it.
@@ -926,6 +1105,34 @@ mod tests {
         // turned away from at all.
         assert!(!turns(true, None, Page::Welcome, true));
         assert!(!turns(true, Some(Page::Pro), Page::Models, true));
+    }
+
+    #[test]
+    fn enter_ends_only_a_dictation_that_listens_and_types_at_the_caret() {
+        for target in [Target::Focused, Target::FocusedEnter] {
+            assert!(ends_at_enter(true, Some(target)));
+            // Stopped, with its last words on their way: not again.
+            assert!(!ends_at_enter(false, Some(target)));
+        }
+        // What is not typed into the program that has the keyboard leaves
+        // Enter to that program.
+        for target in [Target::Search, Target::Memo, Target::Capture] {
+            assert!(!ends_at_enter(true, Some(target)));
+        }
+        assert!(!ends_at_enter(true, None) && !ends_at_enter(false, None));
+
+        // What `Host::enter` asks of the controller: told of the Enter,
+        // then stopped, so the session knows by the time it is at its last
+        // words.
+        let (mut fake, _) = Fake::heard();
+        fake.start(Target::FocusedEnter, None);
+        fake.enter();
+        fake.stop();
+        assert!(fake.entered && fake.is_finishing() && !fake.is_active());
+        // With nothing listening there is nobody to tell.
+        let mut idle = Fake::default();
+        idle.enter();
+        assert!(!idle.entered);
     }
 
     /// Two capture sessions of an API client, "a" and then "b", both

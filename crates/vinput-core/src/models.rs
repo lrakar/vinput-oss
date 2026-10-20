@@ -15,9 +15,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+
+pub use putlab_core::process::hide_console;
+use putlab_core::process::{suffixed, unpack};
 
 use crate::download::{self, Source};
 use crate::settings::local_dir;
@@ -47,6 +49,10 @@ pub enum Runner {
     /// A server of the second engine, for a model that comes as two files:
     /// the one that writes, and this one, which hears.
     Listener(&'static Download),
+    /// A server of the second engine, for a model that only writes: it
+    /// recognizes no speech, and tidies what was recognized
+    /// ([`crate::rewrite`]).
+    Writer,
 }
 
 impl Runner {
@@ -56,8 +62,15 @@ impl Runner {
         match self {
             Self::Server => "whisper-server.exe",
             Self::Command => "parakeet-cli.exe",
-            Self::Listener(_) => "llama-server.exe",
+            Self::Listener(_) | Self::Writer => "llama-server.exe",
         }
+    }
+
+    /// Whether models of this kind run in the second engine, which has one
+    /// build for the processor and for graphics cards of any make.
+    #[must_use]
+    pub fn in_second_engine(self) -> bool {
+        matches!(self, Self::Listener(_) | Self::Writer)
     }
 
     /// The second file of a model that has one.
@@ -246,7 +259,7 @@ pub static CATALOG: [Model; 9] = [
         id: "whisper-large-v3-turbo",
         provider: ProviderKind::Local,
         name: "Whisper large-v3 turbo",
-        summary: "On this PC. 99 languages, best accuracy. Text arrives when you stop.",
+        summary: "On this PC. 99 languages, best accuracy. Text arrives at each pause.",
         detail: "99 languages",
         languages: "",
         local: Some((
@@ -291,6 +304,53 @@ pub static CATALOG: [Model; 9] = [
         )),
     },
 ];
+
+/// A model that writes, as an entry the installer takes.
+const fn writer_of(model: &putlab_core::llm::models::TextModel, summary: &'static str) -> Model {
+    Model {
+        id: model.id,
+        provider: ProviderKind::Local,
+        name: model.name,
+        summary,
+        detail: model.detail,
+        languages: "",
+        local: Some((
+            Download {
+                file: model.file,
+                source: model.source,
+            },
+            Runner::Writer,
+        )),
+    }
+}
+
+/// The models that tidy what was dictated on this PC, in the order
+/// Settings lists them: the ones the programs of the family share
+/// (`putlab_core::llm::models`). They are no part of [`CATALOG`], which is
+/// the models that recognize speech, and are installed like those.
+static WRITERS: [Model; 4] = {
+    const SHARED: [putlab_core::llm::models::TextModel; 4] = putlab_core::llm::models::ALL;
+    [
+        writer_of(&SHARED[0], "The one to start with."),
+        writer_of(&SHARED[1], "Tidies best. Slower."),
+        writer_of(&SHARED[2], "The smallest and quickest."),
+        writer_of(&SHARED[3], "Between the two Gemma models."),
+    ]
+};
+
+/// The models that tidy what was dictated on this PC.
+#[must_use]
+pub fn writers() -> &'static [Model] {
+    &WRITERS
+}
+
+/// The model that writes with this id.
+#[must_use]
+pub fn writer(id: &str) -> Option<&'static Model> {
+    WRITERS
+        .iter()
+        .find(|model| model.id.eq_ignore_ascii_case(id))
+}
 
 /// The engine build for processors, the one for graphics cards of any make,
 /// and the one for NVIDIA cards that earlier versions installed.
@@ -413,7 +473,7 @@ pub fn by_id(id: &str) -> Option<&'static Model> {
 /// version is already here.
 #[must_use]
 pub fn engine(gpu: bool, runner: Runner) -> &'static Download {
-    if runner.second().is_some() {
+    if runner.in_second_engine() {
         &ENGINE_LISTENER
     } else if !gpu {
         &ENGINE_CPU
@@ -436,13 +496,6 @@ fn engine_dir(engine: &Download) -> Option<PathBuf> {
     Some(local_dir()?.join("engines").join(name))
 }
 
-/// `path` with `suffix` added to its last component.
-fn suffixed(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
 /// The path of an engine program, if that engine build is installed.
 #[must_use]
 pub fn engine_program(gpu: bool, runner: Runner) -> Option<PathBuf> {
@@ -457,7 +510,7 @@ pub fn usable_program(gpu: bool, runner: Runner) -> Option<PathBuf> {
     engine_program(gpu, runner).or_else(|| {
         [&ENGINE_CPU, &ENGINE_VULKAN, &ENGINE_CUDA]
             .into_iter()
-            .filter(|_| runner.second().is_none())
+            .filter(|_| !runner.in_second_engine())
             .find_map(|build| program_in(build, runner))
     })
 }
@@ -936,43 +989,6 @@ fn fetch_engine(
     Ok(())
 }
 
-/// Unpacks a zip archive into `dir` with the `tar` that ships with Windows.
-/// The files appear under `dir` only once all of them are unpacked.
-fn unpack(archive: &Path, dir: &Path) -> Result<()> {
-    let failed = |what: &str| Error::Install(format!("unpacking the engine failed: {what}"));
-    let staging = suffixed(dir, ".unpacking");
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|err| failed(&err.to_string()))?;
-    let system = std::env::var_os("SystemRoot").map_or_else(
-        || PathBuf::from("tar.exe"),
-        |root| PathBuf::from(root).join("System32").join("tar.exe"),
-    );
-    let mut command = Command::new(system);
-    command.arg("-xf").arg(archive).arg("-C").arg(&staging);
-    hide_console(&mut command);
-    let output = command.output().map_err(|err| failed(&err.to_string()))?;
-    if !output.status.success() {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(failed(String::from_utf8_lossy(&output.stderr).trim()));
-    }
-    let _ = std::fs::remove_dir_all(dir);
-    std::fs::rename(&staging, dir).map_err(|err| failed(&err.to_string()))
-}
-
-/// Keeps a console program started from the background app from flashing a
-/// console window on screen.
-pub fn hide_console(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        /// `CREATE_NO_WINDOW`.
-        const NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
 /// A size for people: `148 MB`, `1.6 GB`.
 #[must_use]
 #[expect(
@@ -991,6 +1007,8 @@ pub fn human_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     #[test]
@@ -1112,6 +1130,38 @@ mod tests {
         assert!(in_first_engine(ProviderKind::Local, "whisper-base"));
         assert!(!in_first_engine(ProviderKind::Local, ""));
         assert!(!wants_engine(ProviderKind::Local, "qwen3-asr-0.6b"));
+    }
+
+    #[test]
+    fn the_models_that_write_are_installed_like_the_others_and_listed_apart() {
+        assert_eq!(writers().len(), 4);
+        for model in writers() {
+            let Some((file, runner)) = &model.local else {
+                unreachable!("a model that writes runs on this PC");
+            };
+            assert_eq!(*runner, Runner::Writer);
+            assert!(runner.in_second_engine() && runner.second().is_none());
+            assert_eq!(runner.program(), "llama-server.exe");
+            assert_eq!(model.files().count(), 1);
+            assert!(
+                Path::new(file.file)
+                    .extension()
+                    .is_some_and(|ext| ext == "gguf")
+                    && file.source.sha256.len() == 64
+            );
+            // The second engine has one build, whatever the card.
+            assert_eq!(engine(true, *runner), engine(false, *runner));
+            assert_eq!(engine(true, *runner), &ENGINE_LISTENER);
+            // No speech model, and not offered as one.
+            assert!(by_id(model.id).is_none(), "{}", model.id);
+            assert!(find(ProviderKind::Local, model.id).is_none());
+            assert!(!model.summary.is_empty() && !model.is_custom());
+        }
+        assert_eq!(
+            writer("GEMMA-4-E2B").map(|model| model.name),
+            Some("Gemma 4 E2B")
+        );
+        assert!(writer("whisper-base").is_none());
     }
 
     #[test]

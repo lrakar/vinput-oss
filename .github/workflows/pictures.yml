@@ -11,7 +11,9 @@ name: Pictures
 # shows the window over canned data, saves the picture and exits. The scenes
 # are `SCENES` in crates/vinput-ui/src/mock.rs; the list below pairs each
 # window with the scenes that change what it shows. Add a line when a scene
-# or a window is added.
+# or a window is added. A line that starts with `voutput` is a window of
+# Voutput, which `voutput ui` shows the same way, and one that starts with
+# `putlab` a window of the hub.
 on:
   push:
     paths:
@@ -40,12 +42,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # A debug build: it has a console, so each run below is waited for and
       # says on standard error why it failed.
-      - run: cargo build --locked -p vinput
+      - run: cargo build --locked -p vinput -p voutput -p putlab-hub
       - name: Take pictures
         shell: pwsh
         run: |
           $shots = @(
-            "settings settings", "settings first-run", "settings listening", "settings notice",
+            "settings settings", "settings first-run", "settings listening",
+            "shortcuts settings", "shortcuts notice", "shortcuts actions", "shortcuts action-tested",
             "models settings", "models first-run", "models downloading",
             "models pro-subscribed", "models pro-subscribed-elsewhere",
             "models pro-complimentary", "models pro-over-allowance",
@@ -53,6 +56,7 @@ jobs:
             "models pro-used-up-no-model", "models pro-low-no-model",
             "models pro-payment-problem", "models pro-expired", "models pro-offline",
             "models many-models", "settings pro-over-allowance",
+            "settings pro-out-of-reach",
             "models wrong-language", "welcome-local welcome-other-language",
             "settings one-language",
             "pro pro-signed-out", "pro pro-signing-in", "pro pro-not-subscribed",
@@ -80,18 +84,32 @@ jobs:
             "google google-speech-quota", "google google-speech-not-found",
             "google google-speech-no-sign-in", "google google-speech-bad-file",
             "google google-speech-offline", "google google-speech-done",
+            "words settings",
+            "cleanup cleanup", "cleanup cleanup-local", "cleanup cleanup-no-plan",
+            "cleanup settings",
             "advanced settings", "advanced first-run",
             "about settings", "about update",
-            "update update", "update update-downloading"
+            "update update", "update update-downloading",
+            "voutput reading voutput", "voutput reading voutput-first-run",
+            "voutput voices voutput", "voutput voices voutput-first-run",
+            "voutput summaries voutput", "voutput summaries voutput-own-instructions",
+            "voutput summaries voutput-weak-pc",
+            "voutput reader-advanced voutput", "voutput reader-advanced voutput-first-run",
+            "voutput reader-about voutput",
+            "putlab products hub-update", "putlab products hub-signed-out",
+            "putlab account hub-update", "putlab hub-about hub-update"
           )
-          $exe = Resolve-Path target\debug\vinput.exe
           New-Item -ItemType Directory -Force pictures | Out-Null
           $failed = @()
           foreach ($shot in $shots) {
-            $window, $scene = $shot.Split(" ")
+            $words = $shot.Split(" ")
+            $program = if ($words.Count -eq 3) { $words[0] } else { "vinput" }
+            $window, $scene = $words[-2..-1]
+            $exe = Resolve-Path "target\debug\$program.exe"
             # Relative, so no folder name with a space in it can split the argument.
-            $picture = "pictures\$window--$scene.png"
-            $log = "pictures\$window--$scene.txt"
+            $name = if ($program -eq "vinput") { "$window--$scene" } else { "$program-$window--$scene" }
+            $picture = "pictures\$name.png"
+            $log = "pictures\$name.txt"
             $run = Start-Process $exe -ArgumentList "ui", $window, "--mock", $scene, "--picture", $picture `
               -PassThru -NoNewWindow -RedirectStandardError $log
             # Without this the exit code is not there to read afterwards.

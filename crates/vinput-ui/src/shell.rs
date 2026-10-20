@@ -3,10 +3,10 @@
 //! that scrolls and the strip of buttons at the bottom. The result is a
 //! [`Frame`]: a whole window, laid out.
 
-use vinput_view::{Page, RunsOn, Status};
+use vinput_view::{App, Page, RunsOn, Status};
 
 use crate::geometry::{Rect, Size};
-use crate::layout::{Builder, Control, Item, Kind, Measure, Region};
+use crate::layout::{Builder, Control, Item, Kind, Measure, Memory, Pane, Region};
 use crate::node::{Action, ButtonKind, Content, Icon, TextStyle, Tone};
 use crate::pages;
 use crate::theme::metric;
@@ -40,6 +40,9 @@ pub struct Frame {
     pub body: Vec<Item>,
     /// Everything that can be worked, in the order Tab walks it.
     pub controls: Vec<Control>,
+    /// The areas inside the page that scroll by themselves; see
+    /// [`Frame::panes`].
+    panes: Vec<Pane>,
     /// The navigation pane, where Windows shows its wallpaper tint if it can.
     pub pane: Option<Rect>,
     /// What the page lies on.
@@ -56,6 +59,19 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// The areas inside the page that scroll by themselves. A program
+    /// without pages that have such lists has none, which the compiler is
+    /// told here, so that it leaves out what scrolls them; see
+    /// [`crate::node::Pickers`].
+    #[must_use]
+    pub fn panes(&self) -> &[Pane] {
+        if cfg!(feature = "pickers") {
+            &self.panes
+        } else {
+            &[]
+        }
+    }
+
     /// How far the body can be scrolled.
     #[must_use]
     pub fn scroll_range(&self) -> f32 {
@@ -71,6 +87,7 @@ fn runs_on(place: &RunsOn) -> String {
         RunsOn::Processor => "Runs on the processor".to_owned(),
         RunsOn::GraphicsCard(name) => format!("Runs on {name}"),
         RunsOn::Spare(name) => format!("Hours used up, using {name}"),
+        RunsOn::StandIn(name) => format!("Out of reach, using {name}"),
     }
 }
 
@@ -87,7 +104,7 @@ fn pane(builder: &mut Builder<'_>, open: Page, status: &Status, height: f32) {
     );
     builder.line(
         Rect::new(name_x, head.y, 0.0, head.h).left_center(line),
-        "VinPUT",
+        pages::name(open.app()),
         TextStyle::BodyStrong,
         Tone::Primary,
     );
@@ -96,7 +113,7 @@ fn pane(builder: &mut Builder<'_>, open: Page, status: &Status, height: f32) {
     let mut y = metric::NAV_HEAD;
     // An entry is as much taller than a button as it usually is.
     let item = builder.control_height() + metric::NAV_ITEM - metric::CONTROL;
-    for (page, label, icon) in pages::NAVIGATION {
+    for &(page, label, icon) in pages::navigation(open.app()) {
         builder.control(
             Rect::new(margin, y, metric::PANE - 2.0 * margin, item),
             Kind::Nav {
@@ -110,18 +127,69 @@ fn pane(builder: &mut Builder<'_>, open: Page, status: &Status, height: f32) {
         );
         y += item + metric::NAV_GAP;
     }
-    foot(builder, status, height);
+    foot(builder, open.app(), status, height);
+}
+
+/// What the foot of the pane says of a program: its state in a word, with
+/// the color of the dot before it, and where the link under it leads while
+/// there is nothing to name there yet.
+struct Standing {
+    word: &'static str,
+    tone: Tone,
+    choose: (&'static str, Page),
+}
+
+/// How `app` stands, from what its status says. Every program fills the
+/// same record: whether it is at work, and the name of what it works with.
+fn standing(app: App, status: &Status) -> Standing {
+    let chosen = status.model.is_some();
+    match app {
+        App::Vinput => Standing {
+            word: match (chosen, status.listening) {
+                (false, _) => "No speech model yet",
+                (true, true) => "Listening",
+                (true, false) => "Ready",
+            },
+            tone: match (chosen, status.listening) {
+                (false, _) => Tone::Caution,
+                (true, true) => Tone::Critical,
+                (true, false) => Tone::Success,
+            },
+            choose: ("Choose a model", Page::Models),
+        },
+        // The hub is at work for nobody; it says who is signed in.
+        #[cfg(feature = "hub")]
+        App::Hub => Standing {
+            word: if chosen { "Signed in" } else { "Not signed in" },
+            tone: if chosen {
+                Tone::Success
+            } else {
+                Tone::Disabled
+            },
+            choose: ("Sign in", Page::Account),
+        },
+        #[cfg(feature = "voutput")]
+        App::Voutput => Standing {
+            word: match (chosen, status.listening) {
+                (false, _) => "No voice yet",
+                (true, true) => "Reading aloud",
+                (true, false) => "Ready",
+            },
+            tone: match (chosen, status.listening) {
+                (false, _) => Tone::Caution,
+                (true, true) => Tone::Accent,
+                (true, false) => Tone::Success,
+            },
+            choose: ("Choose a voice", Page::Voices),
+        },
+    }
 }
 
 /// The foot of the pane: listening or ready, the model and where it runs.
-fn foot(builder: &mut Builder<'_>, status: &Status, height: f32) {
+fn foot(builder: &mut Builder<'_>, app: App, status: &Status, height: f32) {
     let pad = metric::ROW_PAD;
     let place = runs_on(&status.runs_on);
-    let (word, tone) = match (&status.model, status.listening) {
-        (None, _) => ("No speech model yet", Tone::Caution),
-        (Some(_), true) => ("Listening", Tone::Critical),
-        (Some(_), false) => ("Ready", Tone::Success),
-    };
+    let Standing { word, tone, choose } = standing(app, status);
     let strong = builder.line_height(TextStyle::BodyStrong);
     let small = builder.line_height(TextStyle::Caption);
     let lines = if place.is_empty() { 1.0 } else { 2.0 };
@@ -148,13 +216,13 @@ fn foot(builder: &mut Builder<'_>, status: &Status, height: f32) {
     );
     y += strong + metric::GRID;
     let Some(model) = &status.model else {
-        let label = "Choose a model";
+        let (label, page) = choose;
         let size = builder.text_size(label, TextStyle::Caption, text_w);
         builder.control(
             Rect::new(text_x, y, size.w, small),
             Kind::Link {
                 label: label.to_owned(),
-                action: Action::Go(Page::Models),
+                action: Action::Go(page),
             },
             true,
             None,
@@ -220,10 +288,24 @@ fn title(
     height
 }
 
-/// Lays `content` out as a window of `size` with `chrome` around it.
+/// Lays `content` out as a window of `size` with `chrome` around it, as it
+/// is before the user has opened or typed anything.
 #[must_use]
 pub fn frame(content: Content, chrome: Chrome<'_>, size: Size, measure: &dyn Measure) -> Frame {
-    let mut builder = Builder::new(measure);
+    frame_with(content, chrome, size, measure, &Memory::default())
+}
+
+/// Lays `content` out as a window of `size` with `chrome` around it, with
+/// the rows open and the lists searched that `memory` says.
+#[must_use]
+pub fn frame_with(
+    content: Content,
+    chrome: Chrome<'_>,
+    size: Size,
+    measure: &dyn Measure,
+    memory: &Memory,
+) -> Frame {
+    let mut builder = Builder::new(measure).remembering(memory);
     let compact = matches!(chrome, Chrome::Compact);
     let sheet_x = match chrome {
         Chrome::Settings { page, status } => {
@@ -315,6 +397,7 @@ pub fn frame(content: Content, chrome: Chrome<'_>, size: Size, measure: &dyn Mea
         fixed: laid.fixed,
         body: laid.body,
         controls: laid.controls,
+        panes: laid.panes,
         pane: matches!(chrome, Chrome::Settings { .. })
             .then(|| Rect::new(0.0, 0.0, metric::PANE, size.h)),
         sheet: Rect::new(sheet_x, 0.0, size.w - sheet_x, size.h),

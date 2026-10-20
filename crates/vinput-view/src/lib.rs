@@ -24,6 +24,16 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[cfg(feature = "hub")]
+pub mod hub;
+#[cfg(feature = "voutput")]
+pub mod reader;
+
+#[cfg(feature = "hub")]
+pub use hub::{Catalog, Hub, HubAsk, Product, ProductState};
+#[cfg(feature = "voutput")]
+pub use reader::{Busy, Length, Pick, Place, Reader, ReaderAsk, ReaderChange, ReaderSettings};
+
 /// Sends a plain list of choices over the line as its number, which takes
 /// far less code in the executable than its names would. Both ends of the
 /// line are the same executable, so the numbers never have to mean the same
@@ -51,9 +61,13 @@ macro_rules! sent_as_number {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Page {
-    /// Hotkeys and the everyday switches.
+    /// The microphone, the languages and the everyday switches.
     #[default]
     General,
+    /// Every key of `VinPUT` in one place, each with what belongs to it:
+    /// the search a dictated search opens, where voice memos go, the key
+    /// that edits, and the actions of the user's own.
+    Shortcuts,
     /// The speech model and the downloads.
     Models,
     /// Adding a model of one's own, reached from the Models page.
@@ -63,7 +77,12 @@ pub enum Page {
     Google,
     /// The account and the subscription of `VinPUT` Pro.
     Pro,
-    /// The local API, voice memos and web search.
+    /// The dictionary, the snippets and spoken formatting.
+    Words,
+    /// Tidying a dictation before it is typed, the key that edits the
+    /// selected text, and the model that does both.
+    Cleanup,
+    /// The local API.
     Advanced,
     /// Version, updates and links.
     About,
@@ -75,6 +94,45 @@ pub enum Page {
     WelcomePro,
     /// The models that run on this PC, as a step of the welcome.
     WelcomeLocal,
+    /// The hub: the programs of the family, to install, update and open.
+    #[cfg(feature = "hub")]
+    Products,
+    /// The hub: the one account every program of the family shares.
+    #[cfg(feature = "hub")]
+    Account,
+    /// The hub: its version and links.
+    #[cfg(feature = "hub")]
+    HubAbout,
+    /// Voutput: the keys that read aloud and the everyday switches.
+    #[cfg(feature = "voutput")]
+    Reading,
+    /// Voutput: the voice that speaks, how fast, and as which speaker.
+    #[cfg(feature = "voutput")]
+    Voices,
+    /// Voutput: the model that sums up, how long a summary is and what the
+    /// model is told.
+    #[cfg(feature = "voutput")]
+    Summaries,
+    /// Voutput: the Google API key, the graphics card and the disk.
+    #[cfg(feature = "voutput")]
+    ReaderAdvanced,
+    /// Voutput: its version and links.
+    #[cfg(feature = "voutput")]
+    ReaderAbout,
+}
+
+/// The programs of the family whose pages these are. Each has a window of
+/// its own, with its own name and navigation pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum App {
+    /// Vinput: dictation.
+    Vinput,
+    /// The hub, which installs the others.
+    #[cfg(feature = "hub")]
+    Hub,
+    /// Voutput: reading aloud.
+    #[cfg(feature = "voutput")]
+    Voutput,
 }
 
 impl Page {
@@ -83,6 +141,22 @@ impl Page {
     #[must_use]
     pub fn is_welcome(self) -> bool {
         matches!(self, Self::Welcome | Self::WelcomePro | Self::WelcomeLocal)
+    }
+
+    /// The program this page belongs to.
+    #[must_use]
+    pub fn app(self) -> App {
+        match self {
+            #[cfg(feature = "hub")]
+            Self::Products | Self::Account | Self::HubAbout => App::Hub,
+            #[cfg(feature = "voutput")]
+            Self::Reading
+            | Self::Voices
+            | Self::Summaries
+            | Self::ReaderAdvanced
+            | Self::ReaderAbout => App::Voutput,
+            _ => App::Vinput,
+        }
     }
 }
 
@@ -108,6 +182,9 @@ pub struct View {
     pub settings: Settings,
     /// The audio inputs Windows has, besides its default.
     pub microphones: Vec<Microphone>,
+    /// The languages Windows is set to, as codes such as `sl-SI`, the most
+    /// wanted first: what the list of languages offers before the others.
+    pub system_languages: Vec<String>,
     /// The speech models and what is on this PC.
     pub models: Models,
     /// The search for a model to add.
@@ -125,8 +202,19 @@ pub struct View {
     pub update: Update,
     /// The account of `VinPUT` Pro.
     pub pro: Pro,
+    /// The models that tidy a dictation and edit a selection.
+    pub rewrite: Rewrite,
     /// Something to tell the user about the last thing they asked for.
     pub notice: Option<Notice>,
+    /// Whether the PUTLAB hub, which installs and updates the programs of
+    /// the family, is on this PC.
+    pub hub_installed: bool,
+    /// What the hub shows.
+    #[cfg(feature = "hub")]
+    pub hub: Hub,
+    /// What Voutput shows.
+    #[cfg(feature = "voutput")]
+    pub reader: Reader,
 }
 
 /// What Vinput is doing right now, for the header of every window.
@@ -157,6 +245,9 @@ pub enum RunsOn {
     /// On this PC, with the model of this name, in place of `VinPUT` Pro
     /// while the month's hours are used up.
     Spare(String),
+    /// On this PC, with the model of this name, in place of `VinPUT` Pro
+    /// while its server is out of reach.
+    StandIn(String),
 }
 
 /// The settings a user can change. Hotkeys are text such as `F1` or
@@ -173,6 +264,13 @@ pub struct Settings {
     pub hotkey_search: String,
     /// Key that records a voice memo.
     pub hotkey_memo: String,
+    /// Key that edits the selected text the way it is told to.
+    pub hotkey_command: String,
+    /// What is done with a dictation of [`hotkey`](Self::hotkey) before it
+    /// is typed.
+    pub cleanup: Tidy,
+    /// The same for a dictation of [`hotkey_enter`](Self::hotkey_enter).
+    pub cleanup_enter: Tidy,
     /// Id of the audio input, or empty for the one Windows uses by default.
     pub microphone: String,
     /// Languages to recognize, as the user typed them: `en-US, sl-SI`.
@@ -193,13 +291,95 @@ pub struct Settings {
     pub graphics_card: bool,
     /// Whether other programs may connect to the local API.
     pub api_enabled: bool,
+    /// Whether the programs that are connected are sent what a dictation
+    /// types, as it is typed.
+    pub api_transcript: bool,
     /// Folder for voice memos, or empty for the default.
     pub memo_dir: String,
     /// Whether a saved voice memo is put on the clipboard.
     pub memo_to_clipboard: bool,
     /// The web search a dictated search opens, with `%s` for what was said.
     pub search_url: String,
+    /// Whether spoken formatting is listened for: `new line`, `snake case`.
+    pub spoken_formatting: bool,
+    /// The words of the dictionary, in the order they were added.
+    pub dictionary: Vec<Word>,
+    /// The snippets, in the order they were added.
+    pub snippets: Vec<Snippet>,
+    /// The actions of the user's own, in the order they were added. A
+    /// change to one names it by its place on this list.
+    pub actions: Vec<CustomAction>,
 }
+
+/// A key of the user's own that hands what was said to a program.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomAction {
+    /// What the user calls it.
+    pub name: String,
+    /// The key that starts it, or empty.
+    pub hotkey: String,
+    /// The program to run.
+    pub program: String,
+    /// Its arguments, with `{text}` where what was said goes.
+    pub arguments: String,
+    /// What is done with what the program writes back.
+    pub then: Then,
+    /// What is done with the dictation before it is handed over.
+    pub cleanup: Tidy,
+    /// How long the program may take, in seconds; 0 is no limit.
+    pub timeout: u32,
+}
+
+/// What is done with what the program of an action writes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Then {
+    /// Nothing.
+    #[default]
+    Nothing,
+    /// It is typed where the caret is.
+    Type,
+    /// It is put on the clipboard.
+    Copy,
+}
+
+sent_as_number!(Then: Nothing, Type, Copy);
+
+/// A word of the dictionary.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Word {
+    /// The word as it is to be written.
+    pub word: String,
+    /// What it may sound like, several ways apart by commas, or empty.
+    pub sounds_like: String,
+}
+
+/// A text that a spoken phrase stands for.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Snippet {
+    /// What is said.
+    pub trigger: String,
+    /// What is typed for it.
+    pub text: String,
+}
+
+/// What is done with a dictation before it is typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tidy {
+    /// Nothing: it is typed as it was said.
+    #[default]
+    Plain,
+    /// Filler words, false starts and repeats go, punctuation is put right.
+    Clean,
+    /// It is turned into a prompt for a coding assistant.
+    Prompt,
+    /// It is turned into an email.
+    Email,
+}
+
+sent_as_number!(Tidy: Plain, Clean, Prompt, Email);
 
 /// One setting changed by the user. Each takes effect at once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +394,12 @@ pub enum Change {
     HotkeySearch(String),
     /// See [`Settings::hotkey_memo`].
     HotkeyMemo(String),
+    /// See [`Settings::hotkey_command`].
+    HotkeyCommand(String),
+    /// See [`Settings::cleanup`].
+    Cleanup(Tidy),
+    /// See [`Settings::cleanup_enter`].
+    CleanupEnter(Tidy),
     /// See [`Settings::microphone`].
     Microphone(String),
     /// See [`Settings::languages`].
@@ -235,12 +421,46 @@ pub enum Change {
     GraphicsCard(bool),
     /// See [`Settings::api_enabled`].
     ApiEnabled(bool),
+    /// See [`Settings::api_transcript`].
+    ApiTranscript(bool),
     /// See [`Settings::memo_dir`].
     MemoDir(String),
     /// See [`Settings::memo_to_clipboard`].
     MemoToClipboard(bool),
     /// See [`Settings::search_url`]. Empty goes back to the default search.
     SearchUrl(String),
+    /// See [`Settings::spoken_formatting`].
+    SpokenFormatting(bool),
+    /// Adds a word to the dictionary, with what it sounds like, or changes
+    /// the one that is there. One that cannot be kept is refused with a
+    /// [`Notice`].
+    AddWord(String, String),
+    /// Takes the word written this way out of the dictionary.
+    RemoveWord(String),
+    /// Adds a snippet: what is said and what is typed for it. One that is
+    /// said the same way already has its text changed.
+    AddSnippet(String, String),
+    /// Takes the snippet said this way away.
+    RemoveSnippet(String),
+    /// Adds an action of the user's own, set up as an example to change.
+    AddAction,
+    /// Takes the action at this place on [`Settings::actions`] away.
+    RemoveAction(usize),
+    /// Renames the action at this place.
+    ActionName(usize, String),
+    /// Sets the key of the action at this place; empty takes it away.
+    ActionHotkey(usize, String),
+    /// Sets the program of the action at this place.
+    ActionProgram(usize, String),
+    /// Sets the arguments of the action at this place.
+    ActionArguments(usize, String),
+    /// Sets what is done with what the program writes back.
+    ActionThen(usize, Then),
+    /// Sets what is done with the dictation before it is handed over.
+    ActionCleanup(usize, Tidy),
+    /// Sets how long the program may take, in seconds; 0 is no limit. A
+    /// time that is not on offer is left unmade.
+    ActionTimeout(usize, u32),
 }
 
 /// An audio input.
@@ -657,6 +877,51 @@ pub enum Download {
     },
 }
 
+/// The models that tidy a dictation and edit a selection, and where the one
+/// in use stands.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rewrite {
+    /// Whether the model that comes with the subscription is the one in
+    /// use, and not one on this PC.
+    pub with_pro: bool,
+    /// The models that run on this PC, in the order to list them.
+    pub models: Vec<Model>,
+    /// Where the engine of the model on this PC that is in use stands.
+    pub standing: Standing,
+}
+
+/// Where the engine that runs a model that writes stands.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Standing {
+    /// Not running: nothing has asked for it, or not for a while.
+    #[default]
+    Idle,
+    /// Being made ready.
+    Loading {
+        /// Whether it is to run on the graphics card.
+        card: bool,
+        /// How many hundredths of the model are read in; `None` once it
+        /// is, while the graphics card is made ready for it, which is slow
+        /// only the first time on a PC.
+        read: Option<u8>,
+    },
+    /// Loaded, and answers at once.
+    Ready {
+        /// Whether it runs on the graphics card.
+        card: bool,
+        /// Whether it was to run on the graphics card and the card could
+        /// not run it, so the processor does.
+        fell_back: bool,
+    },
+    /// It could not be started.
+    Failed {
+        /// Why, in words for the user.
+        reason: String,
+    },
+}
+
 /// The id of the model that is `VinPUT` Pro, in [`Models::list`].
 pub const PRO_MODEL: &str = "vinput-pro";
 
@@ -913,6 +1178,9 @@ pub enum Command {
     CapturingHotkey(bool),
     /// Dictate with this model from now on.
     UseModel(String),
+    /// Tidy and edit with this model of [`Rewrite::models`] from now on, or
+    /// with the one that comes with the subscription if this is empty.
+    UseTextModel(String),
     /// Download this model.
     InstallModel(String),
     /// Stop downloading this model.
@@ -944,8 +1212,14 @@ pub enum Command {
     InstallUpdate,
     /// Stop the download of the release.
     CancelUpdate,
+    /// Open the PUTLAB hub, or the page it is downloaded from if it is not
+    /// on this PC.
+    OpenHub,
     /// The user has read the [`Notice`]; stop showing it.
     DismissNotice,
+    /// Run the action at this place on [`Settings::actions`] with a text
+    /// made up for the purpose, and say how it went in a [`Notice`].
+    TestAction(usize),
     /// Open a web page in the browser. Only `https://` addresses are opened.
     OpenLink(String),
     /// Start signing in to `VinPUT` Pro: the browser opens for it.
@@ -968,6 +1242,12 @@ pub enum Command {
     WelcomeDone,
     /// The window was closed.
     Closed,
+    /// Something asked of the hub.
+    #[cfg(feature = "hub")]
+    Hub(HubAsk),
+    /// Something asked of Voutput.
+    #[cfg(feature = "voutput")]
+    Reader(ReaderAsk),
 }
 
 impl Event {
@@ -1039,6 +1319,16 @@ mod tests {
                 }],
                 ..Models::default()
             },
+            settings: Settings {
+                actions: vec![CustomAction {
+                    name: "Notes".to_owned(),
+                    hotkey: "Ctrl+Alt+N".to_owned(),
+                    then: Then::Type,
+                    timeout: 30,
+                    ..CustomAction::default()
+                }],
+                ..Settings::default()
+            },
             ..View::default()
         };
         for event in [
@@ -1055,6 +1345,10 @@ mod tests {
             Command::Ready,
             Command::Set(Change::Hotkey("Ctrl+Shift+Space".to_owned())),
             Command::Set(Change::Autostart(false)),
+            Command::Set(Change::Cleanup(Tidy::Prompt)),
+            Command::Set(Change::HotkeyCommand("F8".to_owned())),
+            Command::UseTextModel("gemma-4-e2b".to_owned()),
+            Command::UseTextModel(String::new()),
             Command::AddModel(2),
             Command::ProSubscribe(ProTier::Plus, ProPlan::Yearly),
             Command::Google(Setup::Open(GoogleService::Speech)),
@@ -1066,6 +1360,12 @@ mod tests {
             Command::ProSignIn,
             Command::ProShown,
             Command::WelcomeDone,
+            Command::Set(Change::AddAction),
+            Command::Set(Change::ActionArguments(1, "-c {text}".to_owned())),
+            Command::Set(Change::ActionThen(0, Then::Copy)),
+            Command::Set(Change::ActionCleanup(2, Tidy::Clean)),
+            Command::Set(Change::RemoveAction(3)),
+            Command::TestAction(1),
             Command::Closed,
         ] {
             let line = command.to_line();
@@ -1163,6 +1463,37 @@ mod tests {
                 (ProTier::Pro, 500, 4900, 90_000)
             ]
         );
+    }
+
+    #[test]
+    fn where_the_text_model_stands_and_the_ways_to_tidy_survive_the_wire() {
+        for standing in [
+            Standing::Idle,
+            Standing::Loading {
+                card: true,
+                read: Some(40),
+            },
+            Standing::Ready {
+                card: true,
+                fell_back: false,
+            },
+            Standing::Failed {
+                reason: "No memory.".to_owned(),
+            },
+        ] {
+            let rewrite = Rewrite {
+                with_pro: false,
+                standing,
+                ..Rewrite::default()
+            };
+            let line = serde_json::to_string(&rewrite).unwrap_or_default();
+            assert_eq!(serde_json::from_str::<Rewrite>(&line).ok(), Some(rewrite));
+        }
+        for tidy in [Tidy::Plain, Tidy::Clean, Tidy::Prompt, Tidy::Email] {
+            let line = serde_json::to_string(&tidy).unwrap_or_default();
+            assert_eq!(line.len(), 1, "{line}");
+            assert_eq!(serde_json::from_str::<Tidy>(&line).ok(), Some(tidy));
+        }
     }
 
     #[test]

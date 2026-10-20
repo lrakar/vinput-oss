@@ -7,8 +7,8 @@ use vinput_view::{Command, Page};
 
 use crate::node::{
     Action, Content, Icon, Node, Severity, TextStyle, Tone, accent_button, badge, bullets, button,
-    card, choice, column, field, header, hotkey, icon_button, info_bar, link, mono, note, row,
-    setting, styled, text, toggle,
+    card, choice, column, field, header, hotkey, icon_button, info_bar, link, mono, note,
+    plain_setting, row, setting, styled, text, toggle,
 };
 
 /// The name of the scene that shows the gallery.
@@ -266,6 +266,77 @@ fn icons() -> Node {
     card([line(first), line(second)])
 }
 
+/// Rows that open, with what they hold: chips, a list that scrolls by
+/// itself, and one that is searched.
+#[cfg(feature = "pickers")]
+fn openers() -> Node {
+    use crate::node::{Pickers, Search, chip, expander, flow, scroll};
+    use crate::theme::metric;
+
+    let numbered = |count: u8| {
+        (1..=count).map(|number| {
+            plain_setting(format!("Row {number} of a list that scrolls by itself"))
+                .compact()
+                .into()
+        })
+    };
+    let found = [
+        "Deutsch",
+        "English",
+        "Fran\u{e7}ais",
+        "Sloven\u{161}\u{10d}ina",
+    ];
+    card([
+        expander(
+            "gallery-closed",
+            Icon::Model,
+            "A row that opens",
+            [note("What it shows while it is open.")],
+        )
+        .value("What is chosen")
+        .into(),
+        expander(
+            "gallery-list",
+            Icon::Storage,
+            "An open row with a list",
+            [
+                header("A heading inside the card"),
+                scroll("gallery-scroll", 3.0 * metric::ROW_COMPACT, numbered(8)),
+            ],
+        )
+        .value("Row 1")
+        .open(true)
+        .into(),
+        expander(
+            "gallery-search",
+            Icon::Globe,
+            "An open row with chips and a search",
+            [
+                flow([
+                    chip("English", Some(nothing())),
+                    chip("Sloven\u{161}\u{10d}ina", Some(nothing())),
+                    chip("Cannot be removed", None),
+                ]),
+                Search {
+                    key: "gallery-find",
+                    placeholder: "Search".to_owned(),
+                    max: 2.0 * metric::ROW_COMPACT,
+                    rows: found
+                        .iter()
+                        .map(|name| ((*name).to_owned(), plain_setting(*name).compact().into()))
+                        .collect(),
+                    none: "Nothing found".to_owned(),
+                    pickers: Pickers,
+                }
+                .into(),
+            ],
+        )
+        .value("English, Sloven\u{161}\u{10d}ina")
+        .open(true)
+        .into(),
+    ])
+}
+
 /// The page.
 #[must_use]
 pub fn content() -> Content {
@@ -276,6 +347,8 @@ pub fn content() -> Content {
     body.push(note("A note between a heading and its card."));
     body.push(rows());
     body.push(more_rows());
+    #[cfg(feature = "pickers")]
+    body.extend([header("Rows that open"), openers()]);
     body.push(header("Text"));
     body.push(words());
     body.push(header("Icons"));
@@ -293,11 +366,11 @@ pub fn content() -> Content {
     });
     body.push(Node::Busy("Something is being waited for.".to_owned()));
     body.push(card([
-        crate::node::plain_setting("A step of an instruction")
+        plain_setting("A step of an instruction")
             .numbered(1)
             .detail("Its number stands where an icon would")
             .into(),
-        crate::node::plain_setting("A row without an icon that lines up with those that have one")
+        plain_setting("A row without an icon that lines up with those that have one")
             .indented()
             .into(),
     ]));
@@ -322,19 +395,39 @@ pub fn content() -> Content {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "pickers")]
     #[test]
     fn the_gallery_has_every_kind_of_node() {
-        fn mark(node: &Node, seen: &mut [bool; 18]) {
+        fn mark(node: &Node, seen: &mut [bool; 23]) {
             let slot = match node {
-                Node::Column(children) | Node::Row(children) | Node::Card(children) => {
+                Node::Column(children)
+                | Node::Row(children)
+                | Node::Card(children)
+                | Node::Flow(children, _)
+                | Node::Scroll { children, .. } => {
                     for child in children {
                         mark(child, seen);
                     }
                     match node {
                         Node::Column(_) => 0,
                         Node::Row(_) => 1,
+                        Node::Flow(..) => 18,
+                        Node::Scroll { .. } => 19,
                         _ => 2,
                     }
+                }
+                Node::Expander(expander) => {
+                    for child in &expander.children {
+                        mark(child, seen);
+                    }
+                    20
+                }
+                Node::Chip { .. } => 21,
+                Node::Search(search) => {
+                    for (_, row) in &search.rows {
+                        mark(row, seen);
+                    }
+                    22
                 }
                 Node::Spring => 3,
                 Node::Header(_) => 4,
@@ -364,10 +457,10 @@ mod tests {
             };
             seen[slot] = true;
         }
-        let mut seen = [false; 18];
+        let mut seen = [false; 23];
         for node in &content().body {
             mark(node, &mut seen);
         }
-        assert_eq!(seen, [true; 18]);
+        assert_eq!(seen, [true; 23]);
     }
 }

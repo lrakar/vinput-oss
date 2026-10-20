@@ -36,7 +36,7 @@ fn the_settings_window_has_a_pane_a_title_and_a_body_that_scrolls() {
     assert!((frame.sheet.x - metric::PANE).abs() < 0.01);
     assert!(frame.scroll_range() > 0.0);
     assert!((frame.viewport.bottom() - 660.0).abs() < 0.01);
-    // Four places to go, then the way back; a page reached from Models
+    // Eight places to go, then the way back; a page reached from Models
     // shows Models as the open one.
     let selected: Vec<bool> = frame
         .controls
@@ -46,9 +46,12 @@ fn the_settings_window_has_a_pane_a_title_and_a_body_that_scrolls() {
             _ => None,
         })
         .collect();
-    assert_eq!(selected, [false, true, false, false, false]);
-    assert_eq!(frame.controls[5].name(), "Back");
-    assert!(frame.controls[5].rect.right() <= metric::PANE + metric::PAGE_PAD + metric::CONTROL);
+    assert_eq!(
+        selected,
+        [false, false, true, false, false, false, false, false]
+    );
+    assert_eq!(frame.controls[8].name(), "Back");
+    assert!(frame.controls[8].rect.right() <= metric::PANE + metric::PAGE_PAD + metric::CONTROL);
     let says = |part: &str| {
         frame
             .fixed
@@ -258,6 +261,22 @@ fn the_welcome_has_the_window_to_itself() {
                 assert!((middle - laid.size.w / 2.0).abs() <= 1.0);
             }
         }
-        assert_eq!(cards, 1);
+        // Each row of the group is a tile of its own.
+        assert_eq!(cards, 2);
     }
+}
+
+#[test]
+fn where_the_model_runs_is_said_in_a_few_words() {
+    let spare = || "Whisper base".to_owned();
+    assert_eq!(runs_on(&RunsOn::Nowhere), "");
+    assert_eq!(runs_on(&RunsOn::Online), "Runs online");
+    assert_eq!(
+        runs_on(&RunsOn::Spare(spare())),
+        "Hours used up, using Whisper base"
+    );
+    assert_eq!(
+        runs_on(&RunsOn::StandIn(spare())),
+        "Out of reach, using Whisper base"
+    );
 }

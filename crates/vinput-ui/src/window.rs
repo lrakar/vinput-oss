@@ -372,7 +372,13 @@ impl Host {
                         fill: self.theme.palette.field_active,
                         bleed: px(metric::EDIT_BLEED, self.scale),
                     };
-                    self.edit = Edit::create(self.hwnd, &editing.text, editing.secret, &style);
+                    self.edit = Edit::create(
+                        self.hwnd,
+                        &editing.text,
+                        editing.secret,
+                        editing.lines,
+                        &style,
+                    );
                     self.place_edit();
                     if let Some(edit) = &self.edit {
                         edit.select(editing.select_all);

@@ -18,11 +18,13 @@ mod winhttp;
 use std::time::Duration;
 
 /// What every request says it is.
-const USER_AGENT: &str = concat!("vinput/", env!("CARGO_PKG_VERSION"));
+fn user_agent() -> &'static str {
+    crate::product::current().agent
+}
 
 /// A request to make.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Request<'a> {
+pub struct Request<'a> {
     /// The address, `https://` or `http://` on this computer.
     pub url: &'a str,
     /// A form to post. Without one, and without [`json`](Self::json), the
@@ -42,7 +44,8 @@ pub(crate) struct Request<'a> {
 
 impl<'a> Request<'a> {
     /// A `GET` of `url` in which every step may take `timeout`.
-    pub(crate) fn get(url: &'a str, timeout: Duration) -> Self {
+    #[must_use]
+    pub fn get(url: &'a str, timeout: Duration) -> Self {
         Self {
             url,
             form: None,
@@ -59,7 +62,7 @@ impl<'a> Request<'a> {
     /// # Errors
     ///
     /// Returns why no answer arrived, in words for the log or the user.
-    pub(crate) fn send(&self) -> Result<Response, String> {
+    pub fn send(&self) -> Result<Response, String> {
         let target = Target::parse(self.url)?;
         #[cfg(windows)]
         {
@@ -75,14 +78,15 @@ impl<'a> Request<'a> {
 
 /// The answer to a [`Request`]: its status, then its body as it arrives.
 #[derive(Debug)]
-pub(crate) struct Response(
+pub struct Response(
     #[cfg(windows)] winhttp::Response,
     #[cfg(not(windows))] std::convert::Infallible,
 );
 
 impl Response {
     /// The HTTP status of the answer, such as 200.
-    pub(crate) fn status(&self) -> u16 {
+    #[must_use]
+    pub fn status(&self) -> u16 {
         #[cfg(windows)]
         {
             self.0.status()
@@ -99,7 +103,7 @@ impl Response {
     /// # Errors
     ///
     /// Returns why the body stopped arriving.
-    pub(crate) fn read(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
+    pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
         #[cfg(windows)]
         {
             self.0.read(buffer)
@@ -118,7 +122,7 @@ impl Response {
     ///
     /// Returns why the body could not be read to its end, which includes it
     /// being larger than `limit`.
-    pub(crate) fn body(&mut self, limit: usize, deadline: Duration) -> Result<Vec<u8>, String> {
+    pub fn body(&mut self, limit: usize, deadline: Duration) -> Result<Vec<u8>, String> {
         let started = std::time::Instant::now();
         let mut body = Vec::new();
         let mut buffer = [0u8; 8192];
@@ -144,7 +148,7 @@ impl Response {
 /// # Errors
 ///
 /// Returns what went wrong, in words, if no answer arrived within `timeout`.
-pub(crate) fn post_form(
+pub fn post_form(
     url: &str,
     form: &str,
     timeout: Duration,
@@ -164,7 +168,7 @@ pub(crate) fn post_form(
 
 /// Where a request goes, taken apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Target {
+pub struct Target {
     /// Whether the connection is encrypted.
     pub secure: bool,
     /// The server's name.
@@ -182,7 +186,7 @@ impl Target {
     /// # Errors
     ///
     /// Returns what is wrong with the address.
-    pub(crate) fn parse(url: &str) -> Result<Self, String> {
+    pub fn parse(url: &str) -> Result<Self, String> {
         let refused = |why: &str| format!("{url} {why}");
         let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
             (true, rest)
@@ -365,7 +369,7 @@ mod tests {
         );
         assert!(asked.contains("\r\nRange: bytes=10-\r\n"), "{asked}");
         assert!(
-            asked.contains(&format!("\r\nUser-Agent: {USER_AGENT}\r\n")),
+            asked.contains(&format!("\r\nUser-Agent: {}\r\n", user_agent())),
             "{asked}"
         );
         Ok(())

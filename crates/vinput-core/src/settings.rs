@@ -7,8 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
+pub use putlab_core::folders::{data_dir, local_dir};
+
+use crate::actions::{self, Action};
 use crate::keys::Hotkey;
+use crate::rewrite::Mode;
 use crate::stt::{GoogleConfig, ProviderKind};
+use crate::words::Words;
 use crate::{Error, Result, search};
 
 /// The Google Cloud Speech-to-Text location the setup in Settings starts
@@ -43,6 +48,17 @@ pub struct Settings {
     pub hotkey_search: Option<Hotkey>,
     /// Key that records a voice memo, if set.
     pub hotkey_memo: Option<Hotkey>,
+    /// Key that edits the selected text the way it is told to, if set.
+    pub hotkey_command: Option<Hotkey>,
+    /// What is done with a dictation of [`hotkey`](Self::hotkey) before it
+    /// is typed.
+    pub cleanup: Mode,
+    /// The same for a dictation of [`hotkey_enter`](Self::hotkey_enter).
+    pub cleanup_enter: Mode,
+    /// The model that tidies and edits: empty for the one that comes with
+    /// `VinPUT` Plus and Pro, or the id of one on this PC
+    /// ([`crate::models::writers`]).
+    pub text_model: String,
     /// BCP-47 language codes to recognize.
     pub languages: Vec<String>,
     /// Whether Vinput starts when the user signs in to Windows.
@@ -75,6 +91,10 @@ pub struct Settings {
     pub local_gpu: bool,
     /// Whether other programs may connect to the local API.
     pub api_enabled: bool,
+    /// Whether programs connected to the local API are sent the text of
+    /// dictations that are typed, as it is typed. Off until the user
+    /// switches it on: what is dictated is nobody else's business.
+    pub api_transcript: bool,
     /// Folder for voice memos. Empty means the default, see [`crate::memo`].
     pub memo_dir: String,
     /// Whether a saved voice memo is put on the clipboard, ready to paste.
@@ -93,6 +113,12 @@ pub struct Settings {
     /// it does, and cleared once they have chosen a model or said later.
     /// A file that does not say has it off, so an update never shows it.
     pub first_run: bool,
+    /// The dictionary, the snippets, and whether spoken formatting is
+    /// listened for; see [`crate::words`].
+    pub words: Words,
+    /// The actions of the user's own, in the order they were added: keys
+    /// that hand what was said to a program; see [`crate::actions`].
+    pub actions: Vec<Action>,
     /// Lines with keys this version does not know, kept so that saving does
     /// not throw away what another version or program wrote.
     pub extra: Vec<(String, String)>,
@@ -105,6 +131,10 @@ impl Default for Settings {
             hotkey_enter: Some(Hotkey::plain(VK_F2)),
             hotkey_search: None,
             hotkey_memo: None,
+            hotkey_command: None,
+            cleanup: Mode::Plain,
+            cleanup_enter: Mode::Plain,
+            text_model: String::new(),
             languages: vec!["en-US".to_owned()],
             autostart: true,
             ready_sound: true,
@@ -118,12 +148,15 @@ impl Default for Settings {
             location: String::new(),
             local_gpu: true,
             api_enabled: true,
+            api_transcript: false,
             memo_dir: String::new(),
             memo_to_clipboard: true,
             check_updates: true,
             search_url: search::DEFAULT_TEMPLATE.to_owned(),
             last_local_model: String::new(),
             first_run: false,
+            words: Words::default(),
+            actions: Vec::new(),
             extra: Vec::new(),
         }
     }
@@ -169,6 +202,12 @@ impl Settings {
                 "hotkey_enter" => set_optional_hotkey(&mut settings.hotkey_enter, value),
                 "hotkey_search" => set_optional_hotkey(&mut settings.hotkey_search, value),
                 "hotkey_memo" => set_optional_hotkey(&mut settings.hotkey_memo, value),
+                "hotkey_command" => set_optional_hotkey(&mut settings.hotkey_command, value),
+                // A word this version does not know leaves the dictation
+                // as it is said, which is what every version can do.
+                "cleanup" => settings.cleanup = value.parse().unwrap_or_default(),
+                "cleanup_enter" => settings.cleanup_enter = value.parse().unwrap_or_default(),
+                "text_model" => value.clone_into(&mut settings.text_model),
                 "languages" => {
                     let languages = parse_languages(value);
                     if !languages.is_empty() {
@@ -212,6 +251,7 @@ impl Settings {
                 // for NVIDIA cards, off unless asked for; it is not carried on.
                 "local_gpu" => {}
                 "api_enabled" => settings.api_enabled = flag(),
+                "api_transcript" => settings.api_transcript = flag(),
                 "memo_dir" => value.clone_into(&mut settings.memo_dir),
                 "memo_to_clipboard" => settings.memo_to_clipboard = flag(),
                 "check_updates" => settings.check_updates = flag(),
@@ -222,6 +262,10 @@ impl Settings {
                 }
                 "last_local_model" => value.clone_into(&mut settings.last_local_model),
                 "first_run" => settings.first_run = flag(),
+                "action" if settings.actions.len() < actions::MAX_ACTIONS => {
+                    settings.actions.extend(Action::parse(value));
+                }
+                _ if settings.words.read(key, value) => {}
                 _ => settings.extra.push((key.to_owned(), value.to_owned())),
             }
         }
@@ -254,7 +298,12 @@ impl Settings {
              last_local_model = {}\n\
              stop_sound = {}\n\
              stop_after_silence = {}\n\
-             live_typing = {}\n",
+             live_typing = {}\n\
+             hotkey_command = {}\n\
+             cleanup = {}\n\
+             cleanup_enter = {}\n\
+             text_model = {}\n\
+             api_transcript = {}\n",
             self.hotkey,
             optional_hotkey(self.hotkey_enter),
             optional_hotkey(self.hotkey_memo),
@@ -277,7 +326,18 @@ impl Settings {
             self.stop_sound,
             self.stop_after_minutes,
             self.live_typing,
+            optional_hotkey(self.hotkey_command),
+            self.cleanup,
+            self.cleanup_enter,
+            self.text_model,
+            self.api_transcript,
         );
+        self.words.write(&mut text);
+        for action in &self.actions {
+            text.push_str("action = ");
+            text.push_str(&action.line());
+            text.push('\n');
+        }
         // Written only while it is on: the file of someone who was never
         // owed a welcome, or has had it, says nothing of it.
         if self.first_run {
@@ -303,22 +363,37 @@ impl Settings {
 
     /// Loads the settings file, or defaults if it cannot be read. Without a
     /// file this is the first start after a new install, and the settings
-    /// say so ([`Settings::first_run`]).
+    /// say so ([`Settings::first_run`]); such a start is set to the
+    /// languages Windows is set to.
     #[must_use]
     pub fn load() -> Self {
-        Self::path().map_or_else(Self::default, |path| Self::load_from(&path))
+        // A test must not depend on the PC it runs on.
+        let windows: &[String] = if crate::instance::name() == Some(crate::instance::TESTS) {
+            &[]
+        } else {
+            crate::languages::preferred()
+        };
+        Self::path().map_or_else(Self::default, |path| Self::load_from(&path, windows))
     }
 
-    /// The settings in the file at `path`, as [`load`](Self::load) reads them.
-    fn load_from(path: &Path) -> Self {
+    /// The settings in the file at `path`, as [`load`](Self::load) reads
+    /// them on a PC whose Windows is set to the languages `windows`.
+    fn load_from(path: &Path, windows: &[String]) -> Self {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse(&text),
             // Only a file that is not there says "new here". One that is
             // there and cannot be read belongs to someone who has settings.
-            Err(err) => Self {
-                first_run: err.kind() == std::io::ErrorKind::NotFound,
-                ..Self::default()
-            },
+            Err(err) => {
+                let mut settings = Self {
+                    first_run: err.kind() == std::io::ErrorKind::NotFound,
+                    ..Self::default()
+                };
+                let spoken = spoken_here(windows);
+                if settings.first_run && !spoken.is_empty() {
+                    settings.languages = spoken;
+                }
+                settings
+            }
         }
     }
 
@@ -451,6 +526,37 @@ fn optional_hotkey(hotkey: Option<Hotkey>) -> String {
     hotkey.map(|hotkey| hotkey.to_string()).unwrap_or_default()
 }
 
+/// The most languages a new install is set to by itself.
+const LANGUAGES_AT_FIRST: usize = 3;
+
+/// The languages a new install dictates in, drawn from those Windows is set
+/// to: the ones that name a language and a country, such as `sl-SI`, one
+/// for each language, the most wanted first. Whoever speaks others names
+/// them in Settings.
+fn spoken_here(windows: &[String]) -> Vec<String> {
+    let letters = |part: &str, least: usize, most: usize| {
+        (least..=most).contains(&part.len()) && part.chars().all(|c| c.is_ascii_alphabetic())
+    };
+    let mut spoken: Vec<String> = Vec::new();
+    for code in windows {
+        let Some((language, country)) = code.trim().split_once('-') else {
+            continue;
+        };
+        if !letters(language, 2, 3) || !letters(country, 2, 2) {
+            continue;
+        }
+        let language = language.to_ascii_lowercase();
+        let known = |code: &String| code.split('-').next() == Some(language.as_str());
+        if !spoken.iter().any(known) {
+            spoken.push(format!("{language}-{}", country.to_ascii_uppercase()));
+        }
+        if spoken.len() == LANGUAGES_AT_FIRST {
+            break;
+        }
+    }
+    spoken
+}
+
 /// Splits a comma-separated list of language codes, dropping blanks.
 #[must_use]
 pub fn parse_languages(list: &str) -> Vec<String> {
@@ -459,19 +565,6 @@ pub fn parse_languages(list: &str) -> Vec<String> {
         .filter(|code| !code.is_empty())
         .map(str::to_owned)
         .collect()
-}
-
-/// Folder for Vinput's settings and log: `%APPDATA%\Vinput`.
-#[must_use]
-pub fn data_dir() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join(crate::instance::named("Vinput")))
-}
-
-/// Folder for what Vinput downloads, such as speech models:
-/// `%LOCALAPPDATA%\Vinput`. It can be large and does not roam.
-#[must_use]
-pub fn local_dir() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(crate::instance::named("Vinput")))
 }
 
 #[cfg(test)]
@@ -500,6 +593,12 @@ mod tests {
 
     #[test]
     fn custom_values_survive_a_round_trip() {
+        let mut words = Words {
+            commands: false,
+            ..Words::default()
+        };
+        assert_eq!(words.add_word("VinPUT", "vin put"), Ok(true));
+        assert_eq!(words.add_snippet("my email", "a = b | c"), Ok(true));
         let settings = Settings {
             hotkey: Hotkey {
                 ctrl: true,
@@ -508,6 +607,10 @@ mod tests {
             hotkey_enter: None,
             hotkey_search: Some(Hotkey::plain(0x79)),
             hotkey_memo: Some(Hotkey::plain(0x78)),
+            hotkey_command: Some(Hotkey::plain(0x77)),
+            cleanup: Mode::Clean,
+            cleanup_enter: Mode::Prompt,
+            text_model: "gemma-4-e2b".into(),
             languages: vec!["sl-SI".into(), "en-US".into()],
             autostart: false,
             ready_sound: false,
@@ -521,15 +624,38 @@ mod tests {
             location: "us".into(),
             local_gpu: true,
             api_enabled: false,
+            api_transcript: true,
             memo_dir: r"D:\Memos".into(),
             memo_to_clipboard: false,
             check_updates: false,
             search_url: "https://duckduckgo.com/?q=%s".into(),
             last_local_model: "whisper-base".into(),
             first_run: true,
+            words,
+            actions: vec![
+                Action::default(),
+                Action {
+                    name: "Translate".into(),
+                    hotkey: Some(Hotkey::plain(0x76)),
+                    program: r"C:\Tools\translate.exe".into(),
+                    arguments: "--to en {text}".into(),
+                    then: actions::Then::Type,
+                    cleanup: Mode::Clean,
+                    timeout: 0,
+                },
+            ],
             extra: vec![("future_key".into(), "kept".into())],
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
+    }
+
+    #[test]
+    fn no_more_actions_are_read_than_there_can_be() {
+        let line = format!("action = {}\n", Action::default().line());
+        let settings = Settings::parse(&line.repeat(actions::MAX_ACTIONS + 3));
+        assert_eq!(settings.actions.len(), actions::MAX_ACTIONS);
+        // One that names no program is left out.
+        assert!(Settings::parse("action = Broken | F9\n").actions.is_empty());
     }
 
     #[test]
@@ -554,13 +680,35 @@ mod tests {
         // Settings added since then take their defaults.
         assert!(settings.api_enabled && settings.memo_to_clipboard);
         assert!(settings.live_typing);
+        assert_eq!(settings.words, Words::default());
         assert_eq!(settings.hotkey_search, None);
+        assert_eq!(settings.hotkey_command, None);
+        assert_eq!(
+            (settings.cleanup, settings.cleanup_enter),
+            (Mode::Plain, Mode::Plain)
+        );
+        assert!(settings.text_model.is_empty());
         assert_eq!(settings.search_url, search::DEFAULT_TEMPLATE);
         assert!(settings.microphone.is_empty(), "the default microphone");
         // What this version does not know is written back untouched.
         let saved = settings.serialize();
         assert!(saved.contains("hotkey_extra = F3\n") && saved.contains("extra_link = \n"));
         assert_eq!(Settings::parse(&saved), settings);
+    }
+
+    #[test]
+    fn a_dictation_is_typed_as_said_unless_a_way_to_tidy_it_is_named() {
+        let settings = Settings::parse("cleanup = email\ncleanup_enter = PROMPT\n");
+        assert_eq!(settings.cleanup, Mode::Email);
+        assert_eq!(settings.cleanup_enter, Mode::Prompt);
+        // A way a later version may add is not one this version has.
+        let later = Settings::parse("cleanup = poem\ncleanup_enter = \n");
+        assert_eq!(
+            (later.cleanup, later.cleanup_enter),
+            (Mode::Plain, Mode::Plain)
+        );
+        let saved = Settings::default().serialize();
+        assert!(saved.contains("cleanup = plain\n") && saved.contains("text_model = \n"));
     }
 
     #[test]
@@ -662,10 +810,11 @@ mod tests {
 
         // A new install: no file, so the welcome is owed, and the file
         // that is then written keeps saying so until it is over.
-        let fresh = Settings::load_from(&path);
+        let fresh = Settings::load_from(&path, &[]);
         assert!(fresh.first_run && fresh.owes_welcome());
+        assert_eq!(fresh.languages, ["en-US"]);
         assert!(fresh.save_to(&path).is_ok());
-        assert!(Settings::load_from(&path).owes_welcome());
+        assert!(Settings::load_from(&path, &[]).owes_welcome());
 
         // Once a model is chosen nothing is owed, whatever the file says.
         let mut chosen = fresh.clone();
@@ -685,7 +834,7 @@ model =
             "",
         ] {
             assert!(std::fs::write(&path, old).is_ok());
-            let settings = Settings::load_from(&path);
+            let settings = Settings::load_from(&path, &[]);
             assert!(!settings.first_run && !settings.owes_welcome(), "{old:?}");
             // And saving such a file does not start to say anything of it.
             assert!(!settings.serialize().contains("first_run"));
@@ -695,9 +844,46 @@ model =
         let mut done = fresh;
         done.first_run = false;
         assert!(done.save_to(&path).is_ok());
-        assert!(!Settings::load_from(&path).first_run);
+        assert!(!Settings::load_from(&path, &[]).first_run);
         assert!(std::fs::read_to_string(&path).is_ok_and(|text| !text.contains("first_run")));
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn a_new_install_is_set_to_the_languages_of_windows() {
+        let windows = |codes: &[&str]| -> Vec<String> {
+            codes.iter().map(|code| (*code).to_owned()).collect()
+        };
+        let folder = std::env::temp_dir().join(format!("vinput-spoken-{}", std::process::id()));
+        let path = folder.join("settings.ini");
+        let _ = std::fs::remove_dir_all(&folder);
+        let fresh = Settings::load_from(&path, &windows(&["sl-SI", "en-US"]));
+        assert!(fresh.first_run);
+        assert_eq!(fresh.languages, ["sl-SI", "en-US"]);
+        // Someone who has settings keeps theirs, whatever Windows says.
+        assert!(Settings::default().save_to(&path).is_ok());
+        let kept = Settings::load_from(&path, &windows(&["sl-SI"]));
+        assert_eq!(kept.languages, ["en-US"]);
+        let _ = std::fs::remove_dir_all(&folder);
+
+        // One for each language, only what names a language and a country,
+        // and never more than three.
+        assert_eq!(
+            spoken_here(&windows(&[
+                "EN-us",
+                "en-GB",
+                "sl",
+                "sr-Latn-RS",
+                "de-DE",
+                "x-y"
+            ])),
+            ["en-US", "de-DE"]
+        );
+        assert_eq!(
+            spoken_here(&windows(&["sl-SI", "en-US", "de-DE", "hr-HR", "it-IT"])),
+            ["sl-SI", "en-US", "de-DE"]
+        );
+        assert!(spoken_here(&[]).is_empty());
     }
 
     #[test]

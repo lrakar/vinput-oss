@@ -7,33 +7,9 @@
 //! so that nobody downloads gigabytes to find out that dictation takes half
 //! a minute, not to rank models to the second.
 
-use std::sync::OnceLock;
+pub use putlab_core::hardware::{Fit, Pc, pc};
 
-use crate::gpu;
 use crate::models::{Model, Runner};
-
-/// The parts of a PC that decide how a local model runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pc {
-    /// Memory of the graphics card local models can run on, in bytes; zero
-    /// without one.
-    pub card_memory: u64,
-    /// Memory of the PC, in bytes.
-    pub memory: u64,
-    /// Threads the processor runs at once.
-    pub threads: usize,
-}
-
-/// How a local model would run on a PC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fit {
-    /// Text arrives about as soon as it can.
-    Well,
-    /// It works, with a wait after each dictation.
-    Slow,
-    /// Too little memory for it, or a wait nobody would dictate with.
-    Heavy,
-}
 
 /// How much work a model is for a processor, whatever its file size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,22 +17,6 @@ enum Effort {
     Light,
     Medium,
     Heavy,
-}
-
-/// This PC. `None` if Windows cannot say how much memory it has. Looked up
-/// once.
-#[must_use]
-pub fn pc() -> Option<&'static Pc> {
-    static PC: OnceLock<Option<Pc>> = OnceLock::new();
-    PC.get_or_init(|| {
-        let memory = platform::memory()?;
-        Some(Pc {
-            card_memory: gpu::card().map_or(0, |card| card.memory),
-            memory,
-            threads: std::thread::available_parallelism().map_or(1, usize::from),
-        })
-    })
-    .as_ref()
 }
 
 const MB: u64 = 1_000_000;
@@ -74,7 +34,9 @@ fn effort(model: &Model, runner: Runner) -> Effort {
     match runner {
         Runner::Server if bytes < 200 * MB => Effort::Light,
         Runner::Server if bytes < 520 * MB => Effort::Medium,
-        Runner::Server => Effort::Heavy,
+        // A model that writes is judged by its own rule
+        // (`rewrite::local::fit`); asked here, it is the heaviest.
+        Runner::Server | Runner::Writer => Effort::Heavy,
         Runner::Listener(_) if bytes < 1_500 * MB => Effort::Light,
         Runner::Command | Runner::Listener(_) => Effort::Medium,
     }
@@ -99,30 +61,6 @@ pub fn fit(model: &Model, pc: &Pc, card: bool) -> Option<Fit> {
         (Effort::Light, _) | (Effort::Medium, 4..) | (Effort::Heavy, 12..) => Fit::Slow,
         (Effort::Medium | Effort::Heavy, _) => Fit::Heavy,
     })
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-mod platform {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-
-    /// The memory of the PC, in bytes.
-    pub(super) fn memory() -> Option<u64> {
-        // SAFETY: the structure is plain numbers and says how large it is,
-        // as the call asks.
-        unsafe {
-            let mut status: MEMORYSTATUSEX = std::mem::zeroed();
-            status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).unwrap_or(0);
-            (GlobalMemoryStatusEx(&raw mut status) != 0).then_some(status.ullTotalPhys)
-        }
-    }
-}
-
-#[cfg(not(windows))]
-mod platform {
-    pub(super) fn memory() -> Option<u64> {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -150,13 +88,6 @@ mod tests {
 
     fn of(id: &str, pc: &Pc, card: bool) -> Option<Fit> {
         fit(by_id(id)?, pc, card)
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn this_pc_can_be_looked_over() {
-        let found = super::pc().copied().unwrap_or(pc(0, 0, 0));
-        assert!(found.memory > GB && found.threads > 0);
     }
 
     #[test]

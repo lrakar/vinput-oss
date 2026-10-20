@@ -2,16 +2,20 @@
 
 use vinput_view::{Command, Setup};
 
-use super::{Control, Corners, Ink, Item, Kind, Measure, Region};
+use super::{Control, Corners, Ink, Item, Kind, Measure, Memory, Pane, Region};
 use crate::geometry::{Rect, Size};
 use crate::icons;
 use crate::node::{
-    Action, Button, ButtonKind, Field, Icon, Key, Node, Setting, Severity, TextStyle, Tone,
+    Action, Button, ButtonKind, Expander, Field, Icon, Key, Node, Pickers, Search, Setting,
+    Severity, TextStyle, Tone,
 };
 use crate::theme::{face, metric};
 
 /// The two words a switch says.
 pub const SWITCH_WORDS: [&str; 2] = ["Off", "On"];
+/// What the cross of a chip does, before the name of the chip, for screen
+/// readers and the tooltip.
+pub const REMOVE: &str = "Remove";
 /// The bullet before a point of a list.
 pub(super) const BULLET: &str = "\u{2022}";
 /// The room a bullet takes, with the gap after it.
@@ -29,7 +33,9 @@ fn trailing(action: &Action) -> Option<char> {
         Action::Go(_) | Action::Send(Command::Google(Setup::Open(_))) => {
             Some(icons::glyph(Icon::ChevronRight))
         }
-        Action::Send(Command::OpenLink(_)) => Some(icons::glyph(Icon::OpenExternal)),
+        Action::Send(Command::OpenLink(_) | Command::OpenHub) => {
+            Some(icons::glyph(Icon::OpenExternal))
+        }
         Action::Both(first, second) => trailing(second).or_else(|| trailing(first)),
         _ => None,
     }
@@ -73,10 +79,18 @@ pub struct Builder<'a> {
     control: f32,
     /// The height of a badge, likewise.
     badge: f32,
+    /// What the layer remembers of the page.
+    memory: Option<&'a Memory>,
+    /// The areas that scroll by themselves, as they are found.
+    panes: Vec<Pane>,
+    /// The one of them what is being laid out is in.
+    pane: Option<(usize, Pickers)>,
 }
 
 /// What a [`Builder`] made.
 pub struct Laid {
+    /// The areas that scroll by themselves.
+    pub panes: Vec<Pane>,
     /// What is painted in the parts that stay put.
     pub fixed: Vec<Item>,
     /// What is painted in the part that scrolls.
@@ -106,7 +120,33 @@ impl<'a> Builder<'a> {
             region: Region::Fixed,
             label: String::new(),
             footer: false,
+            memory: None,
+            panes: Vec::new(),
+            pane: None,
         }
+    }
+
+    /// Lays out with what the layer remembers of the page: which rows are
+    /// open, and what is typed in a field that a list follows.
+    #[must_use]
+    pub fn remembering(mut self, memory: &'a Memory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Whether the row that opens with this key is open.
+    fn is_open(&self, key: Key, usually: bool) -> bool {
+        self.memory
+            .and_then(|memory| memory.open(key))
+            .unwrap_or(usually)
+    }
+
+    /// What is typed in the field with this key, in small letters.
+    fn typed(&self, key: Key) -> String {
+        self.memory
+            .and_then(|memory| memory.typed(key))
+            .map(|typed| typed.trim().to_lowercase())
+            .unwrap_or_default()
     }
 
     /// Says which part of the window what follows is in.
@@ -118,6 +158,7 @@ impl<'a> Builder<'a> {
     #[must_use]
     pub fn finish(self) -> Laid {
         Laid {
+            panes: self.panes,
             fixed: self.fixed,
             body: self.body,
             controls: self.controls,
@@ -154,6 +195,7 @@ impl<'a> Builder<'a> {
             region: self.region,
             label: self.label.clone(),
             corners,
+            area: self.pane,
         });
         self.item(Item::Control(index));
         index
@@ -322,7 +364,14 @@ impl<'a> Builder<'a> {
                 .fold(0.0, f32::max),
             Node::Progress(_) | Node::Gauge { .. } => metric::PROGRESS_MIN,
             Node::Field(field) if field.wide => metric::FIELD_MIN,
-            Node::Card(_) | Node::Setting(_) | Node::InfoBar { .. } | Node::Busy(_) => avail,
+            Node::Card(_)
+            | Node::Setting(_)
+            | Node::InfoBar { .. }
+            | Node::Busy(_)
+            | Node::Expander(_)
+            | Node::Scroll { .. }
+            | Node::Flow(..)
+            | Node::Search(_) => avail,
             other => self.size(other, avail).w,
         }
         .min(avail)
@@ -412,9 +461,14 @@ impl<'a> Builder<'a> {
                     .text_size(&setting.detail, TextStyle::Caption, text_w)
                     .h
         };
-        let main_h = (title_h + detail_h + 2.0 * metric::ROW_PAD_Y)
+        let (pad_y, least) = if setting.compact {
+            (metric::GAP, metric::ROW_COMPACT)
+        } else {
+            (metric::ROW_PAD_Y, metric::ROW_MIN)
+        };
+        let main_h = (title_h + detail_h + 2.0 * pad_y)
             .max(control.h + 2.0 * metric::GAP)
-            .max(metric::ROW_MIN);
+            .max(least);
         let below_w = (w - text_x - pad).max(0.0);
         let below_h = if setting.below.is_empty() {
             0.0
@@ -488,14 +542,28 @@ impl<'a> Builder<'a> {
                 )
             }
             Node::Icon(..) => Size::new(metric::ICON_ROW, metric::ICON_ROW),
-            Node::Card(children) => {
-                let rows: f32 = children.iter().map(|child| self.card_child(child, w)).sum();
-                let lines = metric::LINE * count_f32(children.len().saturating_sub(1));
-                Size::new(w, rows + lines)
-            }
+            Node::Card(children) => Size::new(w, self.tiles_height(children, w)),
             Node::Setting(setting) => {
                 let plan = self.plan(setting, w);
                 Size::new(w, plan.main_h + plan.below_h)
+            }
+            Node::Expander(expander) => {
+                let mut height = self.expander_head(expander, w);
+                if self.is_open(expander.key, expander.open) && !expander.children.is_empty() {
+                    height += metric::LINE + self.rows_height(expander.children.iter(), w);
+                }
+                Size::new(w, height)
+            }
+            Node::Scroll { max, children, .. } => {
+                Size::new(w, self.rows_height(children.iter(), w).min(*max))
+            }
+            Node::Flow(children, _) => Size::new(w, self.flow_lines(children, w).1),
+            Node::Chip { label, remove, .. } => {
+                Size::new(self.chip_width(label, remove.is_some()), metric::CHIP)
+            }
+            Node::Search(search) => {
+                let field = self.control + 2.0 * metric::ROW_PAD;
+                Size::new(w, field + metric::LINE + self.search_list(search, w))
             }
             Node::Button(button) => self.button_size(button),
             Node::Link { label, .. } => {
@@ -513,7 +581,10 @@ impl<'a> Builder<'a> {
                 } else {
                     (metric::FIELD * self.text_scale).min(w.max(metric::TEXT_MIN))
                 };
-                Size::new(width, self.control)
+                // Each line past the first adds the height of a line of type.
+                let line = self.text_size("", TextStyle::Body, f32::MAX).h;
+                let more = f32::from(field.lines.max(1) - 1) * line;
+                Size::new(width, self.control + more)
             }
             // As wide as a combination needs, less where the row is short of room.
             Node::Hotkey { .. } => Size::new(
@@ -540,12 +611,113 @@ impl<'a> Builder<'a> {
 
     /// The height a child of a card takes at the card's width.
     fn card_child(&self, child: &Node, w: f32) -> f32 {
+        let inner = (w - 2.0 * metric::ROW_PAD).max(0.0);
         match child {
-            Node::Setting(_) => self.size(child, w).h,
-            other => {
-                self.size(other, (w - 2.0 * metric::ROW_PAD).max(0.0)).h + 2.0 * metric::ROW_PAD
+            Node::Setting(_) | Node::Expander(_) | Node::Scroll { .. } | Node::Search(_) => {
+                self.size(child, w).h
             }
+            // A heading inside a card names the rows under it, quietly.
+            Node::Header(text) => {
+                self.text_size(text, TextStyle::Caption, inner).h + 2.0 * metric::GAP
+            }
+            other => self.size(other, inner).h + 2.0 * metric::ROW_PAD,
         }
+    }
+
+    /// The height the rows of a group take as tiles one under another, with
+    /// the small gap of Windows Settings between them.
+    fn tiles_height(&self, rows: &[Node], w: f32) -> f32 {
+        let height: f32 = rows.iter().map(|row| self.card_child(row, w)).sum();
+        height + metric::TILE_GAP * count_f32(rows.len().saturating_sub(1))
+    }
+
+    /// The height rows take one under another in a card of width `w`, with
+    /// the hairlines between them.
+    fn rows_height<'n>(&self, rows: impl Iterator<Item = &'n Node>, w: f32) -> f32 {
+        let (mut height, mut count) = (0.0, 0_usize);
+        for row in rows {
+            height += self.card_child(row, w);
+            count += 1;
+        }
+        height + metric::LINE * count_f32(count.saturating_sub(1))
+    }
+
+    /// The height of the row of a setting that opens, without what is under
+    /// it.
+    fn expander_head(&self, expander: &Expander, w: f32) -> f32 {
+        let (_, title_w, _) = self.expander_parts(expander, w);
+        let title = self.text_size(&expander.title, TextStyle::Body, title_w).h;
+        (title + 2.0 * metric::ROW_PAD_Y).max(metric::ROW_MIN)
+    }
+
+    /// Where the title of a setting that opens starts, how wide it is, and
+    /// how wide what is chosen is said.
+    fn expander_parts(&self, expander: &Expander, w: f32) -> (f32, f32, f32) {
+        let pad = metric::ROW_PAD;
+        let text_x = if expander.icon.is_some() {
+            pad + metric::ICON_ROW + pad
+        } else {
+            pad
+        };
+        let room = (w - text_x - pad - metric::ICON_SMALL - pad).max(0.0);
+        let title = self
+            .text_size(&expander.title, TextStyle::Body, f32::MAX)
+            .w
+            .min(room);
+        // What is chosen gets the room the title leaves, and is cut off there.
+        let most = (room - title - pad).max(0.0);
+        let value = self
+            .text_size(&expander.value, TextStyle::Body, f32::MAX)
+            .w
+            .min(most);
+        (text_x, (room - value - pad).max(metric::TEXT_MIN), value)
+    }
+
+    /// The width of a chip.
+    fn chip_width(&self, label: &str, removable: bool) -> f32 {
+        let cross = if removable {
+            metric::GRID + metric::CHIP
+        } else {
+            metric::CHIP_PAD
+        };
+        metric::CHIP_PAD + self.text_size(label, TextStyle::Body, f32::MAX).w + cross
+    }
+
+    /// Where each child of a flow goes, from its top left corner, and the
+    /// height they take in all.
+    fn flow_lines(&self, children: &[Node], w: f32) -> (Vec<(f32, f32, Size)>, f32) {
+        let mut places = Vec::with_capacity(children.len());
+        let (mut x, mut y, mut line) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for child in children {
+            let wish = self.wish(child, w);
+            let size = Size::new(wish, self.size(child, wish).h);
+            if x > 0.0 && x + size.w > w {
+                x = 0.0;
+                y += line + metric::GAP;
+                line = 0.0;
+            }
+            places.push((x, y, size));
+            x += size.w + metric::GAP;
+            line = line.max(size.h);
+        }
+        (places, y + line)
+    }
+
+    /// The height of the list of a search, or of the line that says nothing
+    /// was found.
+    fn search_list(&self, search: &Search, w: f32) -> f32 {
+        let typed = self.typed(search.key);
+        let mut found = search
+            .rows
+            .iter()
+            .filter(|(words, _)| has(words, &typed))
+            .map(|(_, row)| row)
+            .peekable();
+        if found.peek().is_none() {
+            let inner = (w - 2.0 * metric::ROW_PAD).max(0.0);
+            return self.text_size(&search.none, TextStyle::Body, inner).h + 2.0 * metric::ROW_PAD;
+        }
+        self.rows_height(found, w).min(search.max)
     }
 
     /// Places `node` with its top left corner at `x`, `y`, offered the width
@@ -585,6 +757,23 @@ impl<'a> Builder<'a> {
                 self.item(Item::Card(rect));
                 self.setting(setting, rect, Corners::ALL);
             }
+            Node::Expander(expander) => {
+                self.item(Item::Card(rect));
+                self.expander(expander, rect, Corners::ALL);
+            }
+            Node::Scroll {
+                key,
+                children,
+                pickers,
+                ..
+            } => self.scroll(key, children, rect, pickers),
+            Node::Flow(children, _) => {
+                let (places, _) = self.flow_lines(&children, w);
+                for (child, (dx, dy, size)) in children.into_iter().zip(places) {
+                    self.place(child, x + dx, y + dy, size.w);
+                }
+            }
+            Node::Search(search) => self.search(search, rect),
             Node::Progress(value) => self.item(Item::Progress {
                 rect,
                 value: value.map(|value| value.clamp(0.0, 1.0)),
@@ -668,6 +857,26 @@ impl<'a> Builder<'a> {
                 );
             }
             Node::Field(field) => self.field(field, rect),
+            Node::Chip {
+                label,
+                remove,
+                pickers,
+            } => {
+                let name = if remove.is_some() {
+                    format!("{REMOVE} {label}")
+                } else {
+                    label.clone()
+                };
+                let before = std::mem::replace(&mut self.label, name);
+                let enabled = remove.is_some();
+                let kind = Kind::Chip {
+                    label,
+                    remove,
+                    pickers,
+                };
+                self.control(rect, kind, enabled, None);
+                self.label = before;
+            }
             Node::Hotkey {
                 key,
                 text,
@@ -696,7 +905,9 @@ impl<'a> Builder<'a> {
                 text: field.text,
                 placeholder: field.placeholder,
                 secret: field.secret,
+                lines: field.lines,
                 eager: field.eager,
+                live: field.live,
                 action: field.action,
                 on_enter: field.on_enter,
             },
@@ -741,9 +952,34 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A group of settings, the way Windows Settings shows one: each row a
+    /// tile of its own, a little apart from the next. What opens under a
+    /// row stays inside its tile, with hairlines between its rows.
     fn card(&mut self, children: Vec<Node>, rect: Rect) {
-        self.item(Item::Card(rect));
+        let mut y = rect.y;
+        for (index, child) in children.into_iter().enumerate() {
+            if index > 0 {
+                y += metric::TILE_GAP;
+            }
+            let height = self.card_child(&child, rect.w);
+            let tile = Rect::new(rect.x, y, rect.w, height);
+            // A heading among the rows names the tiles under it; it is
+            // not a tile itself.
+            if !matches!(child, Node::Header(_)) {
+                self.item(Item::Card(tile));
+            }
+            self.rows(vec![child], tile, Corners::ALL);
+            y += height;
+        }
+    }
+
+    /// Lays rows out one under another in `rect`, a card or a part of one,
+    /// with a hairline between them. `ends` says which of the card's
+    /// rounded corners the first and the last of them reach.
+    fn rows(&mut self, children: Vec<Node>, rect: Rect, ends: Corners) {
         let last = children.len().saturating_sub(1);
+        let pad = metric::ROW_PAD;
+        let inner = (rect.w - 2.0 * pad).max(0.0);
         let mut y = rect.y;
         for (index, child) in children.into_iter().enumerate() {
             if index > 0 {
@@ -752,19 +988,194 @@ impl<'a> Builder<'a> {
             }
             let height = self.card_child(&child, rect.w);
             let corners = Corners {
-                top: index == 0,
-                bottom: index == last,
+                top: ends.top && index == 0,
+                bottom: ends.bottom && index == last,
             };
+            let row = Rect::new(rect.x, y, rect.w, height);
             match child {
-                Node::Setting(setting) => {
-                    self.setting(setting, Rect::new(rect.x, y, rect.w, height), corners);
-                }
+                Node::Setting(setting) => self.setting(setting, row, corners),
+                Node::Expander(expander) => self.expander(expander, row, corners),
+                Node::Scroll {
+                    key,
+                    children,
+                    pickers,
+                    ..
+                } => self.scroll(key, children, row, pickers),
+                Node::Search(search) => self.search(search, row),
+                Node::Header(text) => self.item(Item::Text {
+                    rect: Rect::new(rect.x + pad, y + metric::GAP, inner, height),
+                    text,
+                    style: TextStyle::Caption,
+                    tone: Tone::Secondary,
+                    trim: false,
+                }),
                 other => {
-                    let pad = metric::ROW_PAD;
-                    self.place(other, rect.x + pad, y + pad, (rect.w - 2.0 * pad).max(0.0));
+                    self.place(other, rect.x + pad, y + pad, inner);
                 }
             }
             y += height;
+        }
+    }
+
+    /// The row of a setting that opens, and under it what it shows while it
+    /// is open.
+    fn expander(&mut self, expander: Expander, rect: Rect, corners: Corners) {
+        let open = self.is_open(expander.key, expander.open) && !expander.children.is_empty();
+        let pad = metric::ROW_PAD;
+        let head = Rect::new(
+            rect.x,
+            rect.y,
+            rect.w,
+            self.expander_head(&expander, rect.w),
+        );
+        let (text_x, title_w, value_w) = self.expander_parts(&expander, rect.w);
+        self.label.clone_from(&expander.title);
+        self.control_with(
+            head,
+            Kind::Expander {
+                open,
+                pickers: expander.pickers,
+            },
+            !expander.children.is_empty(),
+            Some(expander.key),
+            Corners {
+                top: corners.top,
+                bottom: corners.bottom && !open,
+            },
+        );
+        self.label.clear();
+        if let Some(icon) = expander.icon {
+            let size = Size::new(metric::ICON_ROW, metric::ICON_ROW);
+            self.item(Item::Glyph {
+                rect: Rect::new(head.x + pad, head.y, 0.0, head.h).left_center(size),
+                glyph: icons::glyph(icon),
+                size: metric::ICON_ROW,
+                ink: Ink::Tone(Tone::Primary),
+            });
+        }
+        let title_h = self.text_size(&expander.title, TextStyle::Body, title_w).h;
+        self.item(Item::Text {
+            rect: Rect::new(
+                head.x + text_x,
+                head.y + (head.h - title_h) / 2.0,
+                title_w,
+                title_h,
+            ),
+            text: expander.title,
+            style: TextStyle::Body,
+            tone: Tone::Primary,
+            trim: false,
+        });
+        let chevron = Size::new(metric::ICON_SMALL, metric::ICON_SMALL);
+        let chevron_x = head.right() - pad - metric::ICON_SMALL;
+        self.item(Item::Glyph {
+            rect: Rect::new(chevron_x, head.y, 0.0, head.h).left_center(chevron),
+            glyph: if open {
+                icons::CHEVRON_UP
+            } else {
+                icons::CHEVRON_DOWN
+            },
+            size: metric::ICON_SMALL,
+            ink: Ink::Tone(Tone::Secondary),
+        });
+        if value_w > 0.0 {
+            let line = self.line_height(TextStyle::Body);
+            self.line(
+                Rect::new(chevron_x - pad - value_w, head.y, 0.0, head.h)
+                    .left_center(Size::new(value_w, line)),
+                expander.value,
+                TextStyle::Body,
+                expander.value_tone,
+            );
+        }
+        if open {
+            let y = head.bottom();
+            self.item(Item::Divider(Rect::new(rect.x, y, rect.w, metric::LINE)));
+            let under = Rect::new(
+                rect.x,
+                y + metric::LINE,
+                rect.w,
+                (rect.bottom() - y - metric::LINE).max(0.0),
+            );
+            let ends = Corners {
+                top: false,
+                bottom: corners.bottom,
+            };
+            self.rows(expander.children, under, ends);
+        }
+    }
+
+    /// Rows in an area of their own, `rect`, which scrolls by itself if
+    /// they are taller than it.
+    fn scroll(&mut self, key: Key, children: Vec<Node>, rect: Rect, pickers: Pickers) {
+        let content = self.rows_height(children.iter(), rect.w);
+        let ends = Corners::default();
+        // An area inside another scrolls with that one.
+        if self.pane.is_some() || content <= rect.h {
+            self.rows(children, rect, ends);
+            return;
+        }
+        let index = self.panes.len();
+        self.panes.push(Pane {
+            key,
+            rect,
+            content,
+            region: self.region,
+        });
+        self.item(Item::Clip(index, pickers));
+        self.pane = Some((index, pickers));
+        self.rows(children, Rect::new(rect.x, rect.y, rect.w, content), ends);
+        self.pane = None;
+        self.item(Item::Unclip);
+    }
+
+    /// The field of a search, and under it the rows that have what is typed
+    /// in it.
+    fn search(&mut self, search: Search, rect: Rect) {
+        let pad = metric::ROW_PAD;
+        let inner = (rect.w - 2.0 * pad).max(0.0);
+        let typed = self.typed(search.key);
+        self.label.clone_from(&search.placeholder);
+        self.control(
+            Rect::new(rect.x + pad, rect.y + pad, inner, self.control),
+            Kind::Field {
+                text: String::new(),
+                placeholder: search.placeholder,
+                secret: false,
+                lines: 1,
+                eager: false,
+                live: Some(search.pickers),
+                action: Box::new(|_| Action::None),
+                on_enter: Action::None,
+            },
+            true,
+            Some(search.key),
+        );
+        self.label.clear();
+        let y = rect.y + self.control + 2.0 * pad;
+        self.item(Item::Divider(Rect::new(rect.x, y, rect.w, metric::LINE)));
+        let list = Rect::new(
+            rect.x,
+            y + metric::LINE,
+            rect.w,
+            (rect.bottom() - y - metric::LINE).max(0.0),
+        );
+        let found: Vec<Node> = search
+            .rows
+            .into_iter()
+            .filter(|(words, _)| has(words, &typed))
+            .map(|(_, row)| row)
+            .collect();
+        if found.is_empty() {
+            self.item(Item::Text {
+                rect: Rect::new(list.x + pad, list.y + pad, inner, list.h - 2.0 * pad),
+                text: search.none,
+                style: TextStyle::Body,
+                tone: Tone::Secondary,
+                trim: false,
+            });
+        } else {
+            self.scroll(search.key, found, list, search.pickers);
         }
     }
 
@@ -937,6 +1348,12 @@ impl<'a> Builder<'a> {
             );
         }
     }
+}
+
+/// Whether a row found by `words` has `typed`, which is in small letters
+/// already. Nothing typed finds every row.
+fn has(words: &str, typed: &str) -> bool {
+    typed.is_empty() || words.to_lowercase().contains(typed)
 }
 
 /// The room the gaps between `count` things in a row take.

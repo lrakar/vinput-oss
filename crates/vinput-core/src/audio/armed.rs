@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::{AudioSource, StopHandle};
+use super::{AudioSource, SAMPLE_RATE_HZ, StopHandle};
 use crate::{Result, log};
 
 /// How long a stream is kept after the session that used it: two minutes,
@@ -50,6 +50,12 @@ const ARMED_FOR: Duration = Duration::from_secs(120);
 pub trait CaptureStream: Send {
     /// What Windows knows the device behind the stream by.
     fn device(&self) -> &str;
+
+    /// Samples per second it delivers: [`SAMPLE_RATE_HZ`] unless it was
+    /// opened for a recording.
+    fn rate(&self) -> u32 {
+        SAMPLE_RATE_HZ
+    }
 
     /// Whether the stream may be kept between sessions. A stream that costs
     /// the user something merely by existing may not.
@@ -109,6 +115,17 @@ pub trait CaptureBackend: Send + Sync + 'static {
     /// Returns [`Error::Audio`](crate::Error::Audio) if there is no
     /// microphone or it cannot be opened.
     fn open(&self, microphone: &str) -> Result<Self::Stream>;
+
+    /// As [`open`](Self::open), for a recording someone will listen to: at
+    /// the rate of the microphone rather than the one speech is recognized
+    /// at, where the backend can tell what that is.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    fn open_for_recording(&self, microphone: &str) -> Result<Self::Stream> {
+        self.open(microphone)
+    }
 
     /// The device a stream for `microphone` may be kept on right now, or
     /// `None` if there is none, or none that may be kept open.
@@ -374,6 +391,24 @@ impl<B: CaptureBackend> Armed<B> {
         Ok(ArmedSource::new(stream, stop, home))
     }
 
+    /// Starts capturing for a recording someone will listen to, such as a
+    /// voice memo: on a stream opened for it at the rate of the microphone
+    /// ([`CaptureBackend::open_for_recording`]), which is closed when the
+    /// recording ends. A stream kept for dictation is left as it is, since
+    /// it runs at the rate of speech recognition; a recording does not need
+    /// to start in a hurry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Audio`](crate::Error::Audio) if there is no
+    /// microphone, access to it is denied, or the device cannot be started.
+    pub fn record(&self, stop: StopHandle) -> Result<ArmedSource<B::Stream>> {
+        let microphone = self.shared.state().microphone.clone();
+        let mut stream = self.backend.open_for_recording(&microphone)?;
+        stream.start()?;
+        Ok(ArmedSource::unarmed(stream, stop))
+    }
+
     /// Waits until the keeper has done everything asked of it so far.
     #[cfg(test)]
     pub(crate) fn settle(&self) {
@@ -550,6 +585,14 @@ impl<S: CaptureStream> ArmedSource<S> {
         Self::new(stream, stop, None)
     }
 
+    /// Samples per second it delivers.
+    #[must_use]
+    pub fn rate(&self) -> u32 {
+        self.stream
+            .as_ref()
+            .map_or(SAMPLE_RATE_HZ, CaptureStream::rate)
+    }
+
     /// The device being captured from, while capture runs.
     #[cfg(test)]
     pub(crate) fn device(&self) -> Option<&str> {
@@ -711,6 +754,7 @@ mod tests {
         /// since the stream was opened.
         buffered: VecDeque<i16>,
         captured: i16,
+        rate: u32,
     }
 
     impl FakeStream {
@@ -751,7 +795,15 @@ mod tests {
                 running: false,
                 buffered: VecDeque::new(),
                 captured: 0,
+                rate: SAMPLE_RATE_HZ,
             })
+        }
+
+        fn open_for_recording(&self, microphone: &str) -> Result<FakeStream> {
+            let mut stream = self.open(microphone)?;
+            self.0.note(format!("at 48 kHz {}", stream.device));
+            stream.rate = 48_000;
+            Ok(stream)
         }
 
         fn standby(&self, microphone: &str) -> Option<String> {
@@ -772,6 +824,10 @@ mod tests {
     impl CaptureStream for FakeStream {
         fn device(&self) -> &str {
             &self.device
+        }
+
+        fn rate(&self) -> u32 {
+            self.rate
         }
 
         fn may_stay_armed(&self) -> bool {
@@ -890,6 +946,43 @@ mod tests {
                 "stop desk"
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_recording_has_a_stream_of_its_own_and_leaves_the_kept_one_alone() -> Result<()> {
+        let world = World::new("desk");
+        let armed = armed(&world, "");
+        assert_eq!(dictate(&armed)?, "desk");
+        assert_eq!(world.opened(), 1);
+
+        let stop = StopHandle::new();
+        let mut recording = armed.record(stop.clone())?;
+        assert_eq!(recording.rate(), 48_000);
+        assert_eq!(listen(&mut recording, 1)?, [0, 1]);
+        stop.stop();
+        while !listen(&mut recording, 1)?.is_empty() {}
+        drop(recording);
+        armed.settle();
+        // Opened for the recording and closed after it; the stream kept for
+        // dictation is the one the next dictation starts.
+        assert_eq!(world.opened(), 2);
+        assert_eq!(world.closed(), 1);
+        assert_eq!(dictate(&armed)?, "desk");
+        assert_eq!(world.opened(), 2);
+        assert_eq!(
+            world.log()[3..],
+            [
+                "open desk",
+                "at 48 kHz desk",
+                "start desk",
+                "stop desk",
+                "start desk",
+                "stop desk"
+            ]
+        );
+        let source = armed.open(StopHandle::new())?;
+        assert_eq!(source.rate(), SAMPLE_RATE_HZ);
         Ok(())
     }
 

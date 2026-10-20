@@ -369,6 +369,7 @@ impl Host {
     pub(super) fn on_window_tick(&mut self, controller: &mut dyn Controller) {
         self.slow.tick();
         self.pro_keep_current();
+        self.use_text_model_that_arrived(controller);
         if self.hear_windows(controller) {
             self.show_state();
         } else {

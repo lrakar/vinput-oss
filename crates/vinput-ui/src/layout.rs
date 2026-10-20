@@ -14,7 +14,7 @@ use vinput_view::Page;
 
 use crate::geometry::{Rect, Size};
 use crate::node::{
-    Action, ButtonKind, Icon, Key, OnPick, OnText, OnToggle, Severity, TextStyle, Tone,
+    Action, ButtonKind, Icon, Key, OnPick, OnText, OnToggle, Pickers, Severity, TextStyle, Tone,
 };
 use crate::theme::metric;
 
@@ -126,6 +126,12 @@ pub enum Item {
     Logo(Rect),
     /// The control with this index in the list of controls, painted here.
     Control(usize),
+    /// What follows, up to the next [`Item::Unclip`], is in the area with
+    /// this index among those that scroll by themselves: it is cut off at
+    /// the edges of that area and moves as it is scrolled.
+    Clip(usize, Pickers),
+    /// The end of what an [`Item::Clip`] began.
+    Unclip,
 }
 
 /// What kind of control something is, with what it shows and does.
@@ -174,8 +180,13 @@ pub enum Kind {
         placeholder: String,
         /// Whether what is typed is hidden.
         secret: bool,
+        /// How many lines of text it shows.
+        lines: u8,
         /// Whether what is pasted is handed in at once.
         eager: bool,
+        /// Set if the page is laid out again at every key, which only the
+        /// field of a list that is searched asks for.
+        live: Option<Pickers>,
         /// What finishing an edit does.
         action: OnText,
         /// What Enter does besides.
@@ -206,6 +217,22 @@ pub enum Kind {
         /// Whether its page, or one reached from it, is open.
         selected: bool,
     },
+    /// The row of a setting that opens and closes what is under it.
+    Expander {
+        /// Whether it is open.
+        open: bool,
+        /// That this program has rows that open.
+        pickers: Pickers,
+    },
+    /// A chip, with a cross that takes it away if it can be.
+    Chip {
+        /// What it says.
+        label: String,
+        /// What the cross does. A chip without one cannot be used.
+        remove: Option<Action>,
+        /// That this program has chips.
+        pickers: Pickers,
+    },
 }
 
 impl Kind {
@@ -221,6 +248,8 @@ impl Kind {
             Self::Hotkey { .. } => 5,
             Self::Row { .. } => 6,
             Self::Nav { .. } => 7,
+            Self::Expander { .. } => 8,
+            Self::Chip { .. } => 9,
         }
     }
 }
@@ -252,9 +281,85 @@ pub struct Control {
     pub label: String,
     /// For a row, which of its card's rounded corners it reaches.
     pub corners: Corners,
+    /// The area that scrolls by itself it is in, by its index, if it is in
+    /// one; see [`Control::pane`].
+    pub area: Option<(usize, Pickers)>,
+}
+
+/// An area that scrolls by itself, inside a page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pane {
+    /// The name that finds how far it is scrolled again after a rebuild.
+    pub key: Key,
+    /// Where it is. For one in the body, where it is before any scrolling
+    /// of the page.
+    pub rect: Rect,
+    /// How tall what it holds is in all.
+    pub content: f32,
+    /// The part of the window it is in.
+    pub region: Region,
+}
+
+impl Pane {
+    /// How far it can be scrolled.
+    #[must_use]
+    pub fn range(&self) -> f32 {
+        (self.content - self.rect.h).max(0.0)
+    }
+}
+
+/// What the layer remembers of a page that decides how it is laid out:
+/// which rows the user opened or closed, and what is typed in the fields
+/// that something on the page follows.
+///
+/// A page has a handful of such rows and fields at most, so both are short
+/// lists that are looked through.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Memory {
+    open: Vec<(String, bool)>,
+    typed: Vec<(String, String)>,
+}
+
+impl Memory {
+    /// Whether the row with this key is open, where the user had a say.
+    #[must_use]
+    pub fn open(&self, key: &str) -> Option<bool> {
+        let found = self.open.iter().find(|(known, _)| known == key);
+        found.map(|(_, open)| *open)
+    }
+
+    /// Says that the user opened or closed the row with this key.
+    pub fn set_open(&mut self, key: &str, open: bool) {
+        match self.open.iter_mut().find(|(known, _)| known == key) {
+            Some((_, was)) => *was = open,
+            None => self.open.push((key.to_owned(), open)),
+        }
+    }
+
+    /// What the field with this key reads, if anything was typed in it.
+    #[must_use]
+    pub fn typed(&self, key: &str) -> Option<&str> {
+        let found = self.typed.iter().find(|(known, _)| known == key);
+        found.map(|(_, typed)| typed.as_str())
+    }
+
+    /// Says what the field with this key reads now.
+    pub fn set_typed(&mut self, key: &str, typed: String) {
+        match self.typed.iter_mut().find(|(known, _)| known == key) {
+            Some((_, was)) => *was = typed,
+            None => self.typed.push((key.to_owned(), typed)),
+        }
+    }
 }
 
 impl Control {
+    /// The area that scrolls by itself it is in, by its index, if it is in
+    /// one.
+    #[must_use]
+    pub fn pane(&self) -> Option<usize> {
+        self.area.map(|(index, _)| index)
+    }
+
     /// What a screen reader calls it.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -327,4 +432,4 @@ mod build;
 #[cfg(test)]
 mod tests;
 
-pub use build::{Builder, Laid, SWITCH_WORDS};
+pub use build::{Builder, Laid, REMOVE, SWITCH_WORDS};

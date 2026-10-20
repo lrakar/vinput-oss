@@ -34,16 +34,23 @@ const MAX_LINE: usize = 1 << 20;
 pub fn window_name(surface: Surface) -> &'static str {
     match surface {
         Surface::Settings(Page::General) => "settings",
+        Surface::Settings(Page::Shortcuts) => "shortcuts",
         Surface::Settings(Page::Models) => "models",
         Surface::Settings(Page::AddModel) => "add-model",
         Surface::Settings(Page::Google) => "google",
         Surface::Settings(Page::Pro) => "pro",
+        Surface::Settings(Page::Words) => "words",
+        Surface::Settings(Page::Cleanup) => "cleanup",
         Surface::Settings(Page::Advanced) => "advanced",
         Surface::Settings(Page::About) => "about",
         Surface::Settings(Page::Welcome) => "welcome",
         Surface::Settings(Page::WelcomePro) => "welcome-pro",
         Surface::Settings(Page::WelcomeLocal) => "welcome-local",
         Surface::Update => "update",
+        // A page of another program of the family, when one is built
+        // beside this one: Vinput has no window for it.
+        #[allow(unreachable_patterns, clippy::match_same_arms)]
+        Surface::Settings(_) => "settings",
     }
 }
 
@@ -617,10 +624,13 @@ mod tests {
     fn every_window_has_a_name_on_the_command_line() {
         let surfaces = [
             Surface::Settings(Page::General),
+            Surface::Settings(Page::Shortcuts),
             Surface::Settings(Page::Models),
             Surface::Settings(Page::AddModel),
             Surface::Settings(Page::Google),
             Surface::Settings(Page::Pro),
+            Surface::Settings(Page::Words),
+            Surface::Settings(Page::Cleanup),
             Surface::Settings(Page::Advanced),
             Surface::Settings(Page::About),
             Surface::Update,

@@ -560,8 +560,11 @@ pub mod metric {
     pub const GRID: f32 = 4.0;
     /// The gap between things side by side or one under another.
     pub const GAP: f32 = 8.0;
-    /// The extra room over a heading that is not the first thing on a page.
-    pub const HEADER_ABOVE: f32 = 16.0;
+    /// The extra room over a heading that is not the first thing on a page:
+    /// with the gap, 28 px, close to the 30 of Windows Settings.
+    pub const HEADER_ABOVE: f32 = 20.0;
+    /// The room between the tiles of a group of settings.
+    pub const TILE_GAP: f32 = 4.0;
     /// The room under a heading, on top of the usual gap.
     pub const HEADER_BELOW: f32 = 0.0;
     /// How round controls and cards are.
@@ -615,6 +618,15 @@ pub mod metric {
 
     /// The least height of a settings row.
     pub const ROW_MIN: f32 = 68.0;
+    /// The least height of a row of a long list.
+    pub const ROW_COMPACT: f32 = 40.0;
+    /// The height of a chip.
+    pub const CHIP: f32 = 28.0;
+    /// The room between the edge of a chip and its text.
+    pub const CHIP_PAD: f32 = 10.0;
+    /// The most height a list inside a page takes before it scrolls by
+    /// itself.
+    pub const LIST_MAX: f32 = 320.0;
     /// The room around what is in a row or a card.
     pub const ROW_PAD: f32 = 16.0;
     /// The least room over and under the text of a row.

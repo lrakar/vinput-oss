@@ -9,7 +9,7 @@ use crate::geometry::{Point, Rect};
 use crate::gfx::{Align, Canvas, TextBox};
 use crate::icons;
 use crate::layout::{Control, Ink, Item, Kind, Measure, Region, SWITCH_WORDS};
-use crate::look::{Look, ScrollBar, thumb};
+use crate::look::{Look, ScrollBar, pane_thumb, thumb};
 use crate::node::{ButtonKind, TextStyle, Tone};
 use crate::shell::Frame;
 use crate::theme::{Color, Palette, Theme, metric, shade};
@@ -60,13 +60,9 @@ pub fn frame(canvas: &Canvas, frame: &Frame, theme: &Theme, look: &Look<'_>) {
         frame,
     };
     painter.backdrop();
-    for item in &frame.fixed {
-        painter.item(item, 0.0);
-    }
+    painter.items(&frame.fixed, 0.0, None);
     canvas.clip(frame.viewport);
-    for item in &frame.body {
-        painter.item(item, -look.scroll);
-    }
+    painter.items(&frame.body, -look.scroll, Some(frame.viewport));
     canvas.unclip();
     painter.scroll_bar();
     painter.focus();
@@ -118,13 +114,56 @@ impl Painter<'_> {
         }
     }
 
-    fn item(&self, item: &Item, dy: f32) {
+    /// Paints `items`, moved down by `dy` and seen only inside `within`.
+    /// What is in an area that scrolls by itself moves with that area and
+    /// is cut off at its edges.
+    fn items(&self, items: &[Item], dy: f32, within: Option<Rect>) {
+        let mut area: Option<(usize, Rect)> = None;
+        for item in items {
+            // Without such an area there is nothing to keep track of.
+            if self.frame.panes().is_empty() {
+                self.item(item, dy, within);
+                continue;
+            }
+            match (item, area) {
+                (Item::Clip(index, _), _) => {
+                    if let Some(pane) = self.frame.panes().get(*index) {
+                        let rect = pane.rect.moved(0.0, dy);
+                        self.canvas.clip(rect);
+                        area = Some((*index, rect));
+                    }
+                }
+                (Item::Unclip, Some((index, rect))) => {
+                    self.canvas.unclip();
+                    self.pane_bar(index, rect);
+                    area = None;
+                }
+                (Item::Unclip, None) => {}
+                (_, Some((index, rect))) => {
+                    self.item(item, dy - self.look.pane(index), Some(rect));
+                }
+                (_, None) => self.item(item, dy, within),
+            }
+        }
+    }
+
+    /// The scroll bar of an area that scrolls by itself: a thin line that
+    /// says there is more, and the thumb to drag while the mouse is on it.
+    fn pane_bar(&self, index: usize, at: Rect) {
+        let Some(pane) = self.frame.panes().get(index) else {
+            return;
+        };
+        let wide = self.look.pane_bar == Some(index);
+        if let Some(thumb) = pane_thumb(pane, at, self.look.pane(index), wide) {
+            self.canvas
+                .fill(thumb, thumb.w / 2.0, self.colors.scroll_thumb);
+        }
+    }
+
+    fn item(&self, item: &Item, dy: f32, within: Option<Rect>) {
         let colors = self.colors;
         let radius = metric::RADIUS;
-        let seen = |rect: Rect| {
-            let rect = rect.moved(0.0, dy);
-            (dy == 0.0 || rect.touches(self.frame.viewport)).then_some(rect)
-        };
+        let seen = |rect: Rect| in_sight(rect, dy, within);
         match item {
             Item::Card(rect) => {
                 if let Some(rect) = seen(*rect) {
@@ -215,6 +254,8 @@ impl Painter<'_> {
                     self.control(*index, control, rect);
                 }
             }
+            // The list of items is walked by `items`, which acts on these.
+            Item::Clip(..) | Item::Unclip => {}
         }
     }
 
@@ -275,11 +316,15 @@ impl Painter<'_> {
                 text,
                 placeholder,
                 secret,
+                lines,
                 ..
             } => {
                 let active = self.look.editing == Some(index);
                 self.field_face(rect, state, active);
-                if !active {
+                // While it is typed in, the edit control shows the text.
+                if !active && *lines > 1 {
+                    self.field_lines(rect, text, placeholder, state.enabled);
+                } else if !active {
                     let shown: String = if *secret {
                         text.chars().map(|_| HIDDEN).collect()
                     } else {
@@ -289,7 +334,8 @@ impl Painter<'_> {
                 }
             }
             Kind::Hotkey { text, .. } => self.hotkey(index, control, rect, text, state),
-            Kind::Row { .. } => {
+            Kind::Chip { label, .. } => self.chip(rect, label, state),
+            Kind::Row { .. } | Kind::Expander { .. } => {
                 let fill = state.pick(
                     Color::CLEAR,
                     self.colors.subtle_hover,
@@ -335,6 +381,40 @@ impl Painter<'_> {
             ..TextBox::default()
         };
         self.canvas.text(label, rect, style, color, how);
+    }
+
+    /// A chip: its name, and the cross that takes it away.
+    fn chip(&self, rect: Rect, label: &str, state: State) {
+        let colors = self.colors;
+        let radius = metric::RADIUS;
+        let fill = state.pick(colors.control, colors.control_hover, colors.control_pressed);
+        self.canvas.fill(rect, radius, fill);
+        self.canvas
+            .stroke(rect, radius, colors.control_stroke, metric::LINE);
+        if self.theme.contrast && state.hover {
+            self.canvas
+                .stroke(rect, radius, colors.accent, metric::FOCUS);
+        }
+        // One that cannot be taken away has no cross, and says the same.
+        let cross = Rect::new(rect.right() - metric::CHIP, rect.y, metric::CHIP, rect.h);
+        let text_end = if state.enabled {
+            cross.x + metric::GRID
+        } else {
+            rect.right() - metric::CHIP_PAD
+        };
+        let text = Rect::new(
+            rect.x + metric::CHIP_PAD,
+            rect.y,
+            (text_end - rect.x - metric::CHIP_PAD).max(0.0),
+            rect.h,
+        );
+        self.canvas
+            .text(label, text, TextStyle::Body, colors.text, LINE);
+        if state.enabled {
+            let quiet = state.pick(colors.text_secondary, colors.text, colors.text);
+            self.canvas
+                .glyph(icons::CLEAR, cross, metric::ICON_SMALL, quiet);
+        }
     }
 
     fn choice(&self, rect: Rect, picked: &str, state: State) {
@@ -630,6 +710,26 @@ impl Painter<'_> {
         self.canvas.text(shown, inner, TextStyle::Body, color, LINE);
     }
 
+    /// The text of a field of more than one line: wrapped, from the top,
+    /// where the edit control puts its first line, and cut off at the
+    /// bottom of the field.
+    fn field_lines(&self, rect: Rect, text: &str, placeholder: &str, enabled: bool) {
+        let colors = self.colors;
+        let (shown, color) = match (text.is_empty(), enabled) {
+            (true, true) => (placeholder, colors.text_secondary),
+            (true, false) => (placeholder, colors.text_disabled),
+            (false, true) => (text, colors.text),
+            (false, false) => (text, colors.text_disabled),
+        };
+        let line = self.canvas.fonts().text("", TextStyle::Body, f32::MAX).h;
+        let top = ((metric::CONTROL - line) / 2.0).max(0.0);
+        let inner = rect.inset_xy(metric::FIELD_PAD, top);
+        self.canvas.clip(inner);
+        self.canvas
+            .text(shown, inner, TextStyle::Body, color, TextBox::default());
+        self.canvas.unclip();
+    }
+
     fn nav(&self, rect: Rect, label: &str, glyph: char, selected: bool, state: State) {
         let colors = self.colors;
         let fill = if selected {
@@ -692,14 +792,17 @@ impl Painter<'_> {
             return;
         }
         let body = control.region == Region::Body;
-        let rect = if body {
-            control.rect.moved(0.0, -self.look.scroll)
-        } else {
-            control.rect
-        };
+        let rect = self.look.placed(control);
+        let area = control
+            .pane()
+            .and_then(|pane| self.frame.panes().get(pane))
+            .map(|pane| self.look.pane_rect(pane));
         // Rings go around a control, but inside a row or a pane entry, whose
         // neighbors leave no room outside.
-        let inside = matches!(control.kind, Kind::Row { .. } | Kind::Nav { .. });
+        let inside = matches!(
+            control.kind,
+            Kind::Row { .. } | Kind::Nav { .. } | Kind::Expander { .. }
+        );
         let gap = if inside {
             metric::FOCUS
         } else {
@@ -710,6 +813,9 @@ impl Painter<'_> {
         if body {
             self.canvas.clip(self.frame.viewport);
         }
+        if let Some(area) = area {
+            self.canvas.clip(area);
+        }
         self.canvas
             .stroke(outer, radius, self.colors.focus_outer, metric::FOCUS);
         self.canvas.stroke(
@@ -718,10 +824,22 @@ impl Painter<'_> {
             self.colors.focus_inner,
             metric::LINE,
         );
+        if area.is_some() {
+            self.canvas.unclip();
+        }
         if body {
             self.canvas.unclip();
         }
     }
+}
+
+/// Where `rect` is once it is moved down by `dy`, unless nothing of it is
+/// inside `within` then: what is out of sight is not painted.
+fn in_sight(rect: Rect, dy: f32, within: Option<Rect>) -> Option<Rect> {
+    let rect = rect.moved(0.0, dy);
+    within
+        .is_none_or(|within| rect.touches(within))
+        .then_some(rect)
 }
 
 /// One line in the middle of its rectangle, cut off if it is too long.

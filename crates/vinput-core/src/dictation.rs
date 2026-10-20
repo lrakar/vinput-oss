@@ -1,39 +1,40 @@
 //! Runs sessions: each one captures the microphone and either streams it to
 //! the recognizer and types the result or hands it on, or records it as a voice
 //! memo, on its own thread.
+//!
+//! What was recognized may be tidied by a language model before it is typed
+//! ([`crate::rewrite`]), in the way the settings name for the key that
+//! started the session. And a session can be an instruction instead of a
+//! text ([`Target::Command`]): what is selected in the focused window is
+//! taken when the key goes down, what is said is carried out on it, and the
+//! result is put in its place ([`command`]).
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, Scope};
+use std::time::{Duration, Instant};
 
-use crate::audio::{
-    ArmedMicrophone, AudioSource, LevelMeter, Metered, SAMPLE_RATE_HZ, StopHandle, UntilQuiet,
-};
+use crate::audio::{ArmedMicrophone, AudioSource, LevelMeter, Metered, StopHandle, UntilQuiet};
+use crate::inject::live::erasable;
 use crate::inject::{SendInputSink, TextSink};
-use crate::session::{Controller, Ended, Failure, Outcome, Target};
+use crate::rewrite::shown::{put_over_selection, type_tidied};
+use crate::rewrite::{self, Job, Kind, Mode, Rewriter};
+use crate::session::{Controller, Ended, Failure, Outcome, Said, Target, Told, TypingEnter};
 use crate::settings::{Settings, SpeechConfig};
 use crate::sound::{self, Cue};
-use crate::stt::{
-    self, Emit, ProviderKind, SessionOptions, SpeechProvider, Transcriber, Transcript,
-};
+use crate::stt::deferred::{Deferred, MAX_WAITING_SAMPLES, Session};
+use crate::stt::{self, ProviderKind, SessionOptions, SpeechProvider};
+use crate::words::{self, Rules, Shaped};
 use crate::{Error, Result, log, memo, pipeline};
 
-/// The most audio that is kept for a recognizer that is not there yet: one
-/// minute, which is 2 MB. The largest local model loads in a few seconds; a
-/// recognizer that takes longer than this has something wrong with it, and
-/// the session is not allowed to grow without end while it waits.
-const MAX_WAITING_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 60;
-/// How much of the kept audio a recognizer is handed at a time, once it is
-/// there: 100 ms, the most it is ever handed while listening.
-const REPLAY_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 10;
-
 /// A running session: the switch that ends it, whether it was called off,
-/// and whether its thread has left behind everything it is going to.
+/// whether the user pressed Enter while it listened, and whether its thread
+/// has left behind everything it is going to.
 struct Active {
     stop: StopHandle,
     cancelled: Arc<AtomicBool>,
+    entered: Arc<AtomicBool>,
     ended: Arc<AtomicBool>,
 }
 
@@ -114,12 +115,47 @@ struct Options {
     memo_to_clipboard: bool,
     /// Whether words are typed while the recognizer may still change them.
     live: bool,
+    /// Told around every Enter a session types.
+    typing_enter: Option<TypingEnter>,
+    /// Where a dictation leaves what it has typed so far, for programs
+    /// connected to the local API. `None` unless the settings let them read
+    /// it.
+    said: Option<Arc<Transcripts>>,
+    /// What the recognized text is put into the user's own words with: the
+    /// dictionary, the snippets and spoken formatting. `None` if there is
+    /// nothing of them.
+    rules: Option<Arc<Rules>>,
+    /// The same for a dictation that a model tidies, and for an instruction
+    /// to the key that edits: what is put right before the model is given
+    /// the text (the dictionary and spoken formatting), and what after it has
+    /// written it (the snippets, which it would otherwise rewrite).
+    around_a_model: (Option<Arc<Rules>>, Option<Arc<Rules>>),
+    /// What is done with a dictation before it is typed: of the key that
+    /// types, and of the one that types and presses Enter.
+    cleanup: (Mode, Mode),
+    /// What is done with the dictation of each action of the user's own
+    /// before it is handed over, in the order of the settings.
+    action_cleanup: Vec<Mode>,
+    /// The model that tidies and edits.
+    rewriter: Arc<dyn Rewriter>,
 }
 
 impl Options {
-    fn of(settings: &Settings, microphone: Arc<ArmedMicrophone>, held: Arc<AtomicBool>) -> Self {
+    fn of(
+        settings: &Settings,
+        microphone: Arc<ArmedMicrophone>,
+        held: Arc<AtomicBool>,
+        rewriter: Arc<dyn Rewriter>,
+    ) -> Self {
         Self {
             held,
+            cleanup: (settings.cleanup, settings.cleanup_enter),
+            action_cleanup: settings
+                .actions
+                .iter()
+                .map(|action| action.cleanup)
+                .collect(),
+            rewriter,
             languages: settings.languages.clone(),
             start_sound: settings.ready_sound,
             stop_sound: settings.stop_sound,
@@ -128,7 +164,52 @@ impl Options {
             memo_dir: settings.memo_dir.clone(),
             memo_to_clipboard: settings.memo_to_clipboard,
             live: settings.live_typing,
+            typing_enter: None,
+            said: None,
+            rules: Rules::of(&settings.words),
+            around_a_model: Rules::around_a_model(&settings.words),
         }
+    }
+
+    /// What a model is asked to make of a dictation to `target` before it
+    /// is typed or handed to an action; `None` for one that is used as it
+    /// is said, and for every other session.
+    fn tidying(&self, target: Target) -> Option<Kind> {
+        match target {
+            Target::Focused => self.cleanup.0.kind(),
+            Target::FocusedEnter => self.cleanup.1.kind(),
+            Target::Action(slot) => self
+                .action_cleanup
+                .get(usize::from(slot))
+                .and_then(|mode| mode.kind()),
+            _ => None,
+        }
+    }
+
+    /// Whether a session to `target` will ask the model anything.
+    fn rewrites(&self, target: Target) -> bool {
+        target == Target::Command || self.tidying(target).is_some()
+    }
+}
+
+/// The part of the settings that decides which model rewrites and where it
+/// runs. When it changes, the model is chosen again.
+type RewriteConfig = (String, bool);
+
+fn rewrite_config(settings: &Settings) -> RewriteConfig {
+    (settings.text_model.clone(), settings.use_gpu())
+}
+
+/// Has the model that rewrites ready if the settings ask for anything to
+/// be rewritten, and lets go of the one on this PC if they no longer ask
+/// for it.
+fn ready_to_rewrite(settings: &Settings, rewriter: &dyn Rewriter) {
+    let in_use = rewrite::in_use(settings);
+    if in_use {
+        rewriter.make_ready();
+    }
+    if !in_use || rewrite::uses_pro(settings) {
+        rewrite::local::engine().end();
     }
 }
 
@@ -137,6 +218,8 @@ pub struct Dictation {
     speech: Arc<dyn SpeechProvider>,
     /// What `speech` was set up from, to notice when it has to be set up again.
     speech_config: SpeechConfig,
+    /// What the model that rewrites was chosen from.
+    rewrite_config: RewriteConfig,
     options: Options,
     meter: LevelMeter,
     /// Where failed sessions leave their errors for the host to show, each
@@ -145,6 +228,8 @@ pub struct Dictation {
     failures: Arc<Mutex<Vec<Failure>>>,
     /// Where finished sessions leave what the host has to pass on.
     outcomes: Arc<Mutex<Vec<Outcome>>>,
+    /// Where dictations leave what they have typed so far.
+    said: Arc<Transcripts>,
     active: Option<Active>,
     /// Stopped sessions that may still be flushing or saving: for each, the
     /// switch that calls it off and whether it has ended.
@@ -168,13 +253,22 @@ impl Dictation {
     #[must_use]
     pub fn new(settings: &Settings) -> Self {
         let microphone = Arc::new(ArmedMicrophone::new(&settings.microphone));
+        let said = Arc::<Transcripts>::default();
+        words::listen_for(settings.words.terms());
+        let rewriter = rewrite::connect(settings);
+        ready_to_rewrite(settings, rewriter.as_ref());
         Self {
             speech: stt::connect_in_background(settings),
             speech_config: settings.speech_config(),
-            options: Options::of(settings, microphone, Arc::default()),
+            rewrite_config: rewrite_config(settings),
+            options: Options {
+                said: said_for(settings, &said),
+                ..Options::of(settings, microphone, Arc::default(), rewriter)
+            },
             meter: LevelMeter::new(),
             failures: Arc::default(),
             outcomes: Arc::default(),
+            said,
             active: None,
             finishing: Vec::new(),
             notify: None,
@@ -196,6 +290,10 @@ impl Controller for Dictation {
         } else if self.options.stop_sound {
             sound::warm();
         }
+        // The model that rewrites is made ready while the user speaks.
+        if self.options.rewrites(target) {
+            self.options.rewriter.make_ready();
+        }
         let stop = StopHandle::new();
         let speech = Arc::clone(&self.speech);
         let options = self.options.clone();
@@ -206,6 +304,8 @@ impl Controller for Dictation {
         let ended = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let called_off = Arc::clone(&cancelled);
+        let entered = Arc::new(AtomicBool::new(false));
+        let pressed = Arc::clone(&entered);
         let closing = Closing {
             outcomes,
             failures,
@@ -224,7 +324,7 @@ impl Controller for Dictation {
                     meter.clone(),
                     target,
                     id.clone(),
-                    &called_off,
+                    (&called_off, &pressed),
                 );
                 meter.reset();
                 closing.with(if called_off.load(Ordering::Acquire) {
@@ -238,6 +338,7 @@ impl Controller for Dictation {
                 self.active = Some(Active {
                     stop,
                     cancelled,
+                    entered,
                     ended,
                 });
             }
@@ -267,6 +368,12 @@ impl Controller for Dictation {
             self.finishing
                 .retain(|(_, ended)| !ended.load(Ordering::Acquire));
             self.finishing.push((active.cancelled, active.ended));
+        }
+    }
+
+    fn enter(&mut self) {
+        if let Some(active) = &self.active {
+            active.entered.store(true, Ordering::Release);
         }
     }
 
@@ -305,6 +412,10 @@ impl Controller for Dictation {
         self.notify = Some(notify);
     }
 
+    fn on_typing_enter(&mut self, around: TypingEnter) {
+        self.options.typing_enter = Some(around);
+    }
+
     fn level(&self) -> f32 {
         self.meter.level()
     }
@@ -317,11 +428,36 @@ impl Controller for Dictation {
         std::mem::take(&mut *self.outcomes.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
+    fn take_said(&mut self) -> Vec<Said> {
+        // A dictation that started while programs were let read what is
+        // typed goes on leaving it here after they no longer are. It is
+        // let fall: nothing is passed on from the moment the user says so.
+        if self.options.said.is_some() {
+            self.said.take_due(Instant::now())
+        } else {
+            self.said.take();
+            Vec::new()
+        }
+    }
+
     fn configure(&mut self, settings: &Settings, reconnect: bool) {
         let microphone = Arc::clone(&self.options.microphone);
         microphone.set_microphone(&settings.microphone);
         let held = Arc::clone(&self.options.held);
-        self.options = Options::of(settings, microphone, held);
+        let config = rewrite_config(settings);
+        let rewriter = if config == self.rewrite_config {
+            Arc::clone(&self.options.rewriter)
+        } else {
+            rewrite::connect(settings)
+        };
+        self.rewrite_config = config;
+        ready_to_rewrite(settings, rewriter.as_ref());
+        let typing_enter = self.options.typing_enter.take();
+        self.options = Options::of(settings, microphone, held, rewriter);
+        self.options.typing_enter = typing_enter;
+        self.options.said = said_for(settings, &self.said);
+        // The dictation that starts next asks for the words as they are now.
+        words::listen_for(settings.words.terms());
         let speech_config = settings.speech_config();
         if reconnect || speech_config != self.speech_config {
             // Sessions still running keep the provider they started with.
@@ -357,6 +493,19 @@ impl<S: TextSink> TextSink for Counting<S> {
     fn disturbed(&mut self) -> bool {
         self.sink.disturbed()
     }
+
+    fn paste(&mut self, text: &str) -> Result<bool> {
+        let pasted = self.sink.paste(text)?;
+        if pasted {
+            self.typed += text.trim().len();
+        }
+        Ok(pasted)
+    }
+
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        self.typed += text.trim().len();
+        self.sink.type_lines(text)
+    }
 }
 
 /// Passes text on to the real sink until the session is called off, and
@@ -391,6 +540,220 @@ impl<S: TextSink> TextSink for UnlessCancelled<'_, S> {
     fn disturbed(&mut self) -> bool {
         self.sink.disturbed()
     }
+
+    /// Said to be done, so that nothing is typed in its place.
+    fn paste(&mut self, text: &str) -> Result<bool> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        self.sink.paste(text)
+    }
+
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.sink.type_lines(text)
+    }
+}
+
+/// Says so around every Enter that is typed, to whoever keeps that key from
+/// other programs while a dictation listens: an Enter typed here is a key
+/// press like the user's own, and would be kept from the program it is for.
+struct Announcing<S> {
+    sink: S,
+    enter: Option<TypingEnter>,
+}
+
+impl<S: TextSink> TextSink for Announcing<S> {
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        self.rewrite(0, text)
+    }
+
+    fn rewrites(&self) -> bool {
+        self.sink.rewrites()
+    }
+
+    fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+        let enter = self
+            .enter
+            .as_ref()
+            .filter(|_| text.bytes().any(|byte| matches!(byte, b'\n' | b'\r')));
+        if let Some(enter) = enter {
+            enter(true);
+        }
+        let typed = self.sink.rewrite(erase, text);
+        if let Some(enter) = enter {
+            enter(false);
+        }
+        typed
+    }
+
+    fn disturbed(&mut self) -> bool {
+        self.sink.disturbed()
+    }
+
+    /// Pasting presses no Enter.
+    fn paste(&mut self, text: &str) -> Result<bool> {
+        self.sink.paste(text)
+    }
+
+    /// Nor does a line break that sends nothing.
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        self.sink.type_lines(text)
+    }
+}
+
+/// Where dictations leave what they have typed so far, until it is taken.
+/// Only the latest of each dictation is kept: what it typed before is in it.
+#[derive(Default)]
+struct Transcripts {
+    /// How many dictations have been given a number.
+    sessions: AtomicU64,
+    waiting: Mutex<Vec<Said>>,
+    /// When what waited was last handed on.
+    handed_on: Mutex<Option<Instant>>,
+}
+
+/// How long what is typed waits before it is handed on again while a
+/// dictation goes on. Words that are typed as they are said change many
+/// times a second; a program that shows them does not need each letter, and
+/// one that is slow to read must not lose other events for them.
+const SAID_EVERY: Duration = Duration::from_millis(100);
+
+impl Transcripts {
+    /// The number of the dictation that starts now.
+    fn next_session(&self) -> u64 {
+        self.sessions.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn leave(&self, said: Said) {
+        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        match waiting.iter_mut().find(|left| left.session == said.session) {
+            Some(left) => *left = said,
+            None => waiting.push(said),
+        }
+    }
+
+    fn take(&self) -> Vec<Said> {
+        std::mem::take(&mut *self.waiting.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Takes what waits if it is time to at `now`: [`SAID_EVERY`] has passed
+    /// since something was last taken, or a dictation has ended, which is
+    /// said at once.
+    fn take_due(&self, now: Instant) -> Vec<Said> {
+        let mut handed_on = (self.handed_on.lock()).unwrap_or_else(PoisonError::into_inner);
+        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        let soon = handed_on.is_some_and(|then| now.saturating_duration_since(then) < SAID_EVERY);
+        if waiting.is_empty() || (soon && !waiting.iter().any(|said| said.last)) {
+            return Vec::new();
+        }
+        *handed_on = Some(now);
+        std::mem::take(&mut *waiting)
+    }
+}
+
+/// Where dictations leave what they type, if the settings let programs
+/// connected to the local API read it.
+fn said_for(settings: &Settings, said: &Arc<Transcripts>) -> Option<Arc<Transcripts>> {
+    (settings.api_enabled && settings.api_transcript).then(|| Arc::clone(said))
+}
+
+/// Keeps what passes through to the real sink, and leaves all of it where
+/// the host finds it: each time it changes, and once more, marked as the
+/// last, when the dictation is over. It sits right above the real sink, so
+/// what it keeps is what was typed, in the user's own words, and nothing
+/// that was let fall on the way. Without `said` it keeps nothing.
+struct Telling<S> {
+    sink: S,
+    typed: String,
+    /// Where it is left, and the number of this dictation there.
+    said: Option<(Arc<Transcripts>, u64)>,
+    target: Target,
+    id: Option<String>,
+}
+
+impl<S> Telling<S> {
+    fn new(sink: S, said: Option<&Arc<Transcripts>>, target: Target, id: Option<String>) -> Self {
+        Self {
+            sink,
+            typed: String::new(),
+            said: said.map(|said| (Arc::clone(said), said.next_session())),
+            target,
+            id,
+        }
+    }
+
+    /// `text` was put at the caret, after what was there.
+    fn told(&mut self, text: &str) {
+        if self.said.is_some() {
+            self.typed.push_str(text);
+            self.leave(false);
+        }
+    }
+
+    fn leave(&self, last: bool) {
+        if let Some((said, session)) = &self.said {
+            said.leave(Said {
+                session: *session,
+                target: self.target,
+                id: self.id.clone(),
+                text: self.typed.clone(),
+                last,
+            });
+        }
+    }
+}
+
+impl<S: TextSink> TextSink for Telling<S> {
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        self.rewrite(0, text)
+    }
+
+    fn rewrites(&self) -> bool {
+        self.sink.rewrites()
+    }
+
+    fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+        self.sink.rewrite(erase, text)?;
+        if self.said.is_some() {
+            for _ in 0..erase {
+                self.typed.pop();
+            }
+            self.told(text);
+        }
+        Ok(())
+    }
+
+    fn disturbed(&mut self) -> bool {
+        self.sink.disturbed()
+    }
+
+    fn paste(&mut self, text: &str) -> Result<bool> {
+        let pasted = self.sink.paste(text)?;
+        if pasted {
+            self.told(text);
+        }
+        Ok(pasted)
+    }
+
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        self.sink.type_lines(text)?;
+        self.told(text);
+        Ok(())
+    }
+}
+
+/// The dictation is over, however it ended. One that types where the caret
+/// is says so even if it typed nothing, so that whoever shows its text
+/// knows to stop; a search or a captured dictation only if it came to type.
+impl<S> Drop for Telling<S> {
+    fn drop(&mut self) {
+        if self.target.types_at_caret() || !self.typed.is_empty() {
+            self.leave(true);
+        }
+    }
 }
 
 /// What a session that was called off leaves behind: nothing, except for
@@ -424,7 +787,7 @@ fn run_session(
     meter: LevelMeter,
     target: Target,
     id: Option<String>,
-    cancelled: &AtomicBool,
+    (cancelled, entered): (&AtomicBool, &AtomicBool),
 ) -> Result<Option<Outcome>> {
     if target == Target::Memo {
         return record_memo(options, stop, meter, id, cancelled);
@@ -435,19 +798,208 @@ fn run_session(
         Ok(while_spoken_to(microphone, options, stop, &alone))
     };
     let sink = UnlessCancelled {
-        sink: SendInputSink::new(),
+        sink: typing_into(SendInputSink::new(), options, target, id.clone()),
         cancelled,
     };
-    // Only VinPUT Pro makes guesses that are meant to be typed.
-    let live = options.live && speech.kind() == ProviderKind::Cloud;
+    let tidying = options.tidying(target);
+    let rules = if tidying.is_some() || target == Target::Command {
+        options.around_a_model.0.clone()
+    } else {
+        options.rules.clone()
+    };
+    let speech = &InOwnWords { speech, rules };
+    if target == Target::Command {
+        let told = command(
+            speech,
+            &options.languages,
+            microphone,
+            (&Focused, options.rewriter.as_ref()),
+            sink,
+            cancelled,
+        )?;
+        return Ok(told.map(Outcome::Told));
+    }
+    let tidy = tidying.map(|kind| Tidy {
+        rewriter: options.rewriter.as_ref(),
+        kind,
+        snippets: options.around_a_model.1.as_ref(),
+        stop: cancelled,
+    });
+    // Only VinPUT Pro makes guesses that are meant to be typed. A dictation
+    // that is tidied first shows what is said as well, as a preview the
+    // tidied text takes the place of.
+    let typing = Typing {
+        live: options.live && speech.kind() == ProviderKind::Cloud,
+        preview: options.live,
+    };
     dictate(
         speech,
-        (&options.languages, live),
+        (&options.languages, typing),
         microphone,
         (target, id),
-        &alone,
+        (&alone, entered),
         sink,
+        tidy,
     )
+}
+
+/// The sink of a dictation over the real one: what is typed into `sink` is
+/// left for the programs that may read it, and an Enter is said around.
+fn typing_into<S: TextSink>(
+    sink: S,
+    options: &Options,
+    target: Target,
+    id: Option<String>,
+) -> Telling<Announcing<S>> {
+    let sink = Announcing {
+        sink,
+        enter: options.typing_enter.clone(),
+    };
+    Telling::new(sink, options.said.as_ref(), target, id)
+}
+
+/// A provider whose sessions say everything in the user's own words: what
+/// comes back from the recognizer is shaped by `rules` (`words/shape.rs`)
+/// before anything is typed, guessed or handed on.
+struct InOwnWords<'a> {
+    speech: &'a dyn SpeechProvider,
+    rules: Option<Arc<Rules>>,
+}
+
+impl SpeechProvider for InOwnWords<'_> {
+    fn kind(&self) -> ProviderKind {
+        self.speech.kind()
+    }
+
+    fn start_session(&self, options: SessionOptions<'_>) -> Result<Session> {
+        let session = self.speech.start_session(options)?;
+        Ok(match &self.rules {
+            Some(rules) => Box::new(Shaped::new(session, Some(Arc::clone(rules)))),
+            None => session,
+        })
+    }
+}
+
+/// How a dictation is tidied before it is typed.
+struct Tidy<'a> {
+    /// The model that tidies.
+    rewriter: &'a dyn Rewriter,
+    /// What it is asked to make of the dictation.
+    kind: Kind,
+    /// The snippets, which are put in what the model writes.
+    snippets: Option<&'a Arc<Rules>>,
+    /// Set when the session is called off.
+    stop: &'a AtomicBool,
+}
+
+/// The text that is selected in the program the user is in, and the window
+/// that program has in front. Asked of Windows by the real one; made up in
+/// tests.
+trait Selection: Sync {
+    /// The selection as the program says it when asked, which touches
+    /// nothing.
+    fn asked(&self) -> Option<String>;
+    /// The selection, taken by copying it.
+    fn copied(&self) -> Option<String>;
+    /// What tells the window in front from every other.
+    fn window(&self) -> usize;
+}
+
+/// The selection in the window that is in front on this PC.
+struct Focused;
+
+impl Selection for Focused {
+    fn asked(&self) -> Option<String> {
+        putlab_core::selection::asked()
+    }
+
+    fn copied(&self) -> Option<String> {
+        putlab_core::selection::copied()
+    }
+
+    #[allow(unsafe_code)]
+    fn window(&self) -> usize {
+        // SAFETY: a plain call that reads which window is in the foreground.
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() as usize }
+    }
+}
+
+/// What the user is told when a selection was not edited.
+fn unchanged(message: &str, setup: bool) -> Told {
+    Told {
+        title: "Nothing was changed",
+        message: message.to_owned(),
+        setup,
+    }
+}
+
+/// Carries out what `listen` hears on the text that is selected, and puts
+/// the result in its place. Returns what there is to tell the user when
+/// the selection was left as it was.
+///
+/// The selection is asked for the moment the session starts, on a thread
+/// of its own, in the way that touches nothing; only if the program does
+/// not answer is it copied, once the key is let go and the instruction is
+/// there. The result is put in place whole, and not as the model writes
+/// it: a model that fails halfway must not leave half of the user's own
+/// text behind. It is not put anywhere if the user has gone to another
+/// window meanwhile.
+fn command<A: AudioSource>(
+    speech: &dyn SpeechProvider,
+    languages: &[String],
+    listen: impl FnOnce() -> Result<A>,
+    (selection, rewriter): (&dyn Selection, &dyn Rewriter),
+    mut sink: impl TextSink,
+    cancelled: &AtomicBool,
+) -> Result<Option<Told>> {
+    let window = selection.window();
+    let mut said = Collecting::default();
+    let asked = thread::scope(|scope| {
+        let asked = thread::Builder::new()
+            .name("vinput-selection".into())
+            .spawn_scoped(scope, || selection.asked());
+        transcribe(speech, languages, listen, &mut said, false)?;
+        // A program that takes its time to answer is waited for: without
+        // its answer there is nothing to edit.
+        Ok::<_, Error>(asked.ok().and_then(|asked| asked.join().ok()).flatten())
+    })?;
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let instruction = said.text.trim();
+    if instruction.is_empty() {
+        return Ok(Some(unchanged("No instruction was heard.", false)));
+    }
+    let Some(text) = asked.or_else(|| selection.copied()) else {
+        let how = "Select the text first, then hold the key and say what to do with it.";
+        return Ok(Some(unchanged(how, false)));
+    };
+    let job = Job::command(&text, instruction, languages);
+    if job.too_long() {
+        return Ok(Some(unchanged(
+            "The selection is too long to edit in one go.",
+            false,
+        )));
+    }
+    let mut result = String::new();
+    let written = rewriter.rewrite(&job, cancelled, &mut |piece| result.push_str(piece));
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    match written {
+        Ok(()) => {}
+        Err(Error::Setup(why)) => return Ok(Some(unchanged(&why, true))),
+        Err(err) => return Ok(Some(unchanged(&err.to_string(), false))),
+    }
+    if result.trim().is_empty() {
+        return Ok(Some(unchanged("The model wrote nothing.", false)));
+    }
+    if selection.window() != window {
+        let moved = "You moved to another window before the text was ready.";
+        return Ok(Some(unchanged(moved, false)));
+    }
+    put_over_selection(&mut sink, &result)?;
+    Ok(None)
 }
 
 /// Recognizes what `listen` hears and puts the text where `target` says:
@@ -460,21 +1012,52 @@ fn run_session(
 /// the text, and no search is opened. Nothing is lost either: the text is
 /// typed, as that of a plain dictation is. A program that asked for the
 /// text is handed it as always.
+///
+/// `entered` says whether the user pressed Enter to end the dictation. That
+/// key press was kept from the program it was meant for, so that it does not
+/// arrive before the last words do, and is made here in its place: after
+/// the text of any dictation that types, said or not, and once, also where
+/// the dictation would have ended with Enter anyway. A dictation that fails
+/// presses nothing: the words the Enter was meant to follow are not there.
+///
+/// With `tidy`, a dictation that is typed is tidied first. With
+/// `typing.preview`, what is said is typed while the user speaks, as it
+/// would be without cleanup, and when the recognizer is done it is taken
+/// back as the model's version arrives ([`Preview`]); without it nothing is
+/// typed until then. What cannot be tidied is typed as it was said, and the
+/// user is told why.
 fn dictate<A: AudioSource>(
     speech: &dyn SpeechProvider,
-    (languages, live): (&[String], bool),
+    (languages, typing): (&[String], Typing),
     listen: impl FnOnce() -> Result<A>,
     (target, id): (Target, Option<String>),
-    alone: &AtomicBool,
+    (alone, entered): (&AtomicBool, &AtomicBool),
     sink: impl TextSink,
+    tidy: Option<Tidy<'_>>,
 ) -> Result<Option<Outcome>> {
     let mut sink = Counting { sink, typed: 0 };
-    if !matches!(target, Target::Capture | Target::Search) {
-        transcribe(speech, languages, listen, &mut sink, live)?;
-        if target == Target::FocusedEnter && sink.typed > 0 && !alone.load(Ordering::Acquire) {
+    if !matches!(target, Target::Capture | Target::Search | Target::Action(_)) {
+        let told = match tidy {
+            None => {
+                transcribe(speech, languages, listen, &mut sink, typing.live)?;
+                None
+            }
+            Some(tidy) => {
+                let shows = typing.preview && sink.rewrites();
+                let mut preview = Preview::new(&mut sink, shows);
+                transcribe(speech, languages, listen, &mut preview, typing.live)?;
+                let Preview {
+                    said, shown, moved, ..
+                } = preview;
+                tidy_over(&tidy, languages, &said, (shown, moved), &mut sink)?
+            }
+        };
+        let ends_with_enter =
+            target == Target::FocusedEnter && sink.typed > 0 && !alone.load(Ordering::Acquire);
+        if ends_with_enter || entered.load(Ordering::Acquire) {
             sink.type_text("\n")?;
         }
-        return Ok(None);
+        return Ok(told.map(Outcome::Told));
     }
     let mut kept = Collecting::default();
     transcribe(speech, languages, listen, &mut kept, false)?;
@@ -484,12 +1067,234 @@ fn dictate<A: AudioSource>(
         return Ok(Some(Outcome::Captured { text, id }));
     }
     if !alone.load(Ordering::Acquire) {
-        return Ok(Some(Outcome::Search { text }));
+        return Ok(Some(match target {
+            Target::Action(slot) => handed_over(slot, text, languages, tidy)?,
+            _ => Outcome::Search { text },
+        }));
     }
     if !text.is_empty() {
         sink.type_text(&text)?;
     }
     Ok(None)
+}
+
+/// How a dictation is typed while the user speaks.
+#[derive(Debug, Clone, Copy)]
+struct Typing {
+    /// Whether the recognizer's guesses are typed as well as what it
+    /// settles.
+    live: bool,
+    /// Whether a dictation that is tidied first shows what is said while
+    /// the user speaks.
+    preview: bool,
+}
+
+/// What the user is told when the words on the screen could not be swapped
+/// for the tidied ones.
+const LEFT_AS_SAID: &str = "The caret moved while you spoke, so what you said was left as it is.";
+
+/// Types what was `said` into `sink` tidied, in place of the `shown`
+/// characters of it that are on the screen already ([`Preview`]). Where
+/// the caret has `moved` from them, or they can no longer be taken back, they stand as they are, and the user
+/// is told so: typing the tidied text after them would say it all twice.
+fn tidy_over(
+    tidy: &Tidy<'_>,
+    languages: &[String],
+    said: &str,
+    (shown, moved): (usize, bool),
+    sink: &mut impl TextSink,
+) -> Result<Option<Told>> {
+    if shown > 0 && (moved || !sink.rewrites() || sink.disturbed()) {
+        return Ok(Some(Told {
+            title: "Typed as you said it",
+            message: LEFT_AS_SAID.to_owned(),
+            setup: false,
+        }));
+    }
+    let mut sink = Replacing { sink, shown };
+    let text = said.trim();
+    if text.is_empty() {
+        sink.take_back()?;
+        return Ok(None);
+    }
+    let job = Job::tidy(tidy.kind, text, languages);
+    let told = type_tidied(
+        tidy.rewriter,
+        &job,
+        said,
+        tidy.snippets,
+        &mut sink,
+        tidy.stop,
+    )?;
+    Ok(told)
+}
+
+/// What is said while a dictation that is tidied first listens: kept for
+/// the model, and with `shows`, typed at the caret meanwhile, so the user
+/// sees their words as they speak.
+///
+/// What is typed is only ever text that one Backspace a character takes
+/// back ([`erasable`]): a line break or a tab is typed as a space, and
+/// what cannot be taken back is left out. A line break typed would be the
+/// Enter key, which sends a message before it was tidied. The recognizer's
+/// guesses are typed and taken back here as they would be without cleanup
+/// (`inject/live.rs`), and so is what is kept for the model.
+struct Preview<'a, S> {
+    sink: &'a mut S,
+    shows: bool,
+    /// Everything the recognizer has said, guesses taken back included, as
+    /// it would have been typed.
+    said: String,
+    /// How many characters of it are on the screen.
+    shown: usize,
+    /// Whether the caret was seen to move away from them.
+    moved: bool,
+}
+
+impl<'a, S: TextSink> Preview<'a, S> {
+    fn new(sink: &'a mut S, shows: bool) -> Self {
+        Self {
+            sink,
+            shows,
+            said: String::new(),
+            shown: 0,
+            moved: false,
+        }
+    }
+}
+
+/// What of `text` a preview puts on the screen.
+fn previewed(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            c if c.is_whitespace() => Some(' '),
+            c if erasable(c) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+impl<S: TextSink> TextSink for Preview<'_, S> {
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        self.rewrite(0, text)
+    }
+
+    fn rewrites(&self) -> bool {
+        self.shows && self.sink.rewrites()
+    }
+
+    fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+        // Taken back from what was said: the last `erase` characters, of
+        // which those that were shown are taken back from the screen.
+        let at = match erase {
+            0 => self.said.len(),
+            erase => self
+                .said
+                .char_indices()
+                .rev()
+                .nth(erase - 1)
+                .map_or(0, |(at, _)| at),
+        };
+        let unsaid = previewed(&self.said[at..]).chars().count();
+        self.said.truncate(at);
+        self.said.push_str(text);
+        if !self.shows {
+            return Ok(());
+        }
+        // Once the caret has moved, what was shown stays where it is.
+        self.moved |= self.sink.disturbed();
+        let shown = previewed(text);
+        self.shown = self.shown.saturating_sub(unsaid) + shown.chars().count();
+        self.sink.rewrite(unsaid, &shown)
+    }
+
+    fn disturbed(&mut self) -> bool {
+        self.shows && self.sink.disturbed()
+    }
+}
+
+/// The real sink, while what a [`Preview`] showed is still on the screen:
+/// the first thing that is put there takes its place.
+struct Replacing<'a, S> {
+    sink: &'a mut S,
+    /// How many characters the preview left on the screen.
+    shown: usize,
+}
+
+impl<S: TextSink> Replacing<'_, S> {
+    /// Takes back what the preview showed, if that is still to be done.
+    fn take_back(&mut self) -> Result<()> {
+        let shown = std::mem::take(&mut self.shown);
+        if shown > 0 {
+            self.sink.rewrite(shown, "")?;
+        }
+        Ok(())
+    }
+}
+
+impl<S: TextSink> TextSink for Replacing<'_, S> {
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        match std::mem::take(&mut self.shown) {
+            0 => self.sink.type_text(text),
+            shown => self.sink.rewrite(shown, text),
+        }
+    }
+
+    fn rewrites(&self) -> bool {
+        self.sink.rewrites()
+    }
+
+    fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+        let shown = std::mem::take(&mut self.shown);
+        self.sink.rewrite(erase + shown, text)
+    }
+
+    fn paste(&mut self, text: &str) -> Result<bool> {
+        self.take_back()?;
+        self.sink.paste(text)
+    }
+
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        self.take_back()?;
+        self.sink.type_lines(text)
+    }
+
+    fn disturbed(&mut self) -> bool {
+        self.sink.disturbed()
+    }
+}
+
+/// What a dictation for the action at `slot` hands over: `text`, tidied
+/// first when `tidy` says so. What cannot be tidied is handed over as it
+/// was said, and the user is told why.
+fn handed_over(
+    slot: u8,
+    text: String,
+    languages: &[String],
+    tidy: Option<Tidy<'_>>,
+) -> Result<Outcome> {
+    let Some(tidy) = tidy.filter(|_| !text.is_empty()) else {
+        return Ok(Outcome::Action {
+            slot,
+            text,
+            told: None,
+        });
+    };
+    let job = Job::tidy(tidy.kind, &text, languages);
+    let mut tidied = Collecting::default();
+    let told = type_tidied(
+        tidy.rewriter,
+        &job,
+        &text,
+        tidy.snippets,
+        &mut tidied,
+        tidy.stop,
+    )?;
+    Ok(Outcome::Action {
+        slot,
+        text: tidied.text.trim().to_owned(),
+        told,
+    })
 }
 
 /// Starts the microphone. It is live from here on, whatever the recognizer
@@ -555,7 +1360,7 @@ fn transcribe<A: AudioSource>(
     live: bool,
 ) -> Result<()> {
     thread::scope(|scope| {
-        let mut session = Deferred::start(scope, speech, languages);
+        let mut session = ask(scope, speech, languages);
         // Dropped on every way out of here, which lets go of the microphone.
         let mut microphone = listen()?;
         session.session(false)?;
@@ -567,132 +1372,33 @@ fn transcribe<A: AudioSource>(
     })
 }
 
-/// A recognizer session of the provider.
-type Session = Box<dyn Transcriber + Send>;
-
-/// A session that may not be there yet. Audio fed to it before it arrives is
-/// kept, and handed over first and in order when it does.
-struct Deferred {
-    /// Where the session, or the reason there is none, arrives.
-    arriving: Receiver<Result<Session>>,
-    session: Option<Session>,
-    /// What was heard before the session arrived.
-    waiting: Vec<i16>,
-    /// The most that `waiting` may hold.
-    limit: usize,
-    /// Whether audio had to be left out of `waiting`.
-    overflowed: bool,
-    /// Transcripts the session has produced that have not been passed on:
-    /// handing over what was kept can produce several at once.
-    ready: VecDeque<Transcript>,
-}
-
-impl Deferred {
-    /// Asks `speech` for a session on a thread of its own and returns at once.
-    fn start<'scope>(
-        scope: &'scope Scope<'scope, '_>,
-        speech: &'scope dyn SpeechProvider,
-        languages: &'scope [String],
-    ) -> Self {
-        let (arrived, arriving) = mpsc::channel();
-        let fallback = arrived.clone();
-        let asked = thread::Builder::new()
-            .name("vinput-recognizer".into())
-            .spawn_scoped(scope, move || {
-                let _ = arrived.send(speech.start_session(SessionOptions { languages }));
-            });
-        if asked.is_err() {
-            // Without a thread to wait on, wait here, as sessions used to.
-            let _ = fallback.send(speech.start_session(SessionOptions { languages }));
-        }
-        Self::awaiting(arriving, MAX_WAITING_SAMPLES)
+/// Asks `speech` for a session on a thread of its own and returns at once
+/// with the session that is still to come.
+fn ask<'scope>(
+    scope: &'scope Scope<'scope, '_>,
+    speech: &'scope dyn SpeechProvider,
+    languages: &'scope [String],
+) -> Deferred {
+    let (arrived, arriving) = mpsc::channel();
+    let fallback = arrived.clone();
+    let asked = thread::Builder::new()
+        .name("vinput-recognizer".into())
+        .spawn_scoped(scope, move || {
+            let _ = arrived.send(speech.start_session(SessionOptions { languages }));
+        });
+    if asked.is_err() {
+        // Without a thread to wait on, wait here, as sessions used to.
+        let _ = fallback.send(speech.start_session(SessionOptions { languages }));
     }
-
-    fn awaiting(arriving: Receiver<Result<Session>>, limit: usize) -> Self {
-        Self {
-            arriving,
-            session: None,
-            waiting: Vec::new(),
-            limit,
-            overflowed: false,
-            ready: VecDeque::new(),
-        }
-    }
-
-    /// The session, if it has arrived; with `wait`, once it has. On arrival
-    /// it is handed everything that was kept for it.
-    fn session(&mut self, wait: bool) -> Result<Option<&mut Session>> {
-        if self.session.is_none() {
-            let gone = || Error::Transcription("the speech provider gave no answer".into());
-            let arrived = if wait {
-                self.arriving.recv().map_err(|_| gone())?
-            } else {
-                match self.arriving.try_recv() {
-                    Ok(arrived) => arrived,
-                    Err(TryRecvError::Empty) => return Ok(None),
-                    Err(TryRecvError::Disconnected) => return Err(gone()),
-                }
-            };
-            let mut session = arrived?;
-            for chunk in std::mem::take(&mut self.waiting).chunks(REPLAY_SAMPLES) {
-                self.ready.extend(session.feed(chunk)?);
-            }
-            self.session = Some(session);
-        }
-        Ok(self.session.as_mut())
-    }
-
-    /// Keeps audio for the session that is still to come, up to the limit.
-    fn keep(&mut self, pcm: &[i16]) {
-        let room = self.limit.saturating_sub(self.waiting.len());
-        self.waiting.extend_from_slice(&pcm[..pcm.len().min(room)]);
-        if pcm.len() > room && !self.overflowed {
-            self.overflowed = true;
-            log::write(
-                "the speech provider is taking too long to start; what is said from here on is lost",
-            );
-        }
-    }
-}
-
-impl Transcriber for Deferred {
-    fn feed(&mut self, pcm: &[i16]) -> Result<Option<Transcript>> {
-        match self.session(false)? {
-            Some(session) => {
-                let transcript = session.feed(pcm)?;
-                self.ready.extend(transcript);
-            }
-            None => self.keep(pcm),
-        }
-        Ok(self.ready.pop_front())
-    }
-
-    /// Waits for the session if it is still not there: the microphone has
-    /// stopped by now, and what was said is recognized however late.
-    ///
-    /// The wait has no limit of its own. It ends when the provider answers,
-    /// so it is as bounded as `start_session` of every provider is, and each
-    /// of them gives up on a service or an engine that does not come up.
-    fn finish(&mut self, emit: &mut Emit<'_>) -> Result<()> {
-        self.session(true)?;
-        for transcript in std::mem::take(&mut self.ready) {
-            emit(transcript)?;
-        }
-        match self.session.as_mut() {
-            Some(session) => session.finish(emit),
-            None => Ok(()),
-        }
-    }
-
-    /// A guess follows the text settled before it, so none is passed on
-    /// while settled text is still waiting to be.
-    fn guess(&mut self) -> Option<String> {
-        let guess = self.session.as_mut()?.guess();
-        guess.filter(|_| self.ready.is_empty())
-    }
+    Deferred::awaiting(arriving, MAX_WAITING_SAMPLES)
 }
 
 /// Records until stopped and saves the recording as an MP3.
+///
+/// A memo is for someone to listen to, not for a recognizer, so the
+/// microphone is opened for it at its own rate rather than the one of
+/// speech ([`ArmedMicrophone::record`]), and the recording goes to disk as
+/// it comes rather than into memory ([`memo::Recording`]).
 fn record_memo(
     options: &Options,
     stop: StopHandle,
@@ -700,23 +1406,25 @@ fn record_memo(
     id: Option<String>,
     cancelled: &AtomicBool,
 ) -> Result<Option<Outcome>> {
-    let mut microphone = listen(options, stop, meter)?;
-    let mut samples = Vec::new();
-    let mut chunk = [0i16; 1600];
-    while samples.len() < memo::MAX_SAMPLES {
+    let microphone = options.microphone.record(stop)?;
+    let mut recording = memo::Recording::new(microphone.rate())?;
+    let mut microphone = Metered::new(microphone, meter);
+    // A tenth of a second at 48 kHz.
+    let mut chunk = [0i16; 4800];
+    while !recording.is_full() {
         let read = microphone.read(&mut chunk)?;
         if read == 0 {
             break;
         }
-        samples.extend_from_slice(&chunk[..read]);
+        recording.push(&chunk[..read])?;
     }
     // The microphone is released before the encoding starts.
     drop(microphone);
     // A memo that was called off is not saved, not even for a moment.
-    if samples.len() < memo::MIN_SAMPLES || cancelled.load(Ordering::Acquire) {
+    if recording.is_too_short() || cancelled.load(Ordering::Acquire) {
         return Ok(None);
     }
-    let saved = memo::save(&samples, &options.memo_dir)?;
+    let saved = recording.save(&options.memo_dir)?;
     let on_clipboard = options.memo_to_clipboard
         && memo::copy_to_clipboard(&saved)
             .map_err(|err| log::write(&err.to_string()))
@@ -736,7 +1444,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::stt::ProviderKind;
+    use crate::rewrite::testing::{Script, Scripted};
+    use crate::stt::deferred::Session;
+    use crate::stt::{Emit, ProviderKind, Transcriber, Transcript};
 
     /// Samples the made-up microphone hears per read: 10 ms, as a real one.
     const PACKET: usize = 160;
@@ -1304,10 +2014,12 @@ mod tests {
         let mut dictation = Dictation {
             speech: Arc::new(Loading::new(false, false)),
             speech_config: settings.speech_config(),
-            options: Options::of(&settings, microphone, Arc::default()),
+            rewrite_config: rewrite_config(&settings),
+            options: Options::of(&settings, microphone, Arc::default(), quiet_model()),
             meter: LevelMeter::new(),
             failures: Arc::default(),
             outcomes: Arc::default(),
+            said: Arc::default(),
             active: None,
             finishing: Vec::new(),
             notify: None,
@@ -1329,6 +2041,7 @@ mod tests {
         dictation.active = Some(Active {
             stop: StopHandle::new(),
             cancelled: Arc::clone(&listening),
+            entered: Arc::default(),
             ended: Arc::clone(&listening_ended),
         });
 
@@ -1346,6 +2059,7 @@ mod tests {
         dictation.active = Some(Active {
             stop: StopHandle::new(),
             cancelled: Arc::clone(&later),
+            entered: Arc::default(),
             ended: later_ended,
         });
         dictation.stop();
@@ -1386,7 +2100,7 @@ mod tests {
             sink: Collecting::default(),
             cancelled: &cancelled,
         };
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         transcribe(&speech, &[], || Ok(microphone), &mut sink, false)?;
         assert!(started.elapsed() < Duration::from_secs(5));
         // The stand-in settled "Hello world." when the audio ended.
@@ -1494,23 +2208,124 @@ mod tests {
         let mut field = Field::default();
         let left = dictate(
             &speech,
-            (&[], true),
+            (&[], LIVE),
             || Ok(spoken()),
             (Target::FocusedEnter, None),
-            &alone,
+            (&alone, &AtomicBool::new(false)),
             Lent(&mut field),
+            None,
         )?;
         assert_eq!((left, field.text.as_str()), (None, "Hello world.\n"));
         let captured = dictate(
             &speech,
-            (&[], true),
+            (&[], LIVE),
             || Ok(spoken()),
             (Target::Capture, None),
-            &alone,
+            (&alone, &AtomicBool::new(false)),
             Field::default(),
+            None,
         )?;
         let text = "Hello world.".to_owned();
         assert_eq!(captured, Some(Outcome::Captured { text, id: None }));
+        Ok(())
+    }
+
+    /// A connection to `VinPUT` Pro that drops in the middle of a dictation
+    /// costs no word: what the server settled stays, its guess at what
+    /// followed is not typed a second time, and the model on this PC
+    /// recognizes everything the settled text did not reach.
+    #[cfg(windows)]
+    #[test]
+    fn a_dictation_whose_connection_drops_is_finished_by_the_model_on_this_pc()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::cloud::fake::{Fake, Script};
+        use crate::stt::CloudSpeech;
+        use crate::stt::standby::tests::{out_of_reach, with_model};
+
+        let fake = Fake::start()?;
+        // The server settles "So far. ", says that this reaches five
+        // milliseconds of the audio, guesses on, and is gone.
+        fake.change(|state| {
+            state.scripts = vec![Script::SettlesThenDrops {
+                reached: Some(5),
+                guessing: true,
+            }];
+        });
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        let (standby, heard) = with_model();
+        let speech = CloudSpeech::connect(account, Arc::clone(&standby))?;
+        // A microphone that is spoken into for a third of a second.
+        let spoken = Counted::new(30, |_| thread::sleep(Duration::from_millis(10))).0;
+
+        let mut field = Field::default();
+        transcribe(&speech, &[], || Ok(spoken), &mut field, true)?;
+        // The made-up model settles "Locally." when the key is let go.
+        assert_eq!(field.text, "So far. Locally.");
+        // It was handed all of it but those five milliseconds.
+        assert_eq!(heard.fed().len(), 30 * PACKET - 80);
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        Ok(())
+    }
+
+    /// The dictionary, the snippets and spoken formatting work on every
+    /// dictation: on the guesses that are typed while the user speaks, on
+    /// what is settled, and on the text a program asked for.
+    #[cfg(windows)]
+    #[test]
+    fn a_dictation_comes_out_in_the_users_own_words()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::cloud::fake::Fake;
+        use crate::stt::CloudSpeech;
+        use crate::words::Words;
+
+        let fake = Fake::start()?;
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        let speech = CloudSpeech::connect(account, Arc::default())?;
+        let mut words = Words::default();
+        assert_eq!(words.add_word("WORLD", ""), Ok(true));
+        assert_eq!(words.add_snippet("hello", "Good day"), Ok(true));
+        let speech = InOwnWords {
+            speech: &speech,
+            rules: Rules::of(&words),
+        };
+        let spoken = || Counted::new(30, |_| thread::sleep(Duration::from_millis(10))).0;
+
+        // The stand-in guesses "hello wor" and settles "Hello world.".
+        let mut field = Field::default();
+        transcribe(&speech, &[], || Ok(spoken()), &mut field, true)?;
+        assert_eq!(field.text, "Good day WORLD.");
+        assert!(
+            field.stood.iter().any(|text| text == "Good day wor"),
+            "{:?}",
+            field.stood
+        );
+
+        let mut field = Field::default();
+        transcribe(&speech, &[], || Ok(spoken()), &mut field, false)?;
+        assert_eq!(field.text, "Good day WORLD.");
+
+        let captured = dictate(
+            &speech,
+            (&[], SETTLED),
+            || Ok(spoken()),
+            (Target::Capture, None),
+            (&AtomicBool::new(false), &AtomicBool::new(false)),
+            Field::default(),
+            None,
+        )?;
+        let text = "Good day WORLD.".to_owned();
+        assert_eq!(captured, Some(Outcome::Captured { text, id: None }));
+
+        // Without any of them a session is the provider's own.
+        let plain = InOwnWords {
+            speech: speech.speech,
+            rules: None,
+        };
+        let mut field = Field::default();
+        transcribe(&plain, &[], || Ok(spoken()), &mut field, false)?;
+        assert_eq!(field.text, "Hello world.");
         Ok(())
     }
 
@@ -1591,7 +2406,12 @@ mod tests {
             ..Settings::default()
         };
         let microphone = Arc::new(ArmedMicrophone::new(&settings.microphone));
-        Options::of(&settings, microphone, Arc::default())
+        Options::of(&settings, microphone, Arc::default(), quiet_model())
+    }
+
+    /// A model that writes nothing, for sessions that ask it nothing.
+    fn quiet_model() -> Arc<dyn Rewriter> {
+        Arc::new(Scripted::writing(&[]))
     }
 
     /// What a dictation to `target`, of which the recognizer makes "end",
@@ -1611,11 +2431,12 @@ mod tests {
         let id = Some("my-42".to_owned());
         let left = dictate(
             &provider,
-            (&[], false),
+            (&[], SETTLED),
             listen,
             (target, id),
-            &alone,
+            (&alone, &AtomicBool::new(false)),
             seen.clone(),
+            None,
         );
         assert!(left.is_ok(), "{left:?}");
         assert_eq!(alone.load(Ordering::Acquire), forgotten);
@@ -1654,15 +2475,230 @@ mod tests {
         assert_eq!(dictated(Target::Capture, true), (vec![], captured));
     }
 
+    /// What a dictation to `target` types and leaves for the host when the
+    /// user ends it with Enter; the recognizer makes "end" of it, or fails.
+    fn ended_with_enter(target: Target, fails: bool) -> (Vec<String>, Result<Option<Outcome>>) {
+        let provider = Loading::new(fails, false);
+        provider.gate.open();
+        // The host has told the session of the Enter and stopped it.
+        let (alone, entered) = (AtomicBool::new(false), AtomicBool::new(true));
+        let stop = StopHandle::new();
+        stop.stop();
+        let seen = Seen::default();
+        let left = dictate(
+            &provider,
+            (&[], SETTLED),
+            || Ok(Still(stop)),
+            (target, None),
+            (&alone, &entered),
+            seen.clone(),
+            None,
+        );
+        let typed = seen
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        (typed, left)
+    }
+
+    #[test]
+    fn enter_that_ends_a_dictation_is_pressed_once_after_its_last_words() {
+        let then_enter = vec!["end".to_owned(), "\n".to_owned()];
+        // A plain dictation: the Enter the user pressed follows the text.
+        let (typed, left) = ended_with_enter(Target::Focused, false);
+        assert_eq!((typed, left.ok()), (then_enter.clone(), Some(None)));
+        // One that ends with Enter anyway: once, not twice.
+        let (typed, left) = ended_with_enter(Target::FocusedEnter, false);
+        assert_eq!((typed, left.ok()), (then_enter, Some(None)));
+        // The kinds that type nothing are not ended with Enter, and would
+        // press none if they were.
+        let (typed, left) = ended_with_enter(Target::Search, false);
+        assert!(typed.is_empty());
+        assert!(matches!(left, Ok(Some(Outcome::Search { .. }))), "{left:?}");
+        let (typed, _) = ended_with_enter(Target::Capture, false);
+        assert!(typed.is_empty());
+        // A dictation that fails presses nothing: the words are not there.
+        for target in [Target::Focused, Target::FocusedEnter] {
+            let (typed, left) = ended_with_enter(target, true);
+            assert!(typed.is_empty() && left.is_err(), "{typed:?} {left:?}");
+        }
+    }
+
+    #[test]
+    fn whoever_holds_enter_is_told_around_each_one_that_is_typed_and_no_other_text() -> Result<()> {
+        // What happened, in order: told that one is coming, typed, told
+        // that it has been.
+        let told = Seen::default();
+        let around: TypingEnter = {
+            let told = told.clone();
+            Arc::new(move |typing| {
+                let _ = told.clone().type_text(if typing { "<" } else { ">" });
+            })
+        };
+        let mut sink = Announcing {
+            sink: told.clone(),
+            enter: Some(around),
+        };
+        sink.type_text("One. ")?;
+        sink.rewrite(0, "Two.")?;
+        sink.type_text("\n")?;
+        sink.rewrite(0, "Three\r\nfour")?;
+        let happened = told
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            happened,
+            ["One. ", "Two.", "<", "\n", ">", "<", "Three\r\nfour", ">"]
+        );
+        // With nobody to tell, text is typed as ever.
+        let mut sink = Announcing {
+            sink: Seen::default(),
+            enter: None,
+        };
+        sink.type_text("\n")?;
+        assert_eq!(sink.sink.0.lock().map(|typed| typed.len()).ok(), Some(1));
+        Ok(())
+    }
+
+    /// Enter ends a dictation with `VinPUT` Pro as the key that started it
+    /// does: the microphone stops, the server is told that the audio is
+    /// over, what it settles takes the place of its guess, one Enter follows
+    /// that, and the stream is closed. So it is with either key.
+    #[cfg(windows)]
+    #[test]
+    fn a_dictation_with_vinput_pro_ended_with_enter_types_its_last_words_and_closes_its_stream()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::cloud::fake::Fake;
+        use crate::stt::CloudSpeech;
+
+        let fake = Fake::start()?;
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        let speech = CloudSpeech::connect(account, Arc::default())?;
+        for (round, target) in [Target::FocusedEnter, Target::Focused]
+            .into_iter()
+            .enumerate()
+        {
+            // Spoken into until Enter is pressed, a quarter of a second in:
+            // the host tells the session of it and stops the microphone.
+            let stop = StopHandle::new();
+            let entered = Arc::new(AtomicBool::new(false));
+            let (pressed, stopped) = (Arc::clone(&entered), stop.clone());
+            let (microphone, released) = Counted::new(1000, move |read| {
+                thread::sleep(Duration::from_millis(10));
+                if read == 25 {
+                    pressed.store(true, Ordering::Release);
+                    stopped.stop();
+                }
+            });
+            let alone = AtomicBool::new(false);
+            let mut field = Field::default();
+            let started = Instant::now();
+            let left = dictate(
+                &speech,
+                (&[], LIVE),
+                || Ok(Stopped(microphone, stop)),
+                (target, None),
+                (&alone, &entered),
+                Lent(&mut field),
+                None,
+            )?;
+            // It did not listen on: nothing like the ten seconds the
+            // microphone had left to hear.
+            assert!(started.elapsed() < Duration::from_secs(5), "{target:?}");
+            assert!(released.load(Ordering::SeqCst), "{target:?}");
+            // The stand-in guesses "hello wor" and settles "Hello world.".
+            assert_eq!((left, field.text.as_str()), (None, "Hello world.\n"));
+            assert_eq!(
+                field
+                    .stood
+                    .iter()
+                    .filter(|text| text.ends_with('\n'))
+                    .count(),
+                1
+            );
+            // The server heard the end of the audio and the stream is gone.
+            assert!(fake.wait(|seen| {
+                seen.len() == round + 1 && seen[round].events.contains(&"closed")
+            }));
+            let events = fake.read(|state| state.streams[round].events.clone());
+            assert!(events.ends_with(&["finish", "closed"]), "{events:?}");
+            // Less than a third of a second of audio went out, not more.
+            let sent = fake.read(|state| state.streams[round].audio.len());
+            assert!(sent <= 30 * PACKET, "{sent}");
+        }
+        Ok(())
+    }
+
+    /// A microphone that has ended once it was stopped, as a real one has.
+    struct Stopped<A>(A, StopHandle);
+
+    impl<A: AudioSource> AudioSource for Stopped<A> {
+        fn read(&mut self, buf: &mut [i16]) -> Result<usize> {
+            if self.1.is_stopped() {
+                return Ok(0);
+            }
+            self.0.read(buf)
+        }
+    }
+
+    /// A dictation with `VinPUT` Pro that is forgotten ends by itself when
+    /// nothing was said for as long as the settings allow, and its stream
+    /// with it: nothing stays open that the account pays for.
+    #[cfg(windows)]
+    #[test]
+    fn a_dictation_with_vinput_pro_that_ends_for_being_quiet_closes_its_stream()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::cloud::fake::Fake;
+        use crate::stt::CloudSpeech;
+
+        let fake = Fake::start()?;
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        let speech = CloudSpeech::connect(account, Arc::default())?;
+        let options = a_minute();
+        let stop = StopHandle::new();
+        let (alone, entered) = (AtomicBool::new(false), AtomicBool::new(false));
+        let listen = || Ok(while_spoken_to(Still(stop.clone()), &options, stop, &alone));
+        let seen = Seen::default();
+        let target = (Target::FocusedEnter, None);
+        let left = dictate(
+            &speech,
+            (&[], SETTLED),
+            listen,
+            target,
+            (&alone, &entered),
+            seen.clone(),
+            None,
+        )?;
+        assert!(alone.load(Ordering::Acquire) && left.is_none());
+        // What was settled is typed, and no Enter with nobody there.
+        let typed = seen
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(typed, ["Hello world."]);
+        assert!(fake.wait(|seen| seen.len() == 1 && seen[0].events.contains(&"closed")));
+        let events = fake.read(|state| state.streams[0].events.clone());
+        assert!(events.ends_with(&["finish", "closed"]), "{events:?}");
+        Ok(())
+    }
+
     #[test]
     fn a_dictation_is_not_ended_for_being_quiet_while_its_key_is_held() {
         let mut dictation = Dictation {
             speech: Arc::new(Loading::new(false, false)),
             speech_config: Settings::default().speech_config(),
+            rewrite_config: rewrite_config(&Settings::default()),
             options: a_minute(),
             meter: LevelMeter::new(),
             failures: Arc::default(),
             outcomes: Arc::default(),
+            said: Arc::default(),
             active: None,
             finishing: Vec::new(),
             notify: None,
@@ -1718,5 +2754,828 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A recognizer that settles on one text when the audio ends.
+    struct Says(&'static str);
+
+    impl SpeechProvider for Says {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Local
+        }
+
+        fn start_session(&self, _: SessionOptions<'_>) -> Result<Session> {
+            Ok(Box::new(Settles(self.0)))
+        }
+    }
+
+    struct Settles(&'static str);
+
+    impl Transcriber for Settles {
+        fn feed(&mut self, _: &[i16]) -> Result<Option<Transcript>> {
+            Ok(None)
+        }
+
+        fn finish(&mut self, emit: &mut Emit<'_>) -> Result<()> {
+            if self.0.is_empty() {
+                return Ok(());
+            }
+            emit(Transcript {
+                text: self.0.to_owned(),
+                is_final: true,
+            })
+        }
+    }
+
+    /// What was sent to the window, one call at a time: which, and with what.
+    type Sent = Vec<(&'static str, String)>;
+
+    /// What a made-up window was sent: `typed`, or `pasted`, and the text.
+    #[derive(Default, Clone)]
+    struct Board(Arc<Mutex<Sent>>);
+
+    impl Board {
+        fn sent(&self) -> Sent {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn note(&self, how: &'static str, text: &str) {
+            let mut sent = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            sent.push((how, text.to_owned()));
+        }
+    }
+
+    impl TextSink for Board {
+        fn type_text(&mut self, text: &str) -> Result<()> {
+            self.note("typed", text);
+            Ok(())
+        }
+
+        fn paste(&mut self, text: &str) -> Result<bool> {
+            self.note("pasted", text);
+            Ok(true)
+        }
+    }
+
+    /// A dictation of which the recognizer makes `said`, tidied by `model`
+    /// on its way to `target`: what was sent to the window, and what is
+    /// left for the host.
+    fn tidied(
+        said: &'static str,
+        model: &Scripted,
+        target: Target,
+    ) -> Result<(Sent, Option<Outcome>)> {
+        let board = Board::default();
+        let cancelled = AtomicBool::new(false);
+        let alone = AtomicBool::new(false);
+        let languages = ["en-US".to_owned()];
+        let left = dictate(
+            &Says(said),
+            (&languages, SETTLED),
+            || Ok(Counted::new(3, |_| {}).0),
+            (target, None),
+            (&alone, &AtomicBool::new(false)),
+            board.clone(),
+            Some(Tidy {
+                rewriter: model,
+                kind: Kind::Clean,
+                snippets: None,
+                stop: &cancelled,
+            }),
+        )?;
+        Ok((board.sent(), left))
+    }
+
+    fn sent(how: &'static str, text: &str) -> (&'static str, String) {
+        (how, text.to_owned())
+    }
+
+    #[test]
+    fn a_dictation_is_tidied_before_it_is_typed_and_enter_follows_the_tidied_text() -> Result<()> {
+        let model = Scripted::writing(&["So we meet ", "at six."]);
+        let (typed, left) = tidied(" um so we meet at six ", &model, Target::Focused)?;
+        assert_eq!(
+            typed,
+            [sent("typed", "So we meet"), sent("typed", " at six.")]
+        );
+        assert_eq!(left, None);
+        // The model was given what was said, without the space around it.
+        assert_eq!(
+            model.asked(),
+            [(
+                Kind::Clean,
+                "um so we meet at six".to_owned(),
+                String::new()
+            )]
+        );
+        let (typed, _) = tidied(
+            "um yes",
+            &Scripted::writing(&["Yes."]),
+            Target::FocusedEnter,
+        )?;
+        assert_eq!(typed, [sent("typed", "Yes."), sent("typed", "\n")]);
+        Ok(())
+    }
+
+    /// Guesses typed as well as settled text, and a preview while tidying.
+    const LIVE: Typing = Typing {
+        live: true,
+        preview: true,
+    };
+    /// Settled text alone, and nothing while tidying.
+    const SETTLED: Typing = Typing {
+        live: false,
+        preview: false,
+    };
+
+    /// A made-up text field that takes text back: what stands in it, and
+    /// each call it was sent.
+    #[derive(Default, Clone)]
+    struct Screen(Arc<Mutex<(String, Sent, bool)>>);
+
+    impl Screen {
+        fn text(&self) -> String {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .0
+                .clone()
+        }
+
+        fn sent(&self) -> Sent {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .1
+                .clone()
+        }
+
+        /// The caret is moved away from what was typed.
+        fn move_caret(&self) {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).2 = true;
+        }
+    }
+
+    impl TextSink for Screen {
+        fn type_text(&mut self, text: &str) -> Result<()> {
+            let mut field = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            field.0.push_str(text);
+            field.1.push(("typed", text.to_owned()));
+            Ok(())
+        }
+
+        fn rewrites(&self) -> bool {
+            true
+        }
+
+        fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
+            let mut field = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            for _ in 0..erase {
+                field.0.pop();
+            }
+            field.0.push_str(text);
+            field.1.push(("erased", format!("{erase}:{text}")));
+            Ok(())
+        }
+
+        fn disturbed(&mut self) -> bool {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).2
+        }
+
+        fn paste(&mut self, text: &str) -> Result<bool> {
+            let mut field = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            field.0.push_str(text);
+            field.1.push(("pasted", text.to_owned()));
+            Ok(true)
+        }
+    }
+
+    /// A dictation of `said` tidied by `model` into `field` with a preview,
+    /// with the caret moved away while the user speaks if `moved`.
+    fn previewed_into(
+        field: &Screen,
+        said: &'static str,
+        model: &Scripted,
+        target: Target,
+        moved: bool,
+    ) -> Result<Option<Outcome>> {
+        let cancelled = AtomicBool::new(false);
+        let languages = ["en-US".to_owned()];
+        let mark = field.clone();
+        dictate(
+            &Says(said),
+            (&languages, LIVE),
+            move || {
+                if moved {
+                    mark.move_caret();
+                }
+                Ok(Counted::new(3, |_| {}).0)
+            },
+            (target, None),
+            (&AtomicBool::new(false), &AtomicBool::new(false)),
+            field.clone(),
+            Some(Tidy {
+                rewriter: model,
+                kind: Kind::Clean,
+                snippets: None,
+                stop: &cancelled,
+            }),
+        )
+    }
+
+    #[test]
+    fn what_is_said_shows_while_it_is_tidied_and_the_tidied_text_takes_its_place() -> Result<()> {
+        let field = Screen::default();
+        let model = Scripted::writing(&["So we meet ", "at six."]);
+        let left = previewed_into(
+            &field,
+            "um so we\nmeet at six",
+            &model,
+            Target::FocusedEnter,
+            false,
+        )?;
+        assert_eq!(left, None);
+        // The line break was shown as a space, not pressed as Enter; the
+        // model's first words took the place of the preview in one go, and
+        // the Enter came after the tidied text.
+        assert_eq!(
+            field.sent(),
+            [
+                sent("erased", "0:um so we meet at six"),
+                sent("erased", "20:So we meet"),
+                sent("typed", " at six."),
+                sent("typed", "\n"),
+            ]
+        );
+        assert_eq!(field.text(), "So we meet at six.\n");
+        // The model was given what was said, line break and all.
+        assert_eq!(model.asked()[0].1, "um so we\nmeet at six");
+        Ok(())
+    }
+
+    #[test]
+    fn a_preview_is_left_as_it_is_once_the_caret_has_moved() -> Result<()> {
+        let field = Screen::default();
+        let model = Scripted::writing(&["So we meet at six."]);
+        let left = previewed_into(
+            &field,
+            "um so we meet at six",
+            &model,
+            Target::Focused,
+            true,
+        )?;
+        assert_eq!(field.text(), "um so we meet at six");
+        assert!(model.asked().is_empty());
+        let Some(Outcome::Told(told)) = left else {
+            return Err(Error::Host(format!("the user is told: {left:?}")));
+        };
+        assert_eq!(told.message, LEFT_AS_SAID);
+        Ok(())
+    }
+
+    #[test]
+    fn a_preview_that_the_model_fails_to_tidy_ends_as_it_was_said() -> Result<()> {
+        let field = Screen::default();
+        let model = Scripted::new(Script::NeedsSetup("Choose a model."));
+        let left = previewed_into(
+            &field,
+            "um so we meet at six",
+            &model,
+            Target::Focused,
+            false,
+        )?;
+        assert_eq!(field.text(), "um so we meet at six");
+        assert!(matches!(left, Some(Outcome::Told(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn the_model_sees_the_users_spelling_and_the_snippets_follow_what_it_wrote() -> Result<()> {
+        let words = words::Words {
+            dictionary: vec![words::Word {
+                word: "VinPUT".to_owned(),
+                sounds_like: "vin put".to_owned(),
+            }],
+            snippets: vec![words::Snippet {
+                trigger: "my email".to_owned(),
+                text: "me@example.com".to_owned(),
+            }],
+            commands: true,
+        };
+        let (before, after) = Rules::around_a_model(&words);
+        let model = Scripted::writing(&["Write to VinPUT at my", " email."]);
+        let board = Board::default();
+        let cancelled = AtomicBool::new(false);
+        let languages = ["en-US".to_owned()];
+        let speech = InOwnWords {
+            speech: &Says("um write to vin put at my email"),
+            rules: before,
+        };
+        dictate(
+            &speech,
+            (&languages, SETTLED),
+            || Ok(Counted::new(3, |_| {}).0),
+            (Target::Focused, None),
+            (&AtomicBool::new(false), &AtomicBool::new(false)),
+            board.clone(),
+            Some(Tidy {
+                rewriter: &model,
+                kind: Kind::Clean,
+                snippets: after.as_ref(),
+                stop: &cancelled,
+            }),
+        )?;
+        // The dictionary has spelled the name, and the snippet is still the
+        // words that were said.
+        assert_eq!(model.asked()[0].1, "um write to VinPUT at my email");
+        let typed: String = board.sent().into_iter().map(|(_, text)| text).collect();
+        assert_eq!(typed, "Write to VinPUT at me@example.com.");
+        Ok(())
+    }
+
+    #[test]
+    fn a_dictation_that_cannot_be_tidied_is_typed_as_said_and_the_host_is_told() -> Result<()> {
+        let model = Scripted::new(Script::NeedsSetup("Choose a model."));
+        let (typed, left) = tidied("um yes ", &model, Target::FocusedEnter)?;
+        // What a plain dictation would have typed, and its Enter.
+        assert_eq!(typed, [sent("typed", "um yes "), sent("typed", "\n")]);
+        let Some(Outcome::Told(told)) = left else {
+            return Err(Error::Host(format!("{left:?}")));
+        };
+        assert!(told.setup);
+        assert_eq!(told.message, "Choose a model.");
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_said_is_nothing_asked_of_the_model() -> Result<()> {
+        let model = Scripted::writing(&["Made up."]);
+        let (typed, left) = tidied("", &model, Target::FocusedEnter)?;
+        assert!(typed.is_empty() && left.is_none());
+        assert!(model.asked().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_keys_that_type_tidy_and_each_in_its_own_way() {
+        let settings = Settings {
+            cleanup: Mode::Clean,
+            cleanup_enter: Mode::Prompt,
+            ..Settings::default()
+        };
+        let microphone = Arc::new(ArmedMicrophone::new(&settings.microphone));
+        let rewriter = Arc::new(Scripted::writing(&[]));
+        let options = Options::of(&settings, microphone, Arc::default(), rewriter);
+        assert_eq!(options.tidying(Target::Focused), Some(Kind::Clean));
+        assert_eq!(options.tidying(Target::FocusedEnter), Some(Kind::Prompt));
+        for other in [
+            Target::Capture,
+            Target::Search,
+            Target::Memo,
+            Target::Command,
+        ] {
+            assert_eq!(options.tidying(other), None, "{other:?}");
+        }
+        assert!(options.rewrites(Target::Command) && options.rewrites(Target::Focused));
+        assert!(!options.rewrites(Target::Capture));
+        // As it is said, unless the settings say otherwise.
+        let plain = a_minute();
+        assert_eq!(plain.tidying(Target::Focused), None);
+        assert!(!plain.rewrites(Target::FocusedEnter) && plain.rewrites(Target::Command));
+    }
+
+    /// What is selected in a made-up window.
+    #[derive(Default)]
+    struct Chosen {
+        /// What the program says when asked.
+        says: Option<&'static str>,
+        /// What copying yields.
+        copies: Option<&'static str>,
+        /// Whether the selection was copied.
+        copied: AtomicBool,
+        /// Whether the user goes to another window once the selection was
+        /// taken.
+        wanders: bool,
+        looked: AtomicUsize,
+    }
+
+    impl Selection for Chosen {
+        fn asked(&self) -> Option<String> {
+            self.says.map(str::to_owned)
+        }
+
+        fn copied(&self) -> Option<String> {
+            self.copied.store(true, Ordering::Release);
+            self.copies.map(str::to_owned)
+        }
+
+        fn window(&self) -> usize {
+            let looks = self.looked.fetch_add(1, Ordering::AcqRel);
+            if self.wanders { looks } else { 7 }
+        }
+    }
+
+    /// The instruction `said` over what is `chosen`, carried out by
+    /// `model`: what was sent to the window, and what the user is told.
+    fn commanded(
+        said: &'static str,
+        chosen: &Chosen,
+        model: &Scripted,
+        called_off: bool,
+    ) -> Result<(Sent, Option<Told>)> {
+        let board = Board::default();
+        let cancelled = AtomicBool::new(called_off);
+        let told = command(
+            &Says(said),
+            &[],
+            || Ok(Counted::new(3, |_| {}).0),
+            (chosen, model),
+            board.clone(),
+            &cancelled,
+        )?;
+        Ok((board.sent(), told))
+    }
+
+    #[test]
+    fn a_selection_is_edited_as_told_and_the_result_put_in_its_place_whole() -> Result<()> {
+        let chosen = Chosen {
+            says: Some("A long paragraph."),
+            ..Chosen::default()
+        };
+        let model = Scripted::writing(&[" A short ", "one.\n"]);
+        let (sent_to, told) = commanded(" make it shorter ", &chosen, &model, false)?;
+        assert_eq!(sent_to, [sent("pasted", "A short one.")]);
+        assert_eq!(told, None);
+        assert_eq!(
+            model.asked(),
+            [(
+                Kind::Command,
+                "A long paragraph.".to_owned(),
+                "make it shorter".to_owned()
+            )]
+        );
+        // The program answered, so nothing was copied.
+        assert!(!chosen.copied.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[test]
+    fn a_program_that_does_not_say_what_is_selected_has_it_copied() -> Result<()> {
+        let chosen = Chosen {
+            copies: Some("Copied text."),
+            ..Chosen::default()
+        };
+        let model = Scripted::writing(&["Edited."]);
+        let (sent_to, told) = commanded("fix it", &chosen, &model, false)?;
+        assert_eq!((sent_to, told), (vec![sent("pasted", "Edited.")], None));
+        assert_eq!(model.asked()[0].1, "Copied text.");
+        Ok(())
+    }
+
+    #[test]
+    fn a_selection_is_left_as_it_was_whenever_it_cannot_be_edited() -> Result<()> {
+        let text = Chosen {
+            says: Some("Some text."),
+            ..Chosen::default()
+        };
+        let writes = || Scripted::writing(&["Edited."]);
+        // Nothing is selected.
+        let (sent_to, told) = commanded("shorter", &Chosen::default(), &writes(), false)?;
+        assert!(sent_to.is_empty());
+        assert!(told.is_some_and(|told| told.message.starts_with("Select the text first")));
+        // Nothing was said: the model is not asked, and nothing is copied.
+        let model = writes();
+        let silent = Chosen::default();
+        let (sent_to, told) = commanded("", &silent, &model, false)?;
+        assert!(sent_to.is_empty() && model.asked().is_empty());
+        assert!(!silent.copied.load(Ordering::Acquire));
+        assert_eq!(
+            told.map(|told| (told.title, told.message)),
+            Some((
+                "Nothing was changed",
+                "No instruction was heard.".to_owned()
+            ))
+        );
+        // The model cannot be had, fails halfway, or writes nothing.
+        for (script, setup) in [
+            (Script::NeedsSetup("Choose a model."), true),
+            (
+                Script::Breaks(vec!["Half of "], "The server stopped."),
+                false,
+            ),
+            (Script::Writes(vec![" \n"]), false),
+        ] {
+            let (sent_to, told) = commanded("shorter", &text, &Scripted::new(script), false)?;
+            assert!(sent_to.is_empty(), "{sent_to:?}");
+            assert!(told.is_some_and(|told| told.setup == setup && !told.message.is_empty()));
+        }
+        // The user went to another window while the model wrote.
+        let wandered = Chosen {
+            says: Some("Some text."),
+            wanders: true,
+            ..Chosen::default()
+        };
+        let (sent_to, told) = commanded("shorter", &wandered, &writes(), false)?;
+        assert!(sent_to.is_empty());
+        assert!(told.is_some_and(|told| told.message.contains("another window")));
+        // Called off: nothing is put anywhere and nothing is said.
+        let (sent_to, told) = commanded("shorter", &text, &writes(), true)?;
+        assert!(sent_to.is_empty() && told.is_none());
+        // More than a model is asked to take.
+        let endless: &'static str = Box::leak("x".repeat(rewrite::MAX_TEXT_CHARS + 1).into());
+        let long = Chosen {
+            says: Some(endless),
+            ..Chosen::default()
+        };
+        let model = writes();
+        let (sent_to, told) = commanded("shorter", &long, &model, false)?;
+        assert!(sent_to.is_empty() && model.asked().is_empty());
+        assert!(told.is_some_and(|told| told.message.contains("too long")));
+        Ok(())
+    }
+
+    /// Options of someone who lets connected programs read what is typed,
+    /// and where it is left for them.
+    fn read_by_programs() -> (Options, Arc<Transcripts>) {
+        let said = Arc::<Transcripts>::default();
+        let options = Options {
+            said: Some(Arc::clone(&said)),
+            ..a_minute()
+        };
+        (options, said)
+    }
+
+    fn said(session: u64, target: Target, text: &str, last: bool) -> Said {
+        Said {
+            session,
+            target,
+            id: None,
+            text: text.to_owned(),
+            last,
+        }
+    }
+
+    #[test]
+    fn what_is_typed_is_left_for_programs_as_it_stands_and_once_more_at_the_end() {
+        let (options, left) = read_by_programs();
+        let mut field = Field::default();
+        let mut sink = typing_into(Lent(&mut field), &options, Target::Focused, None);
+        assert!(left.take().is_empty(), "nothing was typed yet");
+
+        assert!(sink.type_text("Hello wor").is_ok());
+        assert_eq!(left.take(), [said(1, Target::Focused, "Hello wor", false)]);
+        assert!(left.take().is_empty(), "it is taken once");
+
+        // Words that change are taken back, here across a letter that is
+        // more than one byte; only how it stands now is kept.
+        assert!(sink.rewrite(3, "world, ž").is_ok());
+        assert!(sink.rewrite(1, "š.").is_ok());
+        assert_eq!(
+            left.take(),
+            [said(1, Target::Focused, "Hello world, š.", false)]
+        );
+
+        drop(sink);
+        assert_eq!(
+            left.take(),
+            [said(1, Target::Focused, "Hello world, š.", true)]
+        );
+        assert_eq!(field.text, "Hello world, š.");
+
+        // The next dictation has a number of its own, and the id it was
+        // started with.
+        let id = Some("deck-7".to_owned());
+        let mut sink = typing_into(Field::default(), &options, Target::FocusedEnter, id.clone());
+        assert!(sink.type_text("Next").is_ok());
+        drop(sink);
+        assert_eq!(
+            left.take(),
+            [Said {
+                id,
+                ..said(2, Target::FocusedEnter, "Next", true)
+            }]
+        );
+    }
+
+    #[test]
+    fn what_is_typed_is_handed_on_a_few_times_a_second_and_its_end_at_once() {
+        let (options, left) = read_by_programs();
+        let start = Instant::now();
+        let mut sink = typing_into(Field::default(), &options, Target::Focused, None);
+        assert!(left.take_due(start).is_empty(), "nothing was typed yet");
+        assert!(sink.type_text("a").is_ok());
+        assert_eq!(left.take_due(start), [said(1, Target::Focused, "a", false)]);
+        // Letters that follow at once wait, and are handed on together.
+        assert!(sink.type_text("b").is_ok());
+        assert!(left.take_due(start + SAID_EVERY / 2).is_empty());
+        assert!(sink.type_text("c").is_ok());
+        assert_eq!(
+            left.take_due(start + SAID_EVERY),
+            [said(1, Target::Focused, "abc", false)]
+        );
+        // The end does not wait.
+        assert!(sink.type_text("d").is_ok());
+        drop(sink);
+        assert_eq!(
+            left.take_due(start + SAID_EVERY),
+            [said(1, Target::Focused, "abcd", true)]
+        );
+    }
+
+    #[test]
+    fn a_dictation_that_typed_nothing_still_says_that_it_is_over() {
+        let (options, left) = read_by_programs();
+        drop(typing_into(
+            Field::default(),
+            &options,
+            Target::Focused,
+            None,
+        ));
+        assert_eq!(left.take(), [said(1, Target::Focused, "", true)]);
+        // What a program asked for, or a search, is not typed: there is
+        // nothing to say of it, unless it came to be typed after all.
+        for target in [Target::Capture, Target::Search] {
+            drop(typing_into(Field::default(), &options, target, None));
+        }
+        assert!(left.take().is_empty());
+        let mut sink = typing_into(Field::default(), &options, Target::Search, None);
+        assert!(sink.type_text("weather").is_ok());
+        drop(sink);
+        assert_eq!(left.take(), [said(4, Target::Search, "weather", true)]);
+    }
+
+    #[test]
+    fn nothing_is_left_for_programs_unless_the_settings_say_so() {
+        // The settings as they come: programs may connect, and are not
+        // sent what is typed.
+        let settings = Settings::default();
+        assert!(settings.api_enabled && !settings.api_transcript);
+        let kept = Arc::<Transcripts>::default();
+        assert!(said_for(&settings, &kept).is_none());
+        let on = Settings {
+            api_transcript: true,
+            ..Settings::default()
+        };
+        assert!(said_for(&on, &kept).is_some());
+        // Switched on, but no program may connect.
+        let unconnected = Settings {
+            api_enabled: false,
+            ..on.clone()
+        };
+        assert!(said_for(&unconnected, &kept).is_none());
+
+        // Such a dictation keeps no copy of what it types.
+        let options = a_minute();
+        assert!(options.said.is_none());
+        let mut sink = typing_into(Field::default(), &options, Target::Focused, None);
+        assert!(sink.type_text("for nobody else").is_ok());
+        assert!(sink.typed.is_empty() && sink.said.is_none());
+        drop(sink);
+        assert!(kept.take().is_empty());
+    }
+
+    #[test]
+    fn what_could_not_be_typed_is_not_said_to_have_been() {
+        struct Shut;
+        impl TextSink for Shut {
+            fn type_text(&mut self, _: &str) -> Result<()> {
+                Err(Error::Injection("the window is gone".into()))
+            }
+        }
+        let (options, left) = read_by_programs();
+        let mut sink = typing_into(Shut, &options, Target::Focused, None);
+        assert!(sink.type_text("lost").is_err());
+        drop(sink);
+        assert_eq!(left.take(), [said(1, Target::Focused, "", true)]);
+    }
+
+    /// Programs are told what was typed and not what was recognized: the
+    /// text in the user's own words, with the Enter that follows it.
+    #[test]
+    fn programs_read_the_text_in_the_users_own_words() {
+        use crate::words::Words;
+
+        let provider = Loading::new(false, false);
+        provider.gate.open();
+        let mut words = Words::default();
+        assert_eq!(words.add_snippet("end", "Kind regards"), Ok(true));
+        let speech = InOwnWords {
+            speech: &provider,
+            rules: Rules::of(&words),
+        };
+        let (options, left) = read_by_programs();
+        let mut field = Field::default();
+        let (microphone, _) = Counted::new(3, |_| {});
+        let ended = dictate(
+            &speech,
+            (&[], SETTLED),
+            || Ok(microphone),
+            (Target::FocusedEnter, None),
+            (&AtomicBool::new(false), &AtomicBool::new(false)),
+            typing_into(Lent(&mut field), &options, Target::FocusedEnter, None),
+            None,
+        );
+        assert!(matches!(ended, Ok(None)), "{ended:?}");
+        assert_eq!(field.text, "Kind regards\n");
+        assert_eq!(
+            left.take(),
+            [said(1, Target::FocusedEnter, "Kind regards\n", true)]
+        );
+    }
+
+    /// A tidied dictation tells programs what the model's version came to
+    /// with the snippets in it, and an edit of the selection what was put
+    /// in its place, under a mode of its own.
+    #[test]
+    fn programs_read_what_cleanup_and_editing_put_on_the_screen() -> Result<()> {
+        let mut words = words::Words::default();
+        assert_eq!(words.add_snippet("my email", "me@example.com"), Ok(true));
+        let (before, after) = Rules::around_a_model(&words);
+        let (options, left) = read_by_programs();
+        let model = Scripted::writing(&["Write to me at my", " email."]);
+        let speech = InOwnWords {
+            speech: &Says("um write to me at my email"),
+            rules: before,
+        };
+        let board = Board::default();
+        dictate(
+            &speech,
+            (&[], SETTLED),
+            || Ok(Counted::new(3, |_| {}).0),
+            (Target::Focused, None),
+            (&AtomicBool::new(false), &AtomicBool::new(false)),
+            typing_into(board.clone(), &options, Target::Focused, None),
+            Some(Tidy {
+                rewriter: &model,
+                kind: Kind::Clean,
+                snippets: after.as_ref(),
+                stop: &AtomicBool::new(false),
+            }),
+        )?;
+        let text = "Write to me at me@example.com.";
+        assert_eq!(left.take(), [said(1, Target::Focused, text, true)]);
+
+        let chosen = Chosen {
+            says: Some("A long paragraph."),
+            ..Chosen::default()
+        };
+        let told = command(
+            &Says("make it shorter"),
+            &[],
+            || Ok(Counted::new(3, |_| {}).0),
+            (&chosen, &Scripted::writing(&["Short."])),
+            typing_into(board.clone(), &options, Target::Command, None),
+            &AtomicBool::new(false),
+        )?;
+        assert_eq!(told, None);
+        assert_eq!(board.sent().last(), Some(&sent("pasted", "Short.")));
+        assert_eq!(left.take(), [said(2, Target::Command, "Short.", true)]);
+        Ok(())
+    }
+
+    #[test]
+    fn nothing_is_passed_on_from_the_moment_it_is_switched_off() {
+        let on = Settings {
+            api_transcript: true,
+            ..Settings::default()
+        };
+        let microphone = Arc::new(ArmedMicrophone::new(&on.microphone));
+        let kept = Arc::<Transcripts>::default();
+        let mut dictation = Dictation {
+            speech: Arc::new(Loading::new(false, false)),
+            speech_config: on.speech_config(),
+            rewrite_config: rewrite_config(&on),
+            options: Options {
+                said: said_for(&on, &kept),
+                ..Options::of(&on, microphone, Arc::default(), quiet_model())
+            },
+            meter: LevelMeter::new(),
+            failures: Arc::default(),
+            outcomes: Arc::default(),
+            said: kept,
+            active: None,
+            finishing: Vec::new(),
+            notify: None,
+        };
+        // A dictation that started while it was on goes on typing.
+        let options = dictation.options.clone();
+        let mut sink = typing_into(Field::default(), &options, Target::Focused, None);
+        assert!(sink.type_text("one").is_ok());
+        assert_eq!(
+            dictation.take_said(),
+            [said(1, Target::Focused, "one", false)]
+        );
+        assert!(sink.type_text(" two").is_ok());
+        dictation.configure(&Settings::default(), false);
+        assert!(dictation.take_said().is_empty());
+        drop(sink);
+        assert!(dictation.take_said().is_empty());
+        // And what it typed meanwhile does not come out when it is
+        // switched on again.
+        dictation.configure(&on, false);
+        assert!(dictation.take_said().is_empty());
     }
 }

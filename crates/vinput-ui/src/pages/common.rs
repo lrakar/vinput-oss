@@ -1,10 +1,14 @@
 //! What more than one page needs: the bar for a notice, how far along a
 //! download is, the edit of a setting that is text, and what the tests of
 //! the pages read a page with.
+// A program without Vinput's pages uses only some of what is here.
+#![cfg_attr(not(feature = "vinput"), allow(dead_code, unused_imports))]
 
 use vinput_view::{Change, Command, NoticeKind, PRO_MODEL, Page, Pro, ProWho, View};
 
-use crate::node::{Action, Node, Severity, human_size};
+use crate::node::{
+    Action, Icon, Node, Severity, TextStyle, Tone, card, header, human_size, setting, styled,
+};
 
 /// Goes between the facts on a line of detail.
 pub(super) const DOT: &str = " \u{b7} ";
@@ -23,6 +27,55 @@ pub(super) fn notice_bar(view: &View, page: Page) -> Option<Node> {
         action: None,
         dismiss: Some(Action::send(Command::DismissNotice)),
     })
+}
+
+/// The way to the PUTLAB hub from a program's About page: it opens the hub
+/// where it is installed, and the page it is downloaded from where it is
+/// not.
+pub(super) fn hub_row(view: &View) -> Node {
+    let (title, detail) = if view.hub_installed {
+        ("Open PUTLAB", "Installs and updates your PUTLAB apps")
+    } else {
+        ("Get PUTLAB", "One place to install and update PUTLAB apps")
+    };
+    setting(Icon::Download, title)
+        .detail(detail)
+        .action(Action::send(Command::OpenHub))
+        .into()
+}
+
+/// The head of an About page, the same in every program of the family: the
+/// program, what it does in a line, and the version that is running.
+pub(super) fn identity(icon: Icon, name: &str, what: &str, version: &str) -> Node {
+    let app = setting(icon, name).detail(what);
+    if version.is_empty() {
+        card([app.into()])
+    } else {
+        let version = format!("Version {version}");
+        card([app
+            .control(styled(version, TextStyle::Body, Tone::Secondary))
+            .into()])
+    }
+}
+
+/// A page of the site, as a row of an About page that opens it in the
+/// browser: its icon, title, a line about it, and its address.
+pub(super) type SiteLink = (Icon, &'static str, &'static str, &'static str);
+
+/// The links of an About page, under their heading.
+pub(super) fn links(links: &[SiteLink]) -> [Node; 2] {
+    let rows = links.iter().map(|(icon, title, detail, address)| {
+        setting(*icon, *title)
+            .detail(*detail)
+            .action(Action::send(Command::OpenLink((*address).to_owned())))
+            .into()
+    });
+    [header("Links"), card(rows)]
+}
+
+/// The way to the other programs of the family, under its heading.
+pub(super) fn related(view: &View) -> [Node; 2] {
+    [header("Related"), card([hub_row(view)])]
 }
 
 /// Why `VinPUT` Pro cannot be dictated with right now.
@@ -261,6 +314,8 @@ pub(crate) mod probe {
         pub(crate) toggles: Vec<(bool, Action)>,
         /// The text fields: their keys and what they show while empty.
         pub(crate) fields: Vec<(&'static str, String)>,
+        /// The rows that can be clicked as a whole, by their titles.
+        pub(crate) rows: Vec<Press>,
     }
 
     impl Seen {
@@ -319,6 +374,14 @@ pub(crate) mod probe {
         fn setting(&mut self, setting: &Setting) {
             self.texts.push(setting.title.clone());
             self.texts.push(setting.detail.clone());
+            if !setting.action.is_none() {
+                self.rows.push(Press {
+                    label: setting.title.clone(),
+                    enabled: setting.enabled,
+                    kind: ButtonKind::Subtle,
+                    action: setting.action.clone(),
+                });
+            }
             if let Some(control) = &setting.control {
                 self.visit(control);
             }
@@ -329,7 +392,11 @@ pub(crate) mod probe {
 
         fn visit(&mut self, node: &Node) {
             match node {
-                Node::Column(children) | Node::Row(children) | Node::Card(children) => {
+                Node::Column(children)
+                | Node::Row(children)
+                | Node::Card(children)
+                | Node::Flow(children, _)
+                | Node::Scroll { children, .. } => {
                     for child in children {
                         self.visit(child);
                     }
@@ -373,6 +440,25 @@ pub(crate) mod probe {
                         self.press("Dismiss", true, ButtonKind::Subtle, dismiss);
                     }
                 }
+                Node::Expander(expander) => {
+                    self.texts.push(expander.title.clone());
+                    self.texts.push(expander.value.clone());
+                    for child in &expander.children {
+                        self.visit(child);
+                    }
+                }
+                Node::Chip { label, remove, .. } => {
+                    self.texts.push(label.clone());
+                    if let Some(remove) = remove {
+                        self.press(&format!("Remove {label}"), true, ButtonKind::Subtle, remove);
+                    }
+                }
+                Node::Search(search) => {
+                    self.fields.push((search.key, search.placeholder.clone()));
+                    for (_, row) in &search.rows {
+                        self.visit(row);
+                    }
+                }
                 Node::Spring | Node::Icon(..) | Node::Choice { .. } | Node::Hotkey { .. } => {}
             }
         }
@@ -384,6 +470,7 @@ pub(crate) mod probe {
         match action {
             Action::Send(command) => Some(command.clone()),
             Action::Submit { make, .. } => Some(make(TYPED.to_owned())),
+            Action::Enter { make, .. } => Some(make(TYPED.to_owned(), TYPED.to_owned())),
             Action::Both(first, second) => command(first).or_else(|| command(second)),
             Action::None
             | Action::Go(_)
@@ -408,8 +495,18 @@ pub(crate) mod probe {
         for node in nodes {
             found.push(node);
             match node {
-                Node::Column(children) | Node::Row(children) | Node::Card(children) => {
+                Node::Column(children)
+                | Node::Row(children)
+                | Node::Card(children)
+                | Node::Flow(children, _)
+                | Node::Scroll { children, .. } => {
                     found.extend(all(children));
+                }
+                Node::Expander(expander) => found.extend(all(&expander.children)),
+                Node::Search(search) => {
+                    for (_, row) in &search.rows {
+                        found.extend(all(std::slice::from_ref(row)));
+                    }
                 }
                 Node::Setting(row) => {
                     if let Some(control) = &row.control {
@@ -464,6 +561,8 @@ pub(crate) mod probe {
             .filter_map(|node| match node {
                 Node::Field(field) => Some(field.key),
                 Node::Hotkey { key, .. } | Node::Choice { key, .. } => Some(*key),
+                Node::Expander(expander) => Some(expander.key),
+                Node::Search(search) => Some(search.key),
                 _ => None,
             })
             .collect()

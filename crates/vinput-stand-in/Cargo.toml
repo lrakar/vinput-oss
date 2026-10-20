@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 description = "A stand-in for a Vinput window process, for testing the line to the background process from end to end"
 repository.workspace = true
-license.workspace = true
 publish.workspace = true
 
 [dependencies]

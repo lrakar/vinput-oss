@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use vinput_view::{Command, Page, Setup, View};
 
 use crate::geometry::{Point, Rect, Size};
-use crate::layout::{Control, Kind, Measure, Region};
+use crate::layout::{Control, Kind, Measure, Memory, Region};
 use crate::look::{Look, ScrollBar};
 use crate::node::{Action, Key};
 use crate::scene::{Phase, Showing};
@@ -93,6 +93,8 @@ pub struct Editing {
     pub text: String,
     /// Whether what is typed is hidden.
     pub secret: bool,
+    /// How many lines of text the field shows.
+    pub lines: u8,
     /// Whether to select everything: the field was reached by keyboard.
     pub select_all: bool,
 }
@@ -165,8 +167,17 @@ pub struct Stage {
     ring: bool,
     scroll: f32,
     bar: ScrollBar,
-    /// While the thumb is dragged: how far under its top it was grabbed.
-    drag: Option<f32>,
+    /// While a thumb is dragged: that of which area that scrolls by itself,
+    /// or of the page for none, and how far under its top it was grabbed.
+    drag: Option<(Option<usize>, f32)>,
+    /// How far each area that scrolls by itself is scrolled, in the order
+    /// of the frame's.
+    offsets: Vec<f32>,
+    /// The one of them whose scroll bar the mouse is over.
+    pane_bar: Option<usize>,
+    /// Which rows the user opened or closed, and what is typed in the
+    /// fields that a list follows.
+    memory: Memory,
     drafts: HashMap<Key, Draft>,
     editing: Option<Key>,
     capture: Option<Capture>,
@@ -207,8 +218,12 @@ impl Stage {
     /// A stage that shows `showing` for `view` in a window of `size`.
     #[must_use]
     pub fn new(showing: Showing, view: View, size: Size, measure: Box<dyn Measure>) -> Self {
-        let frame = Self::lay(&showing, &view, size, measure.as_ref());
+        let memory = Memory::default();
+        let frame = Self::lay(&showing, &view, size, measure.as_ref(), &memory);
         Self {
+            offsets: vec![0.0; frame.panes().len()],
+            pane_bar: None,
+            memory,
             measure,
             showing,
             view,
@@ -233,8 +248,20 @@ impl Stage {
         }
     }
 
-    fn lay(showing: &Showing, view: &View, size: Size, measure: &dyn Measure) -> Frame {
-        shell::frame(showing.content(view), showing.chrome(view), size, measure)
+    fn lay(
+        showing: &Showing,
+        view: &View,
+        size: Size,
+        measure: &dyn Measure,
+        memory: &Memory,
+    ) -> Frame {
+        shell::frame_with(
+            showing.content(view),
+            showing.chrome(view),
+            size,
+            measure,
+            memory,
+        )
     }
 
     // ---- What the window reads ----------------------------------------
@@ -291,6 +318,8 @@ impl Stage {
             over_clear: self.over_clear,
             scroll: self.scroll,
             bar: self.bar,
+            panes: &self.offsets,
+            pane_bar: self.pane_bar,
             phase: self.phase,
             mica: self.mica,
         }
@@ -353,9 +382,9 @@ impl Stage {
         let control = self.frame.controls.get(self.keyed(self.editing?)?)?;
         let rect = self.placed(control);
         let inner = rect.inset_xy(metric::FIELD_PAD, metric::FIELD_FOCUS);
-        let view = self.frame.viewport;
-        let seen =
-            control.region == Region::Fixed || (rect.y >= view.y && rect.bottom() <= view.bottom());
+        let within = |view: Rect| rect.y >= view.y && rect.bottom() <= view.bottom();
+        let seen = (control.region == Region::Fixed || within(self.frame.viewport))
+            && control.pane().is_none_or(|pane| within(self.pane_at(pane)));
         Some((inner, seen))
     }
 
@@ -387,11 +416,32 @@ impl Stage {
         Some((control.tip()?, self.placed(control)))
     }
 
-    fn placed(&self, control: &Control) -> Rect {
-        match control.region {
-            Region::Fixed => control.rect,
-            Region::Body => control.rect.moved(0.0, -self.scroll),
-        }
+    /// How far down something in `region` and in the area `pane` is moved
+    /// from where the layout put it.
+    fn shift(&self, region: Region, pane: Option<usize>) -> f32 {
+        let body = match region {
+            Region::Fixed => 0.0,
+            Region::Body => self.scroll,
+        };
+        let inner = pane.and_then(|pane| self.offsets.get(pane));
+        -body - inner.copied().unwrap_or(0.0)
+    }
+
+    pub(super) fn placed(&self, control: &Control) -> Rect {
+        control
+            .rect
+            .moved(0.0, self.shift(control.region, control.pane()))
+    }
+
+    /// Where the area that scrolls by itself with this index is in the
+    /// window right now; nowhere if there is none.
+    pub(super) fn pane_at(&self, index: usize) -> Rect {
+        self.frame
+            .panes()
+            .get(index)
+            .map_or(Rect::default(), |pane| {
+                pane.rect.moved(0.0, self.shift(pane.region, None))
+            })
     }
 
     fn keyed(&self, key: Key) -> Option<usize> {
@@ -418,7 +468,15 @@ impl Stage {
         let mut effects = Vec::new();
         let size = self.frame.size;
         let before = Outline::of(&self.frame);
-        self.frame = Self::lay(&self.showing, &self.view, size, self.measure.as_ref());
+        let scrolled = self.list_offsets();
+        self.frame = Self::lay(
+            &self.showing,
+            &self.view,
+            size,
+            self.measure.as_ref(),
+            &self.memory,
+        );
+        self.scroll_as(&scrolled);
         if Outline::of(&self.frame) != before {
             self.shape = self.shape.wrapping_add(1);
         }
@@ -466,6 +524,36 @@ impl Stage {
         self.rehover();
         self.dirty = true;
         effects
+    }
+
+    /// How far each area that scrolls by itself is scrolled, by its key.
+    fn list_offsets(&self) -> Vec<(Key, f32)> {
+        let panes = self.frame.panes();
+        if panes.is_empty() {
+            return Vec::new();
+        }
+        let keys = panes.iter().map(|pane| pane.key);
+        keys.zip(self.offsets.iter().copied()).collect()
+    }
+
+    /// Scrolls the areas of the frame that was just laid out as far as
+    /// `scrolled` says the ones of the frame before it were: an area is
+    /// found again by its key.
+    fn scroll_as(&mut self, scrolled: &[(Key, f32)]) {
+        let panes = self.frame.panes();
+        if panes.is_empty() && self.offsets.is_empty() {
+            return;
+        }
+        self.offsets = panes
+            .iter()
+            .map(|pane| {
+                let was = scrolled.iter().find(|(key, _)| *key == pane.key);
+                was.map_or(0.0, |(_, offset)| offset.clamp(0.0, pane.range()))
+            })
+            .collect();
+        if matches!(self.drag, Some((Some(pane), _)) if pane >= self.offsets.len()) {
+            self.drag = None;
+        }
     }
 
     /// Shows what is typed instead of what the view says, in every field
@@ -560,6 +648,7 @@ impl Stage {
         }
         self.showing = Showing::Settings(page);
         self.drafts.clear();
+        self.memory = Memory::default();
         self.scroll = 0.0;
         // The page of the account shows what the server says, the prices
         // included; it is asked when the page comes into sight.
@@ -585,6 +674,13 @@ impl Stage {
             Action::Send(command) => vec![Effect::Send(command)],
             Action::Go(page) => self.go(page, false),
             Action::Submit { field, make } => vec![Effect::Send(make(self.text_of(field)))],
+            Action::Enter { fields, make } => {
+                let [first, second] = fields;
+                let command = make(self.text_of(first), self.text_of(second));
+                let mut effects = vec![Effect::Send(command)];
+                effects.extend(self.start_over(fields));
+                effects
+            }
             Action::Close => vec![Effect::Close],
             Action::Accept => vec![Effect::Accept],
             Action::Copy(text) => vec![Effect::Copy(text)],
@@ -605,6 +701,27 @@ impl Stage {
         }
     }
 
+    /// Empties the fields an entry was typed in and has the first of them
+    /// typed in again.
+    fn start_over(&mut self, fields: [Key; 2]) -> Vec<Effect> {
+        for key in fields {
+            if let Some(draft) = self.drafts.get_mut(key) {
+                draft.text.clear();
+                draft.origin.clear();
+                draft.sent = false;
+            }
+        }
+        // The fields show what the drafts say from here on.
+        let mut effects = self.rebuild();
+        let first = fields[0];
+        if self.editing == Some(first) {
+            effects.push(Effect::Retype(String::new()));
+        } else {
+            effects.extend(self.set_focus(self.keyed(first), false));
+        }
+        effects
+    }
+
     /// What the field with this key reads right now.
     fn text_of(&self, key: Key) -> String {
         if let Some(draft) = self.drafts.get(key) {
@@ -621,16 +738,15 @@ impl Stage {
 
     /// Works the control with this index, as a click or Enter does.
     fn activate(&mut self, index: usize, by_keyboard: bool) -> Vec<Effect> {
+        let Some(anchor) = self.rect_of(index) else {
+            return Vec::new();
+        };
         let Some(control) = self.frame.controls.get_mut(index) else {
             return Vec::new();
         };
         if !control.enabled {
             return Vec::new();
         }
-        let anchor = match control.region {
-            Region::Fixed => control.rect,
-            Region::Body => control.rect.moved(0.0, -self.scroll),
-        };
         self.dirty = true;
         match &mut control.kind {
             Kind::Button { action, .. } | Kind::Link { action, .. } | Kind::Row { action } => {
@@ -676,13 +792,42 @@ impl Stage {
                 let page = *page;
                 self.go(page, true)
             }
+            Kind::Expander { open, .. } => {
+                let Some(key) = control.key else {
+                    return Vec::new();
+                };
+                // The user has a say from here on, whatever the page thinks
+                // it should be.
+                self.memory.set_open(key, !*open);
+                let mut effects = self.close_choice();
+                effects.extend(self.rebuild());
+                if by_keyboard && let Some(index) = self.keyed(key) {
+                    self.reveal(index);
+                }
+                effects
+            }
+            Kind::Chip { remove, .. } => {
+                let action = remove.clone().unwrap_or(Action::None);
+                self.run(action)
+            }
         }
+    }
+
+    /// Opens or closes the rows with these keys and searches the lists with
+    /// these, as the user would: for a picture, and for tests.
+    pub fn remember(&mut self, memory: Memory) -> Vec<Effect> {
+        self.memory = memory;
+        self.rebuild()
     }
 }
 
 /// Whether `page` shows what `VinPUT` Pro costs, which is the server's to
 /// say: it is asked when such a page comes into sight.
 fn shows_prices(page: Page) -> bool {
+    #[cfg(feature = "hub")]
+    if page == Page::Account {
+        return true;
+    }
     matches!(page, Page::Pro | Page::Welcome | Page::WelcomePro)
 }
 

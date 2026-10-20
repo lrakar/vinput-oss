@@ -170,7 +170,8 @@ impl Host {
             }
             WM_COMMAND if (wparam.0 >> 16) & 0xFFFF == EN_CHANGE as usize => {
                 if let Some(edit) = &self.edit {
-                    self.stage.typed(edit.text());
+                    let effects = self.stage.typed(edit.text());
+                    self.perform(effects);
                 }
             }
             WM_CTLCOLOREDIT => {

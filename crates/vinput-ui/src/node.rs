@@ -45,6 +45,16 @@ pub enum Action {
         /// Makes the command from its text.
         make: fn(String) -> Command,
     },
+    /// Tell the background process what is typed in two fields that make
+    /// one entry of a list, for the Add button beside them. Both fields
+    /// are then emptied and the first is typed in again, ready for the
+    /// next entry.
+    Enter {
+        /// The fields to read, in the order the command takes them.
+        fields: [Key; 2],
+        /// Makes the command from their texts.
+        make: fn(String, String) -> Command,
+    },
     /// Close the window. In a window that asks, this is the answer no.
     Close,
     /// Close a window that asks with the answer yes: what the button that
@@ -206,6 +216,16 @@ pub enum Icon {
     Star,
     /// A person: an account.
     Person,
+    /// A book of words: the dictionary.
+    Dictionary,
+    /// Text that stands for more text: snippets.
+    Snippet,
+    /// Letters and their case: spoken formatting.
+    Formatting,
+    /// A pen: text that is rewritten.
+    Edit,
+    /// A command prompt: a program of the user's own.
+    Program,
 }
 
 /// How much a button stands out.
@@ -233,6 +253,25 @@ pub enum Severity {
     /// It failed.
     Critical,
 }
+
+/// Stands in every part of a page that picks from a long list: a row that
+/// opens, a list that scrolls by itself, chips, a list that is searched.
+///
+/// In a program that has such pages this is a thing of no size. In one
+/// that has none (the feature `pickers` is off) it is a type without a
+/// value, so no such part can ever be made there, and the compiler, which
+/// knows that, leaves out all the code that would lay one out, paint it or
+/// work it. That is what keeps the smallest program of the family small
+/// without a second version of the layer.
+#[cfg(feature = "pickers")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pickers;
+
+/// See the other [`Pickers`]: here, where no page picks from a long list,
+/// there is no such value.
+#[cfg(not(feature = "pickers"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pickers {}
 
 /// One thing on a page.
 pub enum Node {
@@ -342,6 +381,113 @@ pub enum Node {
         /// What the cross at its right edge does, if it has one.
         dismiss: Option<Action>,
     },
+    /// A settings row that opens: closed, it says what is chosen at its
+    /// right edge; open, it shows what that is chosen from under it. A
+    /// child of a [`Node::Card`], or a card by itself.
+    Expander(Expander),
+    /// Rows one under another in an area that is at most `max` tall and
+    /// scrolls by itself, with a scroll bar of its own, so a long list does
+    /// not make the page longer. Its children are laid out as those of a
+    /// [`Node::Card`] are. One inside another is not scrolled apart.
+    Scroll {
+        /// Keeps how far it is scrolled between rebuilds.
+        key: Key,
+        /// The most height it takes.
+        max: f32,
+        /// What scrolls.
+        children: Vec<Node>,
+        /// That this program has such lists.
+        pickers: Pickers,
+    },
+    /// Children side by side that go on in a new line where the width runs
+    /// out: chips.
+    Flow(Vec<Node>, Pickers),
+    /// A small rounded label for one of several things that are chosen,
+    /// with a cross that takes it away.
+    Chip {
+        /// What it says.
+        label: String,
+        /// What the cross does. Without one the chip only says what it says.
+        remove: Option<Action>,
+        /// That this program has chips.
+        pickers: Pickers,
+    },
+    /// A field to search with over a list that scrolls by itself. The layer
+    /// shows the rows that contain what is typed and no others, so a page
+    /// lists everything and keeps no state.
+    Search(Search),
+}
+
+/// A settings row that opens; see [`Node::Expander`].
+pub struct Expander {
+    /// Keeps whether it is open between rebuilds.
+    pub key: Key,
+    /// The icon at its left edge.
+    pub icon: Option<Icon>,
+    /// What the setting is.
+    pub title: String,
+    /// What is chosen, said at the right edge of the row.
+    pub value: String,
+    /// The color of that.
+    pub value_tone: Tone,
+    /// Whether it is open until the user says otherwise.
+    pub open: bool,
+    /// What it shows under the row while it is open, laid out as the
+    /// children of a [`Node::Card`] are.
+    pub children: Vec<Node>,
+    /// That this program has rows that open.
+    pub pickers: Pickers,
+}
+
+impl Expander {
+    /// Says what is chosen.
+    #[must_use]
+    pub fn value(mut self, value: impl Into<String>) -> Self {
+        self.value = value.into();
+        self
+    }
+
+    /// Colors what is chosen.
+    #[must_use]
+    pub fn value_tone(mut self, tone: Tone) -> Self {
+        self.value_tone = tone;
+        self
+    }
+
+    /// Has it open until the user closes it.
+    #[must_use]
+    pub fn open(mut self, open: bool) -> Self {
+        self.open = open;
+        self
+    }
+}
+
+impl From<Expander> for Node {
+    fn from(expander: Expander) -> Self {
+        Self::Expander(expander)
+    }
+}
+
+/// A field to search with over a list; see [`Node::Search`].
+pub struct Search {
+    /// Keeps what is typed and how far the list is scrolled.
+    pub key: Key,
+    /// What the field shows while it is empty.
+    pub placeholder: String,
+    /// The most height the list takes.
+    pub max: f32,
+    /// The rows, each with the words it is found by.
+    pub rows: Vec<(String, Node)>,
+    /// What is said in place of the list when no row has what is typed.
+    pub none: String,
+    /// That this program has lists that are searched.
+    pub pickers: Pickers,
+}
+
+impl From<Search> for Node {
+    fn from(search: Search) -> Self {
+        Self::Search(search)
+    }
 }
 
 /// The row everything in Settings is made of; see [`Node::Setting`].
@@ -374,6 +520,8 @@ pub struct Setting {
     pub enabled: bool,
     /// The color of the icon.
     pub icon_tone: Tone,
+    /// Whether the row is as low as its text allows: a row of a long list.
+    pub compact: bool,
 }
 
 impl Setting {
@@ -438,6 +586,13 @@ impl Setting {
     #[must_use]
     pub fn numbered(mut self, number: u8) -> Self {
         self.number = Some(number);
+        self
+    }
+
+    /// Makes the row as low as its text allows.
+    #[must_use]
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
         self
     }
 
@@ -526,11 +681,17 @@ pub struct Field {
     /// Whether it takes all the width it can get instead of the standard
     /// width of a control.
     pub wide: bool,
+    /// How many lines of text it shows. With more than one, the text wraps,
+    /// Enter starts a new line, and leaving the field finishes the edit.
+    pub lines: u8,
     /// Whether it can be typed in.
     pub enabled: bool,
     /// Whether what is pasted into it is handed in at once, as if Enter
     /// had followed: for a key, which is pasted whole.
     pub eager: bool,
+    /// Set if the page is laid out again at every key, because something
+    /// on it follows what is typed: the field of a [`Node::Search`].
+    pub live: Option<Pickers>,
     /// What finishing an edit does: Enter, or leaving the field.
     pub action: OnText,
     /// What Enter does besides, and leaving the field does not: running the
@@ -557,6 +718,14 @@ impl Field {
     /// Lets it take all the width it can get.
     #[must_use]
     pub fn wide(mut self) -> Self {
+        self.wide = true;
+        self
+    }
+
+    /// Makes it as tall as `lines` lines of text, and as wide as it can be.
+    #[must_use]
+    pub fn lines(mut self, lines: u8) -> Self {
+        self.lines = lines.max(1);
         self.wide = true;
         self
     }
@@ -693,6 +862,58 @@ pub fn plain_setting(title: impl Into<String>) -> Setting {
         selected: false,
         enabled: true,
         icon_tone: Tone::Primary,
+        compact: false,
+    }
+}
+
+/// A settings row that opens, with what it shows while it is open.
+#[cfg(feature = "pickers")]
+#[must_use]
+pub fn expander(
+    key: Key,
+    icon: Icon,
+    title: impl Into<String>,
+    children: impl IntoIterator<Item = Node>,
+) -> Expander {
+    Expander {
+        key,
+        icon: Some(icon),
+        title: title.into(),
+        value: String::new(),
+        value_tone: Tone::Secondary,
+        open: false,
+        children: children.into_iter().collect(),
+        pickers: Pickers,
+    }
+}
+
+/// Rows in an area that is at most `max` tall and scrolls by itself.
+#[cfg(feature = "pickers")]
+#[must_use]
+pub fn scroll(key: Key, max: f32, children: impl IntoIterator<Item = Node>) -> Node {
+    Node::Scroll {
+        key,
+        max,
+        children: children.into_iter().collect(),
+        pickers: Pickers,
+    }
+}
+
+/// Children side by side that go on in a new line where the width runs out.
+#[cfg(feature = "pickers")]
+#[must_use]
+pub fn flow(children: impl IntoIterator<Item = Node>) -> Node {
+    Node::Flow(children.into_iter().collect(), Pickers)
+}
+
+/// A chip; with `remove`, one with a cross that does it.
+#[cfg(feature = "pickers")]
+#[must_use]
+pub fn chip(label: impl Into<String>, remove: Option<Action>) -> Node {
+    Node::Chip {
+        label: label.into(),
+        remove,
+        pickers: Pickers,
     }
 }
 
@@ -772,8 +993,10 @@ pub fn field(
         placeholder: String::new(),
         secret: false,
         wide: false,
+        lines: 1,
         enabled: true,
         eager: false,
+        live: None,
         action: Box::new(action),
         on_enter: Action::None,
     }

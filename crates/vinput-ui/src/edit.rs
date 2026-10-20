@@ -18,12 +18,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL, ES_PASSWORD,
-    GWLP_USERDATA, GWLP_WNDPROC, GetParent, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowTextW, PostMessageW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_CHAR, WM_KEYDOWN, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_PASTE, WM_SETFONT, WNDPROC,
-    WS_CHILD,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_WANTRETURN, GWL_STYLE, GWLP_USERDATA,
+    GWLP_WNDPROC, GetParent, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, PostMessageW,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_MOUSEWHEEL, WM_PASTE, WM_SETFONT, WNDPROC, WS_CHILD,
 };
 use windows::core::{HSTRING, w};
 
@@ -79,6 +79,8 @@ pub(crate) struct Edit {
     fill: u32,
     line: i32,
     bleed: i32,
+    /// How many lines it shows; with more than one, Enter starts a new line.
+    lines: i32,
 }
 
 /// Sees the keys that mean something to the window before the edit control
@@ -94,7 +96,14 @@ unsafe extern "system" fn proc(
     // `Edit::create` before this one could be called.
     unsafe {
         let parent = GetParent(hwnd).unwrap_or_default();
-        let special = matches!(wparam.0, VK_TAB | VK_RETURN | VK_ESCAPE);
+        // In a control of more than one line, Enter starts a new one.
+        let multiline =
+            GetWindowLongPtrW(hwnd, GWL_STYLE) & isize::try_from(ES_MULTILINE).unwrap_or(0) != 0;
+        let special = match wparam.0 {
+            VK_TAB | VK_ESCAPE => true,
+            VK_RETURN => !multiline,
+            _ => false,
+        };
         match message {
             WM_KEYDOWN if special => {
                 let _ = PostMessageW(Some(parent), EDIT_KEY, wparam, LPARAM(0));
@@ -144,12 +153,24 @@ impl Edit {
         parent: HWND,
         text: &str,
         secret: bool,
+        lines: u8,
         style: &Style<'_>,
     ) -> Option<Self> {
-        let mut flags = WS_CHILD.0 | u32::try_from(ES_AUTOHSCROLL).unwrap_or(0);
+        let multiline = lines > 1;
+        let scrolls = if multiline {
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN
+        } else {
+            ES_AUTOHSCROLL
+        };
+        let mut flags = WS_CHILD.0 | u32::try_from(scrolls).unwrap_or(0);
         if secret {
             flags |= u32::try_from(ES_PASSWORD).unwrap_or(0);
         }
+        let text = if multiline {
+            to_windows_lines(text)
+        } else {
+            text.to_owned()
+        };
         // SAFETY: the class and the strings are valid for the calls, the
         // parent is a live window of this thread, and every handle is
         // checked before use. What is created here is released in `Drop`.
@@ -157,7 +178,7 @@ impl Edit {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("EDIT"),
-                &HSTRING::from(text),
+                &HSTRING::from(text.as_str()),
                 WINDOW_STYLE(flags),
                 0,
                 0,
@@ -231,6 +252,7 @@ impl Edit {
                 fill: style.fill.colorref(),
                 line: metrics.tmHeight.max(1),
                 bleed,
+                lines: i32::from(lines.max(1)),
             })
         }
     }
@@ -283,9 +305,12 @@ impl Edit {
 
     /// Puts it over `field`, the rectangle the text of the field has in
     /// pixels of the parent, in the middle of its height; or hides it if the
-    /// field is out of sight.
+    /// field is out of sight. Its lines together are what is put in the
+    /// middle, so the first sits where the field shows it.
     pub(crate) fn place(&self, field: RECT, seen: bool) {
-        let top = field.top + (field.bottom - field.top - self.line) / 2;
+        let room = field.bottom - field.top;
+        let height = (self.line * self.lines).min(room.max(self.line));
+        let top = field.top + (room - height) / 2;
         let show = if seen { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
         // SAFETY: the control is a live window of this thread.
         let _ = unsafe {
@@ -295,7 +320,7 @@ impl Edit {
                 field.left - self.bleed,
                 top,
                 (field.right - field.left + 2 * self.bleed).max(1),
-                self.line,
+                height,
                 SWP_NOZORDER | SWP_NOACTIVATE | show,
             )
         };
@@ -308,18 +333,30 @@ impl Edit {
             let length = usize::try_from(GetWindowTextLengthW(self.hwnd)).unwrap_or(0);
             let mut buffer = vec![0_u16; length + 1];
             let read = usize::try_from(GetWindowTextW(self.hwnd, &mut buffer)).unwrap_or(0);
-            String::from_utf16_lossy(&buffer[..read.min(length)])
+            String::from_utf16_lossy(&buffer[..read.min(length)]).replace("\r\n", "\n")
         }
     }
 
     /// Makes it read `text`, all of it selected.
     pub(crate) fn retype(&self, text: &str) {
+        let text = if self.lines > 1 {
+            to_windows_lines(text)
+        } else {
+            text.to_owned()
+        };
         // SAFETY: the string is NUL-terminated and outlives the call.
         unsafe {
-            let _ = SetWindowTextW(self.hwnd, &HSTRING::from(text));
+            let _ = SetWindowTextW(self.hwnd, &HSTRING::from(text.as_str()));
             SendMessageW(self.hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
     }
+}
+
+/// `text` with its lines ended the way an edit control of more than one
+/// line needs them: a carriage return before each line feed. What it reads
+/// back has them taken out again (`Edit::text`).
+fn to_windows_lines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
 impl Drop for Edit {

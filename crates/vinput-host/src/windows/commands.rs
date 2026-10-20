@@ -25,6 +25,14 @@ use vinput_view::{self as wire, Page};
 
 impl Host {
     /// Does what the user did in a window.
+    // Which commands there are depends on what is built beside Vinput. Built
+    // alone, as it ships, the last arm has nothing left to match, and clippy
+    // takes it for a wildcard that stands for a single variant; built beside
+    // the others it does not, so the lint cannot be expected, only allowed.
+    #[allow(
+        clippy::match_wildcard_for_single_variants,
+        reason = "the last arm is for the commands of the other programs"
+    )]
     pub(super) fn on_window_command(
         &mut self,
         which: Which,
@@ -44,9 +52,10 @@ impl Host {
             Said::CapturingHotkey(true) => self.start_capturing(controller),
             Said::CapturingHotkey(false) => self.stop_capturing(),
             Said::UseModel(id) => self.use_model(&id, controller),
+            Said::UseTextModel(id) => self.use_text_model(&id, controller),
             Said::InstallModel(id) => self.install_model(&id, controller),
             Said::CancelInstall(id) => {
-                if let Some(model) = models::by_id(&id) {
+                if let Some(model) = models::by_id(&id).or_else(|| models::writer(&id)) {
                     self.installer.stop(model);
                 }
             }
@@ -64,7 +73,9 @@ impl Host {
             Said::InstallUpdate => self.start_update(),
             Said::CancelUpdate => self.cancel_update(),
             Said::DismissNotice => self.notice = None,
+            Said::TestAction(index) => self.test_action(index),
             Said::OpenLink(address) => open_link(&address),
+            Said::OpenHub => vinput_core::hub::open(),
             Said::ProSignIn => self.pro_sign_in(),
             Said::ProCancel => self.pro_cancel(),
             Said::ProSubscribe(tier, plan) => self.pro_subscribe(tier, plan),
@@ -79,6 +90,13 @@ impl Host {
                 }
             }
             Said::Closed => self.close_window(which),
+            // What is asked of another program of the family, when one is
+            // built beside this one: no window of Vinput's sends it.
+            #[allow(
+                unreachable_patterns,
+                reason = "built alone, Vinput has no such command"
+            )]
+            _ => {}
         }
     }
 
@@ -96,6 +114,7 @@ impl Host {
     /// notice.
     pub(super) fn set(&mut self, change: wire::Change, controller: &mut dyn Controller) {
         let before = self.settings.clone();
+        let page = change::page_of(&change);
         let default_memo_dir = memo::folder("");
         let ground = Ground {
             graphics_card: gpu::card().is_some(),
@@ -120,7 +139,7 @@ impl Host {
         {
             self.settings = before;
             self.tell(
-                Page::General,
+                page,
                 format!("{taken} is used by another program. Pick another key."),
             );
             return;
@@ -179,12 +198,40 @@ impl Host {
     }
 
     /// The model a window named, or a notice that it is not there any more.
+    /// A model that writes is found as well as one that recognizes speech:
+    /// both are downloaded and removed the same way.
     fn model_named(&mut self, id: &str) -> Option<&'static models::Model> {
-        let model = models::by_id(id);
+        let model = models::by_id(id).or_else(|| models::writer(id));
         if model.is_none() {
             self.tell(Page::Models, "That model is no longer on the list.");
         }
         model
+    }
+
+    /// Tidies and edits with the model on this PC called `id` from now on,
+    /// or with the one that comes with the subscription if `id` is empty.
+    fn use_text_model(&mut self, id: &str, controller: &mut dyn Controller) {
+        let chosen = if id.is_empty() {
+            String::new()
+        } else {
+            let Some(model) = models::writer(id) else {
+                return self.tell(Page::Cleanup, "That model is no longer on the list.");
+            };
+            if !view::can_use(&self.installer.status(model, self.settings.use_gpu())) {
+                let why = format!("{} has to be downloaded before it can be used.", model.name);
+                return self.tell(Page::Cleanup, why);
+            }
+            model.id.to_owned()
+        };
+        self.notice = None;
+        if self.settings.text_model != chosen {
+            self.settings.text_model = chosen;
+            self.persist();
+            // The model is made ready now, where the page says how far it
+            // is, and not at the first press of a key.
+            controller.configure(&self.settings, false);
+        }
+        self.slow.make_stale();
     }
 
     /// Dictates with `model` from now on.
@@ -227,11 +274,32 @@ impl Host {
             Status::Missing { .. } | Status::Failed(_)
         ) {
             self.installer.install(model, gpu);
-            // The first model someone downloads is the one they want.
-            if !self.settings.has_model() {
+            if view::writes(model) {
+                // It is put to use, and made ready, when it is here.
+                self.text_model_on_its_way = Some(model.id);
+            } else if !self.settings.has_model() {
+                // The first model someone downloads is the one they want.
                 self.choose_model(model, controller);
             }
             self.slow.make_stale();
+        }
+    }
+
+    /// Puts the model that writes whose download was asked for to use once
+    /// it is here: whoever downloads one wants to use it. Looked at
+    /// whenever a picture is drawn, which is as long as its download is
+    /// watched; one that ends unwatched is chosen by hand.
+    pub(super) fn use_text_model_that_arrived(&mut self, controller: &mut dyn Controller) {
+        let Some(model) = self.text_model_on_its_way.and_then(models::writer) else {
+            return;
+        };
+        match self.installer.status(model, self.settings.use_gpu()) {
+            Status::Installing { .. } => {}
+            Status::Installed => {
+                self.text_model_on_its_way = None;
+                self.use_text_model(model.id, controller);
+            }
+            _ => self.text_model_on_its_way = None,
         }
     }
 
@@ -241,6 +309,11 @@ impl Host {
         };
         let status = self.installer.status(model, self.settings.use_gpu());
         let in_use = view::is_in_use(&self.settings, model);
+        let page = if view::writes(model) {
+            Page::Cleanup
+        } else {
+            Page::Models
+        };
         if !view::can_remove(&status, in_use, model.is_custom()) {
             let why = if in_use {
                 format!(
@@ -250,7 +323,7 @@ impl Host {
             } else {
                 format!("{} cannot be removed now.", model.name)
             };
-            self.tell(Page::Models, why);
+            self.tell(page, why);
             return;
         }
         match self.installer.remove(model) {
@@ -261,7 +334,7 @@ impl Host {
                     Error::Install(why) => why,
                     other => other.to_string(),
                 };
-                self.tell(Page::Models, why);
+                self.tell(page, why);
             }
         }
         self.slow.make_stale();

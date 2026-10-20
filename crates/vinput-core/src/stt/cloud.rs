@@ -53,19 +53,75 @@
 //! on with ([`Standby`]). The task then leaves the audio the server did not
 //! count where the dictation finds it ([`Leftover`]): what was sent after
 //! the count the server gave, or, from a server that gives none, after the
-//! last settled text arrived, and everything that was still waiting to be
-//! sent. The dictation starts a session of the local model, hands it that
+//! place its last settled text reaches, and everything that was still
+//! waiting to be sent. The dictation starts a session of the local model, hands it that
 //! audio first and everything after it, and goes on as if nothing had
 //! happened. From then until the allowance starts again no stream is asked
 //! for at all: [`CloudSpeech::start_session`] hands out sessions of the
 //! local model, which costs a look at a number in memory.
 //!
-//! # When the network stalls
+//! # When the server is out of reach
 //!
-//! A write that the connection does not take within [`SEND_TIMEOUT`] ends
-//! the dictation with a failure instead of letting the user speak into
-//! nothing, and a dictation that is let go of is let go of here at once,
-//! whatever was being waited for.
+//! A connection that is bad or gone, or a server that is failing, does not
+//! end a dictation either when a model is on this PC: the dictation is
+//! carried on there, as it is when the hours run out, and nothing that was
+//! said is lost. Three things count as out of reach:
+//!
+//! - The stream cannot be opened. Reaching the server (its name, TCP, TLS)
+//!   may take [`DIAL_TIMEOUT`], and opening the stream [`CONNECT_TIMEOUT`]
+//!   in all.
+//! - The stream is open and says nothing. A stream that is alive says
+//!   `ready` when it starts, and it is pinged every [`PING_EVERY`]; the
+//!   server answers a ping whether or not anybody speaks, which is what
+//!   tells its silence from the speaker's. A stream that has said nothing
+//!   at all for [`QUIET_TIMEOUT`] has stalled, and so has one that does not
+//!   take a write within [`SEND_TIMEOUT`].
+//! - The connection breaks, or the server says that it cannot go on, for
+//!   a reason that may have passed by the next press ([`cause_of`]).
+//!
+//! The task then leaves the audio that the server did not turn into
+//! settled text ([`Leftover`]), and the dictation hands it to a session of
+//! the local model, with all that follows. Where that audio begins is said
+//! by the server: each settled text comes with how far into the stream's
+//! audio it reaches (`until`), so the model begins at the end of the last
+//! word that was typed, the server's guess at what followed is withdrawn,
+//! and no word is lost or typed twice. A server that does not say is taken
+//! to have settled what had been sent when its text arrived, less a second
+//! while it was guessing at more ([`Leftover::of`]).
+//!
+//! After that the server is left alone for a short while and then tried
+//! again; `stt/standby.rs` has the rule. While a connection takes longer
+//! than a healthy one does, [`SUSPECT_AFTER`], the model is loaded ahead,
+//! so it is ready or on its way when the connection is given up.
+//!
+//! The waits come from measurement. From a good line in the server's part
+//! of Europe (28 connections, October 2026) reaching the server took 70 to
+//! 120 ms, of which the name 1 to 40, TCP 10 to 30 and TLS 30 to 60, and an
+//! answer to a request on it 34 to 47 ms, 36 at the median.
+//!
+//! - [`DIAL_TIMEOUT`], 3 s: thirty times what it takes. Windows sends the
+//!   first packet of a connection again after one second, so one that is
+//!   lost on a poor line and a slow handshake after it still fit. A PC
+//!   that is offline does not wait for this: it is told at once.
+//! - [`CONNECT_TIMEOUT`], 8 s: the server runs no instance while nobody
+//!   dictates, and one that has to start answers after one to two seconds
+//!   (`cloud/docs/deploy.md`; none was caught starting in the measurements,
+//!   not after 25 idle minutes either). This is several times that, on top
+//!   of the dial, because giving up on a server that is only starting
+//!   would put the first dictation of the day on the local model.
+//! - [`QUIET_TIMEOUT`], 4 s: a hundred round trips. It has to outlast a
+//!   line that loses packets but works, on which TCP sends again after 0.3,
+//!   0.6 and 1.2 s, so three losses in a row are 2.1 s of silence; and the
+//!   two seconds the server may take to write down a stream's count at its
+//!   end, during which it answers nothing. Being wrong costs little: no
+//!   word is lost, the rest of that one dictation is recognized here.
+//! - [`PING_EVERY`], 1 s: four chances to be heard within the above, and
+//!   one small frame a second only while a dictation runs.
+//! - [`SUSPECT_AFTER`], 2 s: half of the above, and as long as an instance
+//!   takes to start, so a model is not often loaded for nothing.
+//!
+//! A dictation that is let go of is let go of here at once, whatever was
+//! being waited for.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -79,7 +135,7 @@ use tokio::io::AsyncReadExt;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
-use tokio::time::{sleep, timeout};
+use tokio::time::{MissedTickBehavior, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -87,17 +143,28 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{Bytes, Error as WsError, Message};
 
 use super::live::{self, Client, Network, Socket, Stream};
-use super::standby::Standby;
+use super::standby::{Cause, Standby};
 use super::{Emit, ProviderKind, SessionOptions, SpeechProvider, Transcriber, Transcript};
 use crate::audio::SAMPLE_RATE_HZ;
 use crate::cloud::{self, Account, Code, Failure};
 use crate::{Error, Result, log};
 
-/// How long opening a stream may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long reaching the server may take: its name, TCP and TLS. See "When
+/// the server is out of reach" above for how each of these was arrived at.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long opening a stream may take in all.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long an open stream may say nothing at all, not even in answer to
+/// a ping, before it is taken to have stalled.
+const QUIET_TIMEOUT: Duration = Duration::from_secs(4);
+/// How often an open stream is pinged.
+const PING_EVERY: Duration = Duration::from_secs(1);
+/// How long opening a stream, or an answer on an open one, may take before
+/// the model on this PC is loaded in case it is needed.
+const SUSPECT_AFTER: Duration = Duration::from_secs(2);
 /// How long the connection may take to accept one message before the
 /// network is taken to have stalled.
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const SEND_TIMEOUT: Duration = QUIET_TIMEOUT;
 /// How long a connection is kept ready after a dictation. Well under the two
 /// minutes at which idle connections behind a home router start to be
 /// dropped, so no ping is ever needed to keep it.
@@ -125,8 +192,16 @@ const BYTES_PER_MS: u64 = SAMPLE_RATE_HZ as u64 * 2 / 1000;
 /// ever on its way.
 const KEEP_BYTES: usize = 30 * SAMPLE_RATE_HZ as usize * 2;
 
+/// How far behind the audio a server that does not say how far its
+/// settled text reaches settles a word at the soonest: one second.
+const BEHIND_BYTES: u64 = 1000 * BYTES_PER_MS;
+
 /// Where in Settings the account is, for the end of an error message.
 const WHERE: &str = "Settings, VinPUT Pro";
+/// What is added to a failure of the connection when no model is on this PC
+/// to carry on with.
+const NO_MODEL: &str =
+    "and no model is downloaded to carry on with on this PC; get one under Settings, Models";
 
 const FINISH_MESSAGE: &str = r#"{"type":"finish"}"#;
 
@@ -134,14 +209,19 @@ const FINISH_MESSAGE: &str = r#"{"type":"finish"}"#;
 /// the log in a build that ships; a build for development always does.
 const ENV_TIMING: &str = "VINPUT_TIMING";
 
-/// The first message of a stream: what to listen for.
-fn start_message(languages: &[String]) -> String {
-    json!({
+/// The first message of a stream: what to listen for. `terms` are the
+/// words of the user's dictionary; a server that does not know the field
+/// leaves it unread.
+fn start_message(languages: &[String], terms: &[String]) -> String {
+    let mut start = json!({
         "type": "start",
         "languages": hints(languages),
         "sample_rate": SAMPLE_RATE_HZ,
-    })
-    .to_string()
+    });
+    if !terms.is_empty() {
+        start["terms"] = json!(terms);
+    }
+    start.to_string()
 }
 
 /// The languages as the server takes them: `sl` for `sl-SI`, each once, in
@@ -179,8 +259,9 @@ fn counted_bytes(seconds: f64) -> u64 {
 enum Update {
     /// Words that may still change.
     Partial(String),
-    /// Words that are settled.
-    Final(String),
+    /// Words that are settled, and how many bytes of the stream's audio
+    /// all the settled text reaches, if the server said.
+    Final(String, Option<u64>),
     /// The stream is complete, with this many bytes of its audio counted,
     /// if the server said.
     Done(Option<u64>),
@@ -199,7 +280,7 @@ fn read_message(text: &str) -> Update {
     let counted = || message["seconds"].as_f64().map(counted_bytes);
     match message["type"].as_str() {
         Some("partial") => Update::Partial(said()),
-        Some("final") => Update::Final(said()),
+        Some("final") => Update::Final(said(), message["until"].as_f64().map(counted_bytes)),
         Some("done") => Update::Done(counted()),
         Some("error") => {
             let error = &message["error"];
@@ -284,6 +365,14 @@ fn stalled() -> Error {
     )
 }
 
+fn silent() -> Error {
+    Error::Transcription("VinPUT Pro stopped answering; check your internet connection".into())
+}
+
+fn out_of_time() -> Error {
+    Error::Transcription("connecting to VinPUT Pro timed out".into())
+}
+
 /// The moments of a dictation that are measured, each from the key press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mark {
@@ -315,6 +404,8 @@ struct Timeline {
     at: [AtomicU32; MARKS],
     /// Whether the stream was opened on a connection that was kept ready.
     kept: AtomicBool,
+    /// Whether the server answered a ping on it.
+    answered: AtomicBool,
 }
 
 impl Timeline {
@@ -323,6 +414,7 @@ impl Timeline {
             pressed: Instant::now(),
             at: Default::default(),
             kept: AtomicBool::new(false),
+            answered: AtomicBool::new(false),
         }
     }
 
@@ -347,6 +439,7 @@ impl Timeline {
         };
         Timings {
             kept_ready: self.kept.load(Ordering::Relaxed),
+            ping_answered: self.answered.load(Ordering::Relaxed),
             socket_open: at(Mark::Open),
             first_audio: at(Mark::FirstAudio),
             first_partial: at(Mark::FirstPartial),
@@ -365,6 +458,9 @@ pub struct Timings {
     /// Whether the stream was opened on a connection kept ready from the
     /// dictation before.
     pub kept_ready: bool,
+    /// Whether the server answered a ping on the stream: only a server that
+    /// does is found out when a stream stalls without closing.
+    pub ping_answered: bool,
     /// The WebSocket was open.
     pub socket_open: Option<Duration>,
     /// The first audio had been written to it.
@@ -411,7 +507,11 @@ impl fmt::Display for Timings {
             let after = typed.saturating_sub(released).as_millis();
             write!(f, " ({after} ms after the key)")?;
         }
-        Ok(())
+        if self.ping_answered {
+            write!(f, ", pings answered")
+        } else {
+            write!(f, ", no ping answered")
+        }
     }
 }
 
@@ -425,8 +525,12 @@ fn timings_are_logged() -> bool {
 /// connection is kept ready. Tests shorten them.
 #[derive(Debug, Clone, Copy)]
 struct Timing {
+    dial: Duration,
     connect: Duration,
     send: Duration,
+    quiet: Duration,
+    ping: Duration,
+    suspect: Duration,
     warm_for: Duration,
     warm_answer: Duration,
 }
@@ -434,8 +538,12 @@ struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         Self {
+            dial: DIAL_TIMEOUT,
             connect: CONNECT_TIMEOUT,
             send: SEND_TIMEOUT,
+            quiet: QUIET_TIMEOUT,
+            ping: PING_EVERY,
+            suspect: SUSPECT_AFTER,
             warm_for: WARM_FOR,
             warm_answer: WARM_ANSWER,
         }
@@ -464,8 +572,13 @@ struct Shared {
     request: Request,
     timing: Timing,
     ready: Mutex<Ready>,
-    /// What dictation carries on with when the month's hours are used up.
+    /// What dictation carries on with when the month's hours are used up,
+    /// or the server is out of reach.
     standby: Arc<Standby>,
+    /// Whether the server has ever answered a ping. Until it has, a stream
+    /// is not held to answering them: something between here and the
+    /// server may not pass them on.
+    answers: AtomicBool,
 }
 
 impl Shared {
@@ -515,7 +628,7 @@ fn keep_ready(shared: &Arc<Shared>) {
 /// up, or the server has closed it.
 async fn keep(shared: Arc<Shared>, id: u64, mut taken: oneshot::Receiver<oneshot::Sender<Stream>>) {
     let dialing = live::dial(&shared.tls, &shared.request);
-    let Ok(Ok(mut stream)) = timeout(shared.timing.connect, dialing).await else {
+    let Ok(Ok(mut stream)) = timeout(shared.timing.dial, dialing).await else {
         // A dictation that was already waiting for it connects for itself.
         shared.let_go(id);
         return;
@@ -578,6 +691,7 @@ impl CloudSpeech {
             timing,
             ready: Mutex::default(),
             standby,
+            answers: AtomicBool::new(false),
         });
         keep_fresh(&shared);
         Ok(Self {
@@ -590,7 +704,7 @@ impl CloudSpeech {
     fn session(&self, options: SessionOptions<'_>) -> CloudSession {
         let (stream, client) = live::session("VinPUT Pro stream", MAX_MESSAGE);
         let marks = Arc::new(Timeline::begin());
-        let start = start_message(options.languages);
+        let start = start_message(options.languages, &crate::words::listened_for());
         let spare = Arc::<Mutex<Option<Leftover>>>::default();
         let serving = serve(
             Arc::clone(&self.shared),
@@ -631,6 +745,10 @@ impl SpeechProvider for CloudSpeech {
         // While the month's hours are used up the server is not asked: it
         // would only say so again, a round trip later.
         if let Some(session) = self.shared.standby.session(options) {
+            return Ok(session);
+        }
+        // Nor for a short while after it could not be reached.
+        if let Some(session) = self.shared.standby.cover(options) {
             return Ok(session);
         }
         Ok(Box::new(self.session(options)))
@@ -692,16 +810,20 @@ async fn connection(
     {
         return Ok((stream, true));
     }
-    match live::dial(&shared.tls, &shared.request).await {
-        Ok(stream) => Ok((stream, false)),
-        Err(err) => Err(Unopened::Failed(lost("connecting to", &err))),
+    let dialing = live::dial(&shared.tls, &shared.request);
+    match timeout(shared.timing.dial, dialing).await {
+        Ok(Ok(stream)) => Ok((stream, false)),
+        Ok(Err(err)) => Err(Unopened::Failed(lost("connecting to", &err))),
+        Err(_) => Err(Unopened::Failed(out_of_time())),
     }
 }
 
 /// Opens a stream, within the time connecting may take. The connection is
 /// made while the token is fetched, if one has to be. An access token the
 /// server no longer takes is traded for a new one, once; a connection that
-/// was kept ready and has died is replaced by a new one.
+/// was kept ready and has died is replaced by a new one. When it takes
+/// longer than it does on a healthy connection, the model on this PC is
+/// loaded meanwhile, in case this is given up.
 async fn open(shared: &Arc<Shared>, marks: &Timeline) -> std::result::Result<Socket, Unopened> {
     let opening = async {
         let mut given = shared.take_ready();
@@ -743,10 +865,17 @@ async fn open(shared: &Arc<Shared>, marks: &Timeline) -> std::result::Result<Soc
             }
         }
     };
-    let timed_out = || Error::Transcription("connecting to VinPUT Pro timed out".into());
-    timeout(shared.timing.connect, opening)
+    tokio::pin!(opening);
+    let Timing {
+        connect, suspect, ..
+    } = shared.timing;
+    if let Ok(opened) = timeout(suspect.min(connect), &mut opening).await {
+        return opened;
+    }
+    shared.standby.warm();
+    timeout(connect.saturating_sub(suspect), opening)
         .await
-        .unwrap_or_else(|_| Err(Unopened::Failed(timed_out())))
+        .unwrap_or_else(|_| Err(Unopened::Failed(out_of_time())))
 }
 
 /// Whether a refusal says that the month's allowance is used up.
@@ -796,11 +925,29 @@ struct Sent {
     bytes: u64,
     tail: VecDeque<Bytes>,
     kept: usize,
-    /// How much of it had been sent when the last settled text arrived.
+    /// How much of it the settled text reaches: as far as the server said
+    /// with the last settled text, or, from a server that does not say, as
+    /// much as had been sent when that text arrived.
     settled: u64,
+    /// Whether the server said.
+    exact: bool,
+    /// The furthest the server ever said its settled text reaches.
+    known: u64,
 }
 
 impl Sent {
+    /// Settled text has arrived, which reaches `reached` bytes of this
+    /// stream's audio, if the server said.
+    fn settle(&mut self, reached: Option<u64>) {
+        self.exact = reached.is_some();
+        // Whole samples, and never back behind what was settled before.
+        let reached = reached.map_or(self.bytes, |reached| reached.min(self.bytes) & !1);
+        self.settled = self.settled.max(reached);
+        if self.exact {
+            self.known = self.settled;
+        }
+    }
+
     fn note(&mut self, piece: &Bytes) {
         self.bytes += piece.len() as u64;
         self.kept += piece.len();
@@ -844,25 +991,46 @@ struct Io {
     /// How many bytes of the stream it had counted when it said so, if it
     /// said that too.
     counted: Option<u64>,
+    /// How many bytes of the stream's audio the settled text reaches, if
+    /// the server said so with the settled text that arrived last.
+    reached: Option<u64>,
+    /// Whether the server is guessing at speech it has not settled.
+    guessing: bool,
 }
 
-/// The audio of a dictation that the server did not count before the
-/// month's allowance was used up: what a model on this PC recognizes first.
-#[derive(Default)]
+/// The audio of a dictation that the server did not turn into settled text
+/// before it could no longer serve: what a model on this PC recognizes
+/// first.
 struct Leftover {
+    /// Why the server could not go on.
+    cause: Cause,
     audio: Vec<u8>,
     /// Whether that is all of it; a long stretch is kept only in part.
     whole: bool,
 }
 
 impl Leftover {
-    /// Gathers what the server did not count: the end of what the stream
+    /// Gathers what the server did not settle: the end of what the stream
     /// was sent, and everything that was still waiting to be sent. Nothing
     /// more is taken from the dictation after this.
-    fn of(io: &mut Io, talk: &mut Talk) -> Self {
+    ///
+    /// Where the end begins is what the server counted, when it said so
+    /// with a refusal, and otherwise as far as its settled text reaches. A
+    /// server that does not say how far that is has settled, at the most,
+    /// what was sent when the text arrived; and while it is guessing at
+    /// more, a second less than that, which is how far behind the audio it
+    /// settles a word at the soonest, though never before a place it did
+    /// name. Its guess is withdrawn and that speech is recognized here, so
+    /// it is better to begin too late by a word than to type one twice.
+    fn of(cause: Cause, io: &mut Io, talk: &mut Talk) -> Self {
         io.audio.close();
         let sent = std::mem::take(&mut talk.sent);
-        let counted = io.counted.unwrap_or(sent.settled).min(sent.bytes);
+        let settled = if sent.exact || !io.guessing {
+            sent.settled
+        } else {
+            (sent.settled.saturating_sub(BEHIND_BYTES) & !1).max(sent.known)
+        };
+        let counted = io.counted.unwrap_or(settled).min(sent.bytes);
         let whole = sent.bytes - counted <= sent.kept as u64;
         let mut audio = sent.past(counted).concat();
         for piece in talk.carry.drain(..) {
@@ -872,7 +1040,11 @@ impl Leftover {
         while let Ok(more) = io.audio.try_recv() {
             audio.extend(more);
         }
-        Self { audio, whole }
+        Self {
+            cause,
+            audio,
+            whole,
+        }
     }
 }
 
@@ -934,6 +1106,8 @@ async fn serve(
         finals: 0,
         used_up: false,
         counted: None,
+        reached: None,
+        guessing: false,
     };
     let mut talk = Talk {
         audio_open: true,
@@ -949,14 +1123,18 @@ async fn serve(
         _ = &mut gone => None,
         outcome = dictate(&shared, &start, &mut io, &mut talk, &mut socket, &marks) => Some(outcome),
     };
-    if let Some(Err(err)) = outcome {
-        // Held from before the audio is closed until the failure is on its
-        // way, so that whoever hears of either finds what was left.
-        let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
-        if io.used_up {
-            *spare = Some(Leftover::of(&mut io, &mut talk));
+    match outcome {
+        Some(Err(err)) => {
+            // Held from before the audio is closed until the failure is on
+            // its way, so that whoever hears of either finds what was left.
+            let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(cause) = cause_of(&err, io.used_up) {
+                *spare = Some(Leftover::of(cause, &mut io, &mut talk));
+            }
+            let _ = io.results.send(Err(err));
         }
-        let _ = io.results.send(Err(err));
+        Some(Ok(())) => shared.standby.reached(),
+        None => {}
     }
     // The dictation is told that it is over before the connection is closed.
     drop(io);
@@ -970,6 +1148,19 @@ async fn serve(
         keep_ready(&shared);
     }
     keep_fresh(&shared);
+}
+
+/// Why a model on this PC may carry on a dictation that ended with `err`,
+/// if it may. Hours that are used up are one reason. The other is every
+/// failure that may have passed by the next press ([`explain`]): a
+/// connection that is bad or gone, a server that is failing or busy. What
+/// only the account can put right ends the dictation, and says so.
+fn cause_of(err: &Error, used_up: bool) -> Option<Cause> {
+    match err {
+        _ if used_up => Some(Cause::UsedUp),
+        Error::Transcription(_) => Some(Cause::OutOfReach),
+        _ => None,
+    }
 }
 
 async fn dictate(
@@ -1027,8 +1218,16 @@ fn hear(
         Some(Err(err)) => return Err(Trouble::Lost(lost("receiving from", &err))),
     };
     let (text, is_final) = match update {
-        Update::Partial(text) => (text, false),
-        Update::Final(text) => (text, true),
+        Update::Partial(text) => {
+            io.guessing = !text.is_empty();
+            (text, false)
+        }
+        Update::Final(text, reached) => {
+            // It took the place of the guess that was showing.
+            io.guessing = false;
+            io.reached = reached;
+            (text, true)
+        }
         Update::Done(counted) => {
             if let Some(counted) = counted {
                 shared.standby.counted(counted / (BYTES_PER_MS * 1000));
@@ -1136,6 +1335,20 @@ async fn converse(
         )
         .await?;
     }
+    let Timing {
+        ping,
+        quiet,
+        suspect,
+        ..
+    } = shared.timing;
+    // The first ping goes out as the stream starts, so that a server which
+    // answers them is known to within a round trip.
+    let mut beat = interval_at(tokio::time::Instant::now(), ping);
+    beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // When the server was last heard from, and whether it ever was on this
+    // stream.
+    let mut heard_at = Instant::now();
+    let mut heard_any = false;
     loop {
         // In this order: what the server has said is read before more is
         // written, so that its last words are not lost to a write that it
@@ -1143,12 +1356,20 @@ async fn converse(
         tokio::select! {
             biased;
             heard = socket.next() => {
+                if let Some(Ok(message)) = &heard {
+                    heard_at = Instant::now();
+                    heard_any = true;
+                    if message.is_pong() {
+                        shared.answers.store(true, Ordering::Relaxed);
+                        marks.answered.store(true, Ordering::Relaxed);
+                    }
+                }
                 let finals = io.finals;
                 if let Some(ended) = hear(heard, io, shared, marks)? {
                     return Ok(ended);
                 }
                 if io.finals > finals {
-                    talk.sent.settled = talk.sent.bytes;
+                    talk.sent.settle(io.reached.take());
                 }
             }
             chunk = next_audio(talk, &mut io.audio), if talk.audio_open => {
@@ -1166,6 +1387,25 @@ async fn converse(
                 }
                 marks.mark(Mark::FirstAudio);
             }
+            _ = beat.tick() => {
+                // A stream says `ready` when it starts and answers every
+                // ping after that, so one that is alive is never quiet for
+                // long, whether or not anybody speaks. It is held to the
+                // first always, and to the second once the server has been
+                // seen to answer a ping at all.
+                let quiet_for = heard_at.elapsed();
+                let held = !heard_any || shared.answers.load(Ordering::Relaxed);
+                if held && quiet_for >= quiet {
+                    return Err(silent());
+                }
+                if held && quiet_for >= suspect {
+                    shared.standby.warm();
+                }
+                let asking = Message::Ping(Bytes::new());
+                if let Err(failed) = write(shared, socket, asking, "reaching").await {
+                    return last_words(shared, socket, io, marks, failed).await;
+                }
+            }
         }
     }
 }
@@ -1180,8 +1420,8 @@ struct CloudSession {
     marks: Arc<Timeline>,
     /// Whether the timings go to the log when the dictation is over.
     logged: bool,
-    /// Where the task leaves the audio the server did not count, if the
-    /// month's allowance is used up.
+    /// Where the task leaves the audio the server did not settle, if a
+    /// model on this PC may carry on with it.
     spare: Arc<Mutex<Option<Leftover>>>,
     standby: Arc<Standby>,
     languages: Vec<String>,
@@ -1198,28 +1438,51 @@ struct CloudSession {
 
 impl CloudSession {
     /// The stream has ended with `failed`. If that is because the month's
-    /// allowance is used up and a model on this PC can carry on, a session
-    /// of that model takes over: it is handed what the server did not
-    /// count, and `pcm` if that was fed and not taken any more. Otherwise
-    /// the dictation ends with `failed`, as it always has.
-    fn carry_on(&mut self, failed: Error, pcm: &[i16]) -> Result<()> {
+    /// allowance is used up, or because the server is out of reach, and a
+    /// model on this PC can carry on, a session of that model takes over:
+    /// it is handed what the server did not settle, and what was fed after
+    /// the stream had ended. Otherwise the dictation ends with `failed`, as
+    /// it always has, which for a connection that failed also says that no
+    /// model is here to carry on with.
+    fn carry_on(&mut self, failed: Error) -> Result<()> {
         // Waits for the task, which may still be gathering what is left.
         let left = self
             .spare
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        // The task closes the audio before its failure is on its way, so
+        // a feed in between only finds the stream closed. By now the
+        // failure has arrived, and it is the one that says why.
+        let (rest, why) = self.stream.rest();
+        let failed = why.unwrap_or(failed);
         let Some(left) = left else {
             return Err(failed);
         };
         let options = SessionOptions {
             languages: &self.languages,
         };
-        let Some(mut local) = self.standby.take_over(options, left.whole) else {
-            return Err(failed);
+        let local = match left.cause {
+            Cause::UsedUp => self.standby.take_over(options, left.whole),
+            Cause::OutOfReach => self.standby.stand_in(options, left.whole),
         };
+        let Some(mut local) = local else {
+            return Err(match failed {
+                Error::Transcription(why)
+                    if left.cause == Cause::OutOfReach && self.standby.looks() =>
+                {
+                    Error::Transcription(format!("{why}, {NO_MODEL}"))
+                }
+                failed => failed,
+            });
+        };
+        if left.cause == Cause::OutOfReach {
+            log::write(&format!(
+                "{failed}: the dictation carries on with the model on this PC"
+            ));
+        }
         // What the server settled before it stopped comes first.
-        self.ready.extend(self.stream.rest());
+        self.ready.extend(rest);
         let samples: Vec<i16> = left
             .audio
             .chunks_exact(2)
@@ -1228,8 +1491,8 @@ impl CloudSession {
         for chunk in samples.chunks(HANDOVER_BYTES / 2) {
             self.ready.extend(local.feed(chunk)?);
         }
-        if self.stream.unsent {
-            self.ready.extend(local.feed(pcm)?);
+        for chunk in self.stream.take_unsent().chunks(HANDOVER_BYTES / 2) {
+            self.ready.extend(local.feed(chunk)?);
         }
         self.local = Some(local);
         self.withdrawn = true;
@@ -1246,7 +1509,7 @@ impl Transcriber for CloudSession {
         }
         match self.stream.feed(pcm) {
             Err(failed) => {
-                self.carry_on(failed, pcm)?;
+                self.carry_on(failed)?;
                 Ok(self.ready.pop_front())
             }
             fed => fed,
@@ -1263,7 +1526,7 @@ impl Transcriber for CloudSession {
                 Ok(())
             });
             match finished {
-                Err(failed) => self.carry_on(failed, &[])?,
+                Err(failed) => self.carry_on(failed)?,
                 Ok(()) => return Ok(()),
             }
         }
@@ -1353,6 +1616,7 @@ pub fn measure(
 
 #[cfg(test)]
 mod tests {
+    use super::super::standby::tests::{Heard, out_of_reach, used_up, with_model};
     use super::*;
     use crate::cloud::fake::{Fake, Memory, Script};
 
@@ -1361,13 +1625,19 @@ mod tests {
     #[test]
     fn the_start_names_the_languages_and_the_rate() {
         let languages = ["sl-SI".to_owned(), "en-US".to_owned(), "en-GB".to_owned()];
-        let start: Value = serde_json::from_str(&start_message(&languages)).unwrap_or_default();
+        let start: Value =
+            serde_json::from_str(&start_message(&languages, &[])).unwrap_or_default();
         assert_eq!(
             start,
             json!({"type": "start", "languages": ["sl", "en"], "sample_rate": 16000})
         );
-        let none: Value = serde_json::from_str(&start_message(&[])).unwrap_or_default();
+        let none: Value = serde_json::from_str(&start_message(&[], &[])).unwrap_or_default();
         assert_eq!(none["languages"], json!([]));
+        // The words of the dictionary go along when there are any.
+        let terms = ["VinPUT".to_owned(), "Lovro Rakar".to_owned()];
+        let listening: Value =
+            serde_json::from_str(&start_message(&[], &terms)).unwrap_or_default();
+        assert_eq!(listening["terms"], json!(["VinPUT", "Lovro Rakar"]));
         assert_eq!(hints(&[" EN_us ".to_owned(), String::new()]), ["en"]);
     }
 
@@ -1380,7 +1650,12 @@ mod tests {
         );
         assert_eq!(
             read_message(r#"{"type":"final","text":"Hello. "}"#),
-            Update::Final("Hello. ".into())
+            Update::Final("Hello. ".into(), None)
+        );
+        // A server that says how far its settled text reaches.
+        assert_eq!(
+            read_message(r#"{"type":"final","text":"Hello. ","until":1.5}"#),
+            Update::Final("Hello. ".into(), Some(48_000))
         );
         // What was counted is said in seconds and kept in bytes of audio.
         assert_eq!(
@@ -1524,6 +1799,7 @@ mod tests {
 
         let line = Timings {
             kept_ready: true,
+            ping_answered: true,
             socket_open: Some(Duration::from_millis(40)),
             first_audio: Some(Duration::from_millis(41)),
             first_partial: None,
@@ -1537,7 +1813,12 @@ mod tests {
             line,
             "socket open on a connection kept ready 40 ms, first audio sent 41 ms, first \
              partial never, first settled text 900 ms, key released 2000 ms, final received \
-             2200 ms, text typed 2201 ms (201 ms after the key)"
+             2200 ms, text typed 2201 ms (201 ms after the key), pings answered"
+        );
+        assert!(
+            Timings::default()
+                .to_string()
+                .ends_with(", no ping answered")
         );
     }
 
@@ -1691,17 +1972,19 @@ mod tests {
 
     /// A provider at the stand-in, signed in, with a made-up model on this
     /// PC to carry on with, and what that model hears.
-    fn speech_with_model(
+    fn speech_with_model(fake: &Fake) -> Result<(CloudSpeech, Arc<Standby>, Arc<Heard>)> {
+        speech_with_model_and(fake, quick())
+    }
+
+    /// The same, with these waits.
+    fn speech_with_model_and(
         fake: &Fake,
-    ) -> Result<(
-        CloudSpeech,
-        Arc<Standby>,
-        Arc<super::super::standby::tests::Heard>,
-    )> {
-        let (standby, heard) = super::super::standby::tests::with_model();
+        timing: Timing,
+    ) -> Result<(CloudSpeech, Arc<Standby>, Arc<Heard>)> {
+        let (standby, heard) = with_model();
         let (account, memory) = fake.account();
         memory.sign_in(fake);
-        let speech = CloudSpeech::with(account, quick(), Arc::clone(&standby))?;
+        let speech = CloudSpeech::with(account, timing, Arc::clone(&standby))?;
         Ok((speech, standby, heard))
     }
 
@@ -1716,7 +1999,7 @@ mod tests {
         assert_eq!(typed, "Locally.");
         // Everything that was said reached the model, once and in order.
         assert_eq!(heard.fed(), audio_of(0..3));
-        assert_eq!(standby.take_served(), Some(true));
+        assert_eq!(standby.take_served(), Some(used_up(true)));
         assert!(standby.until() > 0);
         // From then on the server is not asked for a stream at all.
         let (typed, finished) = dictate(&speech, 2);
@@ -1724,7 +2007,7 @@ mod tests {
         assert_eq!(typed, "Locally.");
         assert_eq!(fake.asked("GET /v1/stream"), 1);
         assert_eq!(heard.sessions(), 2);
-        assert_eq!(standby.take_served(), Some(true));
+        assert_eq!(standby.take_served(), Some(used_up(true)));
         Ok(())
     }
 
@@ -1799,7 +2082,7 @@ mod tests {
         let mut expected = vec![0i16; 80];
         expected.extend(audio_of(1..5));
         assert_eq!(heard.fed(), expected);
-        assert_eq!(standby.take_served(), Some(true));
+        assert_eq!(standby.take_served(), Some(used_up(true)));
         assert_eq!(fake.asked("GET /v1/stream"), 1);
 
         // A server that does not say: what was sent after the last settled
@@ -1811,7 +2094,7 @@ mod tests {
         assert!(finished.is_ok(), "{finished:?}");
         assert_eq!(typed, "So far. Locally.");
         assert_eq!(heard.fed(), audio_of(1..5));
-        assert_eq!(standby.take_served(), Some(true));
+        assert_eq!(standby.take_served(), Some(used_up(true)));
         // The next one does not ask the server.
         assert_eq!(dictate(&speech, 1).0, "Locally.");
         assert_eq!(fake.asked("GET /v1/stream"), 1);
@@ -1850,15 +2133,18 @@ mod tests {
             finals: 0,
             used_up: true,
             counted: Some(0),
+            reached: None,
+            guessing: false,
         };
-        let left = Leftover::of(&mut io, &mut talk);
+        let left = Leftover::of(Cause::UsedUp, &mut io, &mut talk);
         assert!(!left.whole);
         // The end of what was sent, what did not fit a message, and what
         // was still waiting, in that order.
         assert_eq!(left.audio.len(), 16 + 4 + 4);
         assert_eq!(left.audio[16..], [7, 7, 7, 7, 9, 0, 9, 0]);
         // Nothing more is taken from the dictation.
-        assert!(session.feed(&[1i16; 2]).is_err() && session.unsent);
+        assert!(session.feed(&[1i16; 2]).is_err());
+        assert_eq!(session.take_unsent(), [1, 1]);
     }
 
     #[cfg(windows)]
@@ -2333,6 +2619,8 @@ mod tests {
             unreachable!("two rounds were measured");
         };
         assert!(!first.kept_ready && second.kept_ready);
+        // Three tenths of a second are enough for the first ping's answer.
+        assert!(first.ping_answered && second.ping_answered);
         for timings in [first, second] {
             let Timings {
                 socket_open: Some(open),
@@ -2356,6 +2644,358 @@ mod tests {
         // All of the file reached the server, both times.
         let seen = fake.read(|state| state.streams.clone());
         assert!(seen.iter().all(|stream| stream.audio == samples));
+        Ok(())
+    }
+
+    /// Waits short enough for a test to see a stream given up.
+    fn impatient() -> Timing {
+        Timing {
+            connect: Duration::from_millis(600),
+            quiet: Duration::from_millis(300),
+            ping: Duration::from_millis(40),
+            suspect: Duration::from_millis(100),
+            ..quick()
+        }
+    }
+
+    /// Waits until `check` holds. Says whether it came to.
+    fn eventually(check: impl Fn() -> bool) -> bool {
+        let started = Instant::now();
+        while !check() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        check()
+    }
+
+    /// One dictation on a stream that works, kept open until the server
+    /// has answered a ping: from then on streams are held to answering.
+    fn dictate_until_a_ping_is_answered(speech: &CloudSpeech) -> Outcome {
+        let mut session = speech.start_session(SessionOptions { languages: &[] })?;
+        session.feed(&[0i16; 160])?;
+        assert!(eventually(|| speech.shared.answers.load(Ordering::Relaxed)));
+        session.finish(&mut |_| Ok(()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn settled_text_reaches_as_far_as_the_server_says_and_never_back() {
+        let mut sent = pieces(&[100, 100]);
+        // A server that does not say: as much as was sent by then.
+        sent.settle(None);
+        assert_eq!((sent.settled, sent.exact), (200, false));
+        sent.note(&Bytes::from(vec![0u8; 100]));
+        // One that does: whole samples, and no more than was sent.
+        sent.settle(Some(251));
+        assert_eq!((sent.settled, sent.exact), (250, true));
+        sent.settle(Some(120));
+        assert_eq!(sent.settled, 250);
+        sent.settle(Some(9000));
+        assert_eq!((sent.settled, sent.known), (300, 300));
+        // Text that does not say is taken to reach what was sent by then,
+        // and what was said before stays known.
+        sent.note(&Bytes::from(vec![0u8; 50]));
+        sent.settle(None);
+        assert_eq!((sent.settled, sent.exact, sent.known), (350, false, 300));
+    }
+
+    #[test]
+    fn what_is_handed_over_begins_where_the_settled_text_ends() {
+        // Two seconds were sent when settled text arrived, and a third
+        // after it. Returns how many bytes are left to recognize here.
+        let left = |reached: Option<u64>, guessing: bool| {
+            let (_session, client) = live::session("test stream", MAX_MESSAGE);
+            let mut sent = Sent::default();
+            sent.note(&Bytes::from(vec![1u8; 64_000]));
+            sent.settle(reached);
+            sent.note(&Bytes::from(vec![2u8; 32_000]));
+            let mut talk = Talk {
+                audio_open: true,
+                pending: None,
+                carry: Vec::new(),
+                sent,
+            };
+            let mut io = Io {
+                audio: client.audio,
+                results: client.results,
+                finals: 1,
+                used_up: false,
+                counted: None,
+                reached: None,
+                guessing,
+            };
+            let left = Leftover::of(Cause::OutOfReach, &mut io, &mut talk);
+            assert!(left.whole);
+            left.audio.len()
+        };
+        // The server said how far its text reaches: from there, exactly,
+        // whatever it was guessing at.
+        assert_eq!(left(Some(40_000), true), 56_000);
+        assert_eq!(left(Some(40_000), false), 56_000);
+        // It did not say, and had nothing more in hand: from what was sent
+        // when the text arrived.
+        assert_eq!(left(None, false), 32_000);
+        // It did not say and was guessing at more: a second before that,
+        // which is how far behind it settles a word at the soonest.
+        assert_eq!(left(None, true), 64_000);
+    }
+
+    #[test]
+    fn only_what_may_pass_or_used_up_hours_is_carried_on_here() {
+        let lost = ended_early();
+        assert_eq!(cause_of(&lost, false), Some(Cause::OutOfReach));
+        assert_eq!(cause_of(&silent(), false), Some(Cause::OutOfReach));
+        assert_eq!(cause_of(&out_of_time(), false), Some(Cause::OutOfReach));
+        for code in [
+            Code::UpstreamFailed,
+            Code::Unavailable,
+            Code::Internal,
+            Code::TooManyRequests,
+        ] {
+            let failed = explain(&Failure::refused(code, "x"));
+            assert_eq!(
+                cause_of(&failed, false),
+                Some(Cause::OutOfReach),
+                "{code:?}"
+            );
+        }
+        let unreachable = explain(&Failure::Unreachable("offline".into()));
+        assert_eq!(cause_of(&unreachable, false), Some(Cause::OutOfReach));
+        // What only the account can put right ends the dictation.
+        for code in [Code::SubscriptionRequired, Code::Unauthorized] {
+            let failed = explain(&Failure::refused(code, "x"));
+            assert_eq!(cause_of(&failed, false), None, "{code:?}");
+        }
+        assert_eq!(cause_of(&explain(&Failure::SignedOut), false), None);
+        // Hours that are used up are their own reason.
+        let used_up = explain(&Failure::refused(Code::QuotaExceeded, "x"));
+        assert_eq!(cause_of(&used_up, true), Some(Cause::UsedUp));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_server_that_refuses_the_connection_is_followed_by_the_model_on_this_pc() -> Outcome {
+        let fake = Fake::start()?;
+        let (standby, heard) = with_model();
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        // Connecting to a port nobody listens on takes Windows two seconds
+        // to give up: the wait for it is the one that ships.
+        let speech = CloudSpeech::with(account, Timing::default(), Arc::clone(&standby))?;
+        assert!(eventually(|| speech.shared.account.is_ready()));
+        // The access token is in memory, and the server is gone.
+        drop(fake);
+        let (typed, finished) = dictate(&speech, 3);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        // Everything that was said reached the model, once and in order.
+        assert_eq!(heard.fed(), audio_of(0..3));
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        assert!(standby.out_of_reach());
+        // The next press does not wait for the same refusal again.
+        let started = Instant::now();
+        let (typed, finished) = dictate(&speech, 2);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        assert_eq!(heard.sessions(), 2);
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        // The hours are not taken to be used up for that.
+        assert_eq!(standby.until(), 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_server_that_is_slow_to_let_a_stream_in_is_not_waited_for() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::SlowToOpen(Duration::from_secs(5))]);
+        let (speech, standby, heard) = speech_with_model_and(&fake, impatient())?;
+        let started = Instant::now();
+        let (typed, finished) = dictate(&speech, 3);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        assert_eq!(heard.fed(), audio_of(0..3));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stream_that_never_says_a_word_is_given_up_and_the_model_takes_over() -> Outcome {
+        let fake = Fake::start()?;
+        // The stream is let in, and then nothing: no `ready`, no result,
+        // no answer to a ping.
+        fake.change(|state| state.scripts = vec![Script::Deaf]);
+        let (speech, standby, heard) = speech_with_model_and(&fake, impatient())?;
+        let started = Instant::now();
+        let (typed, finished) = dictate(&speech, 3);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        // All of it had been sent, and all of it is recognized here.
+        assert_eq!(heard.fed(), audio_of(0..3));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_connection_that_drops_midway_is_carried_on_where_the_settled_text_ends() -> Outcome {
+        // The server said that its settled text reaches five milliseconds,
+        // half of the first chunk. The rest of that chunk is recognized
+        // here, with all that followed, and the guess is not typed twice.
+        let dropped = |reached: Option<u32>, guessing: bool| -> Result<Vec<i16>> {
+            let fake = Fake::start().map_err(live::failed("starting the stand-in"))?;
+            fake.change(|state| {
+                state.scripts = vec![Script::SettlesThenDrops { reached, guessing }];
+            });
+            let (speech, standby, heard) = speech_with_model(&fake)?;
+            let (typed, finished) = dictate_past_the_first_answer(&speech);
+            assert!(finished.is_ok(), "{finished:?}");
+            assert_eq!(typed, "So far. Locally.");
+            assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+            assert_eq!(fake.asked("GET /v1/stream"), 1);
+            Ok(heard.fed())
+        };
+        let mut expected = vec![0i16; 80];
+        expected.extend(audio_of(1..5));
+        assert_eq!(dropped(Some(5), true)?, expected);
+        // A server that does not say, and had nothing more in hand: what
+        // was sent after the settled text arrived.
+        assert_eq!(dropped(None, false)?, audio_of(1..5));
+        // One that does not say and was guessing at more: from a second
+        // before, which here is all of it.
+        assert_eq!(dropped(None, true)?, audio_of(0..5));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stream_that_stalls_midway_is_given_up_and_carried_on() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| {
+            state.scripts = vec![
+                Script::Usual,
+                Script::SettlesThenStalls {
+                    reached: Some(5),
+                    guessing: true,
+                },
+            ];
+        });
+        let (speech, standby, heard) = speech_with_model_and(&fake, impatient())?;
+        dictate_until_a_ping_is_answered(&speech)?;
+        let started = Instant::now();
+        let (typed, finished) = dictate_past_the_first_answer(&speech);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "So far. Locally.");
+        // All five chunks had been sent before the stream was given up;
+        // what the settled text did not reach is recognized here.
+        let mut expected = vec![0i16; 80];
+        expected.extend(audio_of(1..5));
+        assert_eq!(heard.fed(), expected);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_stream_nobody_speaks_on_is_kept_for_as_long_as_the_server_answers() -> Outcome {
+        let fake = Fake::start()?;
+        let (speech, standby, heard) = speech_with_model_and(&fake, impatient())?;
+        let mut session = speech.start_session(SessionOptions { languages: &[] })?;
+        session.feed(&[1i16; 160])?;
+        // Three times as long as a stream may be quiet, without a sound
+        // sent and without a result back: the pings are answered.
+        std::thread::sleep(Duration::from_millis(900));
+        let mut typed = String::new();
+        session.finish(&mut |transcript| {
+            typed.push_str(&transcript.text);
+            Ok(())
+        })?;
+        assert_eq!(typed, "Hello world.");
+        assert!(speech.shared.answers.load(Ordering::Relaxed));
+        assert_eq!((standby.take_served(), heard.sessions()), (None, 0));
+        assert!(!standby.out_of_reach());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_server_is_tried_again_after_a_rest_and_serves_once_it_can() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::DropMidway]);
+        let (speech, standby, heard) = speech_with_model(&fake)?;
+        let (typed, finished) = dictate(&speech, 2);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        assert_eq!(heard.fed(), audio_of(0..2));
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        // During the rest the server is not asked.
+        assert_eq!(dictate(&speech, 2).0, "Locally.");
+        assert_eq!(fake.asked("GET /v1/stream"), 1);
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        // After it, it is, and serves; then nothing is held against it.
+        standby.rested();
+        let (typed, finished) = dictate(&speech, 2);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Hello world.");
+        assert_eq!(fake.asked("GET /v1/stream"), 2);
+        assert!(eventually(|| !standby.out_of_reach()));
+        assert_eq!((standby.take_served(), heard.sessions()), (None, 2));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_server_that_is_failing_is_followed_by_the_model_too() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| {
+            state.scripts = vec![
+                Script::FailMidway("upstream_failed"),
+                Script::Refuse(503, "unavailable"),
+            ];
+        });
+        let (speech, standby, heard) = speech_with_model(&fake)?;
+        let (typed, finished) = dictate_past_the_first_answer(&speech);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "So far. Locally.");
+        assert_eq!(heard.fed(), audio_of(1..5));
+        assert_eq!(standby.take_served(), Some(out_of_reach(true)));
+        // Refused before the stream was open: all of it is recognized here.
+        standby.rested();
+        let (typed, finished) = dictate(&speech, 2);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Locally.");
+        assert_eq!(fake.asked("GET /v1/stream"), 2);
+        let mut expected = audio_of(1..5);
+        expected.extend(audio_of(0..2));
+        assert_eq!(heard.fed(), expected);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn without_a_model_on_this_pc_a_failed_connection_says_that_too() -> Outcome {
+        let fake = Fake::start()?;
+        fake.change(|state| state.scripts = vec![Script::DropMidway]);
+        let (account, memory) = fake.account();
+        memory.sign_in(&fake);
+        let standby = Arc::new(Standby::new(|_, _, _| None));
+        let speech = CloudSpeech::with(account, quick(), Arc::clone(&standby))?;
+        let (typed, finished) = dictate(&speech, 2);
+        assert_eq!(typed, "");
+        assert!(
+            matches!(&finished, Err(Error::Transcription(why))
+                if why.contains("VinPUT Pro") && why.ends_with("get one under Settings, Models")),
+            "{finished:?}"
+        );
+        assert_eq!(standby.take_served(), None);
+        // Nothing is held against the server: the next press asks it.
+        let (typed, finished) = dictate(&speech, 2);
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(typed, "Hello world.");
         Ok(())
     }
 }

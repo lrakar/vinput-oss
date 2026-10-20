@@ -68,6 +68,34 @@ const BLOCK_ALIGN: u16 = 2;
 #[expect(clippy::cast_possible_truncation)]
 const FORMAT_TAG_PCM: u16 = WAVE_FORMAT_PCM as u16;
 
+/// The highest rate a recording is captured at. Microphones that work at
+/// more than this (96 kHz, 192 kHz) are converted down by Windows: a voice
+/// has nothing up there, and an MP3 holds 48 kHz at most.
+const MOST_RECORDING_RATE_HZ: u32 = 48_000;
+
+/// The rate a recording from a device that works at `device` hertz is
+/// captured at: the device's own, so that nothing is lost to a conversion,
+/// up to [`MOST_RECORDING_RATE_HZ`].
+fn recording_rate(device: u32) -> u32 {
+    match device {
+        0 => SAMPLE_RATE_HZ,
+        rate => rate.min(MOST_RECORDING_RATE_HZ),
+    }
+}
+
+/// Mono 16-bit PCM at `rate`.
+fn mono_format(rate: u32) -> WAVEFORMATEX {
+    WAVEFORMATEX {
+        wFormatTag: FORMAT_TAG_PCM,
+        nChannels: 1,
+        nSamplesPerSec: rate,
+        nAvgBytesPerSec: rate * u32::from(BLOCK_ALIGN),
+        nBlockAlign: BLOCK_ALIGN,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    }
+}
+
 /// The microphone of this PC, kept ready for a while after each session.
 pub type ArmedMicrophone = Armed<Wasapi>;
 
@@ -172,23 +200,12 @@ impl Wasapi {
         unsafe { enumerator.GetDefaultAudioEndpoint(flow, eConsole) }
             .map_err(audio_error("finding the default microphone"))
     }
-}
 
-impl CaptureBackend for Wasapi {
-    type Stream = WasapiStream;
-    type Watch = WasapiWatch;
-
-    fn open(&self, microphone: &str) -> Result<WasapiStream> {
+    /// Opens a stopped stream on `microphone`, delivering mono 16-bit PCM
+    /// at [`SAMPLE_RATE_HZ`], or for a `recording` at the rate the device
+    /// works at ([`recording_rate`]).
+    fn open_at(&self, microphone: &str, recording: bool) -> Result<WasapiStream> {
         apartment()?;
-        let format = WAVEFORMATEX {
-            wFormatTag: FORMAT_TAG_PCM,
-            nChannels: 1,
-            nSamplesPerSec: SAMPLE_RATE_HZ,
-            nAvgBytesPerSec: SAMPLE_RATE_HZ * u32::from(BLOCK_ALIGN),
-            nBlockAlign: BLOCK_ALIGN,
-            wBitsPerSample: 16,
-            cbSize: 0,
-        };
         let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
             | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
             | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
@@ -198,9 +215,10 @@ impl CaptureBackend for Wasapi {
             Endpoint::Loopback => flags | AUDCLNT_STREAMFLAGS_LOOPBACK,
         };
         // SAFETY: COM is available on this thread (`apartment`), and `format`
-        // is a valid PCM format that outlives the `Initialize` call. Nothing
-        // here starts the stream: Windows neither captures for it nor shows
-        // the microphone as in use until `Start`.
+        // is a valid PCM format that outlives the `Initialize` call. The mix
+        // format is read and freed once. Nothing here starts the stream:
+        // Windows neither captures for it nor shows the microphone as in use
+        // until `Start`.
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -213,6 +231,17 @@ impl CaptureBackend for Wasapi {
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(audio_error("opening the microphone"))?;
+            let rate = if recording {
+                let mix = client
+                    .GetMixFormat()
+                    .map_err(audio_error("reading the format of the microphone"))?;
+                let rate = (*mix).nSamplesPerSec;
+                CoTaskMemFree(Some(mix.cast_const().cast()));
+                recording_rate(rate)
+            } else {
+                SAMPLE_RATE_HZ
+            };
+            let format = mono_format(rate);
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
@@ -237,6 +266,7 @@ impl CaptureBackend for Wasapi {
                     bluetooth,
                     pending: VecDeque::new(),
                     running: false,
+                    rate,
                 }),
                 Err(err) => {
                     let _ = CloseHandle(event);
@@ -244,6 +274,19 @@ impl CaptureBackend for Wasapi {
                 }
             }
         }
+    }
+}
+
+impl CaptureBackend for Wasapi {
+    type Stream = WasapiStream;
+    type Watch = WasapiWatch;
+
+    fn open(&self, microphone: &str) -> Result<WasapiStream> {
+        self.open_at(microphone, false)
+    }
+
+    fn open_for_recording(&self, microphone: &str) -> Result<WasapiStream> {
+        self.open_at(microphone, true)
     }
 
     fn standby(&self, microphone: &str) -> Option<String> {
@@ -284,6 +327,8 @@ pub struct WasapiStream {
     pending: VecDeque<i16>,
     /// Whether the stream has been started and not stopped since.
     running: bool,
+    /// Samples per second it delivers.
+    rate: u32,
 }
 
 // SAFETY: the stream is made in the multithreaded apartment of the process,
@@ -370,6 +415,10 @@ impl WasapiStream {
 impl CaptureStream for WasapiStream {
     fn device(&self) -> &str {
         &self.device
+    }
+
+    fn rate(&self) -> u32 {
+        self.rate
     }
 
     fn may_stay_armed(&self) -> bool {
@@ -973,6 +1022,39 @@ mod tests {
         } else {
             assert_eq!(backend.standby(""), None);
         }
+    }
+
+    #[test]
+    fn a_recording_is_captured_at_the_rate_of_the_device_up_to_48_khz() {
+        assert_eq!(recording_rate(48_000), 48_000);
+        assert_eq!(recording_rate(44_100), 44_100);
+        assert_eq!(recording_rate(16_000), 16_000);
+        assert_eq!(recording_rate(192_000), 48_000);
+        // A device that says nothing records as dictation does.
+        assert_eq!(recording_rate(0), SAMPLE_RATE_HZ);
+    }
+
+    /// Plays silence on the default speakers and records what they play,
+    /// as a memo records a microphone. No microphone is opened.
+    #[test]
+    #[ignore = "plays silence on the default speakers of this PC and listens to them"]
+    fn a_stream_for_a_recording_delivers_the_rate_it_says() -> Result<()> {
+        let Ok(_silence) = Silence::play() else {
+            eprintln!("skipped: no speakers to listen to");
+            return Ok(());
+        };
+        let armed = Armed::with(Wasapi::loopback(), "");
+        let mut source = armed.record(StopHandle::new())?;
+        let rate = source.rate();
+        assert!((SAMPLE_RATE_HZ..=48_000).contains(&rate), "{rate} Hz");
+        // Three tenths of a second of it, the first packet taking a moment.
+        let heard = count(&mut source, Duration::from_millis(300))?;
+        let expected = rate as usize * 3 / 10;
+        assert!(
+            (expected * 2 / 3..=expected * 4 / 3).contains(&heard),
+            "{heard} samples in 300 ms at {rate} Hz"
+        );
+        Ok(())
     }
 
     /// Plays silence on the default speakers for a second and listens to

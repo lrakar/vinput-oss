@@ -8,6 +8,8 @@ use crate::node::{Icon, Severity};
 
 /// The chevron of a drop-down list.
 pub const CHEVRON_DOWN: char = '\u{E70D}';
+/// The chevron of a row that is open and closes.
+pub const CHEVRON_UP: char = '\u{E70E}';
 /// The cross that clears a field.
 pub const CLEAR: char = '\u{E894}';
 /// What the logo falls back to when the program has no icon of its own.
@@ -50,6 +52,11 @@ pub const fn glyph(icon: Icon) -> char {
         Icon::Copy => '\u{E8C8}',
         Icon::Star => '\u{E734}',
         Icon::Person => '\u{E77B}',
+        Icon::Dictionary => '\u{E82D}',
+        Icon::Snippet => '\u{E8FD}',
+        Icon::Formatting => '\u{E8D2}',
+        Icon::Edit => '\u{E70F}',
+        Icon::Program => '\u{E756}',
     }
 }
 

@@ -1,5 +1,50 @@
 [
   {
+    "version": "0.6.2",
+    "published": "2026-10-16",
+    "notes": [
+      "With cleanup on, you see your words as you speak, and the cleaned text takes their place when you stop or press Enter",
+      "Works with the text model of VinPUT Plus and Pro and with a text model on this PC",
+      "Settings is laid out the way Windows 11 lays out its own, with each setting on a tile of its own",
+      "A new Shortcuts page has every key and what belongs to it, your actions among them",
+      "Your settings carry over as they are"
+    ]
+  },
+  {
+    "version": "0.6.0",
+    "published": "2026-10-07",
+    "notes": [
+      "Cleanup tidies a dictation before it is typed: as said, clean, a coding prompt or an email, chosen for each key on the new Cleanup page",
+      "Edit by voice: select text, hold the edit key and say what to change, and the result takes the place of the selection",
+      "Cleanup and editing use VinPUT Plus or Pro, or a text model on this PC, and do not count against your monthly hours",
+      "Your own actions: a key that runs a program or script you choose with what you said, under Settings, General, Your actions",
+      "Settings is easier to read: sections open and close, long lists scroll on their own, and languages are picked from a list you can search",
+      "Voice memos are recorded at the full quality of your microphone",
+      "The tray menu and About lead to PUTLAB, where Voutput and other programs are installed"
+    ]
+  },
+  {
+    "version": "0.5.1",
+    "published": "2026-10-07",
+    "notes": [
+      "Other programs on this PC can show what you dictate as it is typed, if you let them",
+      "Settings, Advanced, Send typed text to connected programs switches it on; it starts switched off",
+      "While it is off, nothing you dictate into a window is sent to any program",
+      "For developers: the local API has a transcript event with the text so far, the mode and a session number, and a final one when the dictation ends"
+    ]
+  },
+  {
+    "version": "0.5.0",
+    "published": "2026-10-07",
+    "notes": [
+      "Settings has a new page, Words: a dictionary for your names and terms, and snippets that stand for a saved text",
+      "Say new line, new paragraph, all caps, snake case, camel case or kebab case and it is done; this starts switched on, and Words has the switch",
+      "Enter ends a dictation, and is pressed once after your last words",
+      "When VinPUT Pro cannot be reached, a model on this PC carries on and no word is lost",
+      "Updates are signed: VinPUT installs only an update that comes from its makers"
+    ]
+  },
+  {
     "version": "0.4.8",
     "published": "2026-10-07",
     "notes": [

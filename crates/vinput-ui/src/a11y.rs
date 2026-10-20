@@ -69,6 +69,7 @@ use windows::core::{
 
 use crate::geometry::Rect;
 use crate::layout::{Item, Kind, Region};
+use crate::look::{out_of_sight, pane_of};
 use crate::shell::Frame;
 use crate::window::Host;
 
@@ -160,9 +161,10 @@ fn facts(host: &Host, part: Part) -> Option<Facts> {
         Part::Text(body, index) => {
             let items = if body { &frame.body } else { &frame.fixed };
             let (text, rect) = said(items.get(index)?)?;
-            let dy = if body { -stage.look().scroll } else { 0.0 };
-            let mut facts = plain(text, rect.moved(0.0, dy));
-            facts.hidden = body && !facts.rect.touches(frame.viewport);
+            let region = if body { Region::Body } else { Region::Fixed };
+            let (look, pane) = (stage.look(), pane_of(items, index));
+            let mut facts = plain(text, rect.moved(0.0, look.shift(region, pane)));
+            facts.hidden = out_of_sight(frame, &look, facts.rect, region, pane);
             return Some(facts);
         }
         Part::Control(index) => index,
@@ -178,9 +180,14 @@ fn facts(host: &Host, part: Part) -> Option<Facts> {
         .unwrap_or_default()
         .clone_into(&mut facts.help);
     match &control.kind {
-        Kind::Button { .. } | Kind::Row { .. } => {
+        Kind::Button { .. } | Kind::Row { .. } | Kind::Chip { .. } => {
             facts.kind = UIA_ButtonControlTypeId;
             facts.invokes = true;
+        }
+        Kind::Expander { open, .. } => {
+            facts.kind = UIA_ButtonControlTypeId;
+            facts.invokes = true;
+            facts.open = Some(*open);
         }
         Kind::Link { .. } => {
             facts.kind = UIA_HyperlinkControlTypeId;
@@ -214,7 +221,13 @@ fn facts(host: &Host, part: Part) -> Option<Facts> {
         }
     }
     // Scrolled out of sight; it is brought back when it gets the focus.
-    facts.hidden = control.region == Region::Body && !facts.rect.touches(frame.viewport);
+    facts.hidden = out_of_sight(
+        frame,
+        &stage.look(),
+        facts.rect,
+        control.region,
+        control.pane(),
+    );
     Some(facts)
 }
 

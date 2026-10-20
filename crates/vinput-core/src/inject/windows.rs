@@ -11,7 +11,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_HOME,
     VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MBUTTON, VK_NEXT, VK_PRIOR,
-    VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_TAB, VK_UP,
+    VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
+    VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -118,8 +119,10 @@ impl SendInputSink {
         Self::default()
     }
 
-    /// Presses Backspace `erase` times and types `text`, as one batch.
-    fn send(&mut self, erase: usize, text: &str) -> Result<()> {
+    /// Presses Backspace `erase` times and types `text`, as one batch. With
+    /// `soft`, Shift is held for every Enter, which makes it a line break
+    /// that sends nothing.
+    fn send(&mut self, erase: usize, text: &str, soft: bool) -> Result<()> {
         let keys = keys::encode(text);
         if keys.is_empty() && erase == 0 {
             return Ok(());
@@ -147,9 +150,17 @@ impl SendInputSink {
                 Key::Enter => (VK_RETURN, 0, 0),
                 Key::Tab => (VK_TAB, 0, 0),
             };
+            let shifted = soft && key == Key::Enter;
+            if shifted {
+                self.inputs.push(keyboard_input(VK_SHIFT, 0, 0));
+            }
             self.inputs.push(keyboard_input(vk, scan, flags));
             self.inputs
                 .push(keyboard_input(vk, scan, flags | KEYEVENTF_KEYUP));
+            if shifted {
+                self.inputs
+                    .push(keyboard_input(VK_SHIFT, 0, KEYEVENTF_KEYUP));
+            }
         }
         let count = u32::try_from(self.inputs.len())
             .map_err(|_| Error::Injection("text is too long to type in one call".into()))?;
@@ -171,7 +182,21 @@ impl SendInputSink {
 
 impl TextSink for SendInputSink {
     fn type_text(&mut self, text: &str) -> Result<()> {
-        self.send(0, text)
+        self.send(0, text, false)
+    }
+
+    fn paste(&mut self, text: &str) -> Result<bool> {
+        // SAFETY: a plain call that reads which window is in the foreground.
+        let into = unsafe { GetForegroundWindow() };
+        let pasted = putlab_core::selection::paste(text);
+        if pasted {
+            self.typed_into = Some(into);
+        }
+        Ok(pasted)
+    }
+
+    fn type_lines(&mut self, text: &str) -> Result<()> {
+        self.send(0, text, true)
     }
 
     fn rewrites(&self) -> bool {
@@ -180,7 +205,7 @@ impl TextSink for SendInputSink {
     }
 
     fn rewrite(&mut self, erase: usize, text: &str) -> Result<()> {
-        self.send(erase, text)
+        self.send(erase, text, false)
     }
 
     fn disturbed(&mut self) -> bool {
@@ -221,6 +246,9 @@ mod tests {
     fn empty_text_sends_nothing() {
         assert!(SendInputSink::new().type_text("").is_ok());
         assert!(SendInputSink::new().rewrite(0, "").is_ok());
+        assert!(SendInputSink::new().type_lines("").is_ok());
+        // Nothing is pasted for no text, and the clipboard is not looked at.
+        assert!(matches!(SendInputSink::new().paste(""), Ok(false)));
     }
 
     #[test]

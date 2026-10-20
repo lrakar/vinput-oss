@@ -1,0 +1,42 @@
+[package]
+name = "putlab-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "What Vinput and the programs beside it share: requests, downloads, updates, the account, and the names of a running copy. No window code"
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.22"
+ring = "0.17"
+serde_json.workspace = true
+# Only the stand-in for the account's server needs these; see `fake` below.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"], optional = true }
+
+[target."cfg(windows)".dependencies]
+windows.workspace = true
+# How much memory a loading engine holds says how far its load is; see `engine.rs`.
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus"] }
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+
+[features]
+# For the tests of the other crates, which ask for it among their
+# dev-dependencies: without a VINPUT_INSTANCE a program then runs as the
+# separate copy "tests" (see src/instance.rs), so that no test writes to the
+# log or the settings of a program installed on this PC, shows a notification
+# or plays a sound. Never among the dependencies of anything that ships.
+test-instance = []
+# The stand-in for the account's server (src/cloud/fake.rs), for the tests of
+# the crates that talk to it. Never among the dependencies of anything that
+# ships.
+fake = ["dep:futures-util", "dep:tokio", "dep:tokio-tungstenite"]
+
+[lints]
+workspace = true

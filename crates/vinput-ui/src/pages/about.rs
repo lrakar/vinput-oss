@@ -2,7 +2,7 @@
 
 use vinput_view::{Change, Command, Download, Page, Release, Update, UpdateCheck, View};
 
-use super::common::{fraction, notice_bar, so_far};
+use super::common::{SiteLink, fraction, identity, links, notice_bar, related, so_far};
 use crate::node::{
     Action, Content, Icon, Node, Setting, TextStyle, Tone, accent_button, bullets, button, card,
     header, human_size, setting, styled, toggle,
@@ -20,28 +20,21 @@ const RELEASE_NOTES: &str = "https://vinput-dasvcr.web.app/changelog";
 pub fn content(view: &View) -> Content {
     let mut body = Vec::new();
     body.extend(notice_bar(view, Page::About));
-    body.push(identity(&view.version));
+    body.push(identity(
+        Icon::Microphone,
+        "VinPUT",
+        "Type with your voice in any app. By PUTLAB",
+        &view.version,
+    ));
     body.extend(updates(view));
-    body.extend(links());
+    body.extend(links(&LINKS));
+    body.extend(related(view));
     Content {
         pinned: Vec::new(),
         title: "About".to_owned(),
         body,
         footer: Vec::new(),
         back: None,
-    }
-}
-
-/// The app, who makes it and the version that is running.
-fn identity(version: &str) -> Node {
-    let app = setting(Icon::Microphone, "VinPUT").detail("by PUTLAB");
-    if version.is_empty() {
-        card([app.into()])
-    } else {
-        let version = format!("Version {version}");
-        card([app
-            .control(styled(version, TextStyle::Body, Tone::Secondary))
-            .into()])
     }
 }
 
@@ -147,35 +140,22 @@ fn checked(update: &Update, running: &str) -> Setting {
     }
 }
 
-/// A row that opens a page of the site in the browser.
-fn link_row(icon: Icon, title: &str, detail: &str, address: &str) -> Node {
-    setting(icon, title)
-        .detail(detail)
-        .action(Action::send(Command::OpenLink(address.to_owned())))
-        .into()
-}
-
 /// Where to read more.
-fn links() -> [Node; 2] {
-    [
-        header("Links"),
-        card([
-            link_row(Icon::Globe, "Website", "vinput-dasvcr.web.app", WEBSITE),
-            link_row(
-                Icon::Info,
-                "Documentation",
-                "How to use VinPUT and build on it",
-                DOCUMENTATION,
-            ),
-            link_row(
-                Icon::Clipboard,
-                "Release notes",
-                "What each version brought",
-                RELEASE_NOTES,
-            ),
-        ]),
-    ]
-}
+const LINKS: [SiteLink; 3] = [
+    (Icon::Globe, "Website", "vinput-dasvcr.web.app", WEBSITE),
+    (
+        Icon::Info,
+        "Documentation",
+        "How to use VinPUT and build on it",
+        DOCUMENTATION,
+    ),
+    (
+        Icon::Clipboard,
+        "Release notes",
+        "What each version brought",
+        RELEASE_NOTES,
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -229,7 +209,7 @@ mod tests {
         let nodes = all(&page.body);
         assert_eq!(page.title, "About");
         let app = setting_row(&nodes, "VinPUT");
-        assert_eq!(app.detail, "by PUTLAB");
+        assert_eq!(app.detail, "Type with your voice in any app. By PUTLAB");
         assert!(matches!(
             app.control.as_deref(),
             Some(Node::Text { text, .. }) if text == "Version 0.3.0"
@@ -241,7 +221,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(headers, ["Updates", "Links"]);
+        assert_eq!(headers, ["Updates", "Links", "Related"]);
+        // The way to the hub opens it, like the links, outside this window.
+        assert_eq!(
+            command(&setting_row(&nodes, "Open PUTLAB").action),
+            Some(Command::OpenHub)
+        );
     }
 
     #[test]

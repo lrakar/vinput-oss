@@ -13,16 +13,20 @@ use vinput_core::audio::Microphone;
 
 use vinput_core::cloud::{AccountInfo, Plan, Prices, Tier};
 use vinput_core::hardware::{self, Fit, Pc};
-use vinput_core::models::{self, EngineState, Model, Status};
+use vinput_core::models::{self, EngineState, Model, Runner, Status};
+use vinput_core::rewrite;
 use vinput_core::settings::Settings;
-use vinput_core::stt::ProviderKind;
+use vinput_core::stt::{Cause, ProviderKind};
 use vinput_core::update;
 use vinput_core::update::Release;
 use vinput_view as wire;
 
 pub(crate) use vinput_view::ProDoing;
 
+use crate::change::{then_to, tidy_of};
 use crate::finder::{self, Snapshot};
+
+pub(crate) use vinput_core::rewrite::local::{Standing, Step};
 
 /// The outcome of the last look for a newer version.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -72,9 +76,10 @@ pub(crate) struct ProFacts<'a> {
     pub(crate) problem: Option<&'a str>,
     /// What the plans cost.
     pub(crate) prices: &'a Prices,
-    /// Whether the model on this PC serves in place of `VinPUT` Pro right
-    /// now, because the month's hours are used up.
-    pub(crate) carrying: bool,
+    /// Why the model on this PC serves in place of `VinPUT` Pro right now,
+    /// if it does: the month's hours are used up, or the server is out of
+    /// reach.
+    pub(crate) carrying: Option<Cause>,
 }
 
 /// What is known about the setup of a Google service of one's own.
@@ -103,8 +108,32 @@ pub(crate) struct GoogleFacts<'a> {
     pub(crate) model: &'a str,
 }
 
+/// Where an engine that was started for the graphics card runs its model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardUse {
+    /// On the card, as far as it has let on.
+    AsAsked,
+    /// On the processor: it said it cannot use the card.
+    Refused,
+}
+
+impl CardUse {
+    /// From whether an engine fell back to the processor.
+    pub(crate) fn of(fell_back: bool) -> Self {
+        if fell_back {
+            Self::Refused
+        } else {
+            Self::AsAsked
+        }
+    }
+}
+
 /// Everything a picture is drawn from.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about this PC"
+)]
 pub(crate) struct Facts<'a> {
     /// The settings in force.
     pub(crate) settings: &'a Settings,
@@ -114,6 +143,9 @@ pub(crate) struct Facts<'a> {
     pub(crate) graphics_card: Option<&'a str>,
     /// Whether the engine that runs models on a graphics card is installed.
     pub(crate) card_engine: bool,
+    /// What an engine started for the graphics card let on about where it
+    /// runs its model (`stt::fell_back`).
+    pub(crate) card_use: CardUse,
     /// What this PC has to run local models with, if that could be found out.
     pub(crate) pc: Option<&'a Pc>,
     /// Every model in the order to list them, with where each stands.
@@ -136,14 +168,32 @@ pub(crate) struct Facts<'a> {
     pub(crate) update: UpdateFacts<'a>,
     /// The account of `VinPUT` Pro.
     pub(crate) pro: ProFacts<'a>,
+    /// The models that write, in the order to list them, with where each
+    /// stands.
+    pub(crate) writers: Vec<(&'static Model, Status)>,
+    /// Where the engine of the model that writes stands.
+    pub(crate) standing: Standing,
     /// Where the search for a model to add stands.
     pub(crate) finder: Snapshot,
     /// What there is to tell the user about the last thing they asked for.
     pub(crate) notice: Option<wire::Notice>,
+    /// The languages Windows is set to, the most wanted first.
+    pub(crate) system_languages: &'a [String],
+    /// Whether the PUTLAB hub is on this PC.
+    pub(crate) hub_installed: bool,
 }
 
-/// Whether `model` is the one `settings` choose.
+/// Whether `model` is one that writes, and not one that recognizes speech.
+pub(crate) fn writes(model: &Model) -> bool {
+    matches!(model.local, Some((_, Runner::Writer)))
+}
+
+/// Whether `model` is the one `settings` choose: to dictate with, or for a
+/// model that writes, to tidy and edit with.
 pub(crate) fn is_in_use(settings: &Settings, model: &Model) -> bool {
+    if writes(model) {
+        return model.id.eq_ignore_ascii_case(&settings.text_model);
+    }
     model.provider == settings.provider && model.id.eq_ignore_ascii_case(&settings.model)
 }
 
@@ -172,6 +222,9 @@ fn settings(settings: &Settings, graphics_card: bool) -> wire::Settings {
         hotkey_enter: optional(settings.hotkey_enter),
         hotkey_search: optional(settings.hotkey_search),
         hotkey_memo: optional(settings.hotkey_memo),
+        hotkey_command: optional(settings.hotkey_command),
+        cleanup: tidy_of(settings.cleanup),
+        cleanup_enter: tidy_of(settings.cleanup_enter),
         microphone: settings.microphone.clone(),
         languages: settings.languages.join(", "),
         autostart: settings.autostart,
@@ -183,9 +236,34 @@ fn settings(settings: &Settings, graphics_card: bool) -> wire::Settings {
         // What the user wants only counts on a PC that has a card.
         graphics_card: settings.local_gpu && graphics_card,
         api_enabled: settings.api_enabled,
+        api_transcript: settings.api_transcript,
         memo_dir: settings.memo_dir.clone(),
         memo_to_clipboard: settings.memo_to_clipboard,
         search_url: settings.search_url.clone(),
+        spoken_formatting: settings.words.commands,
+        dictionary: (settings.words.dictionary.iter())
+            .map(|known| wire::Word {
+                word: known.word.clone(),
+                sounds_like: known.sounds_like.clone(),
+            })
+            .collect(),
+        snippets: (settings.words.snippets.iter())
+            .map(|snippet| wire::Snippet {
+                trigger: snippet.trigger.clone(),
+                text: snippet.text.clone(),
+            })
+            .collect(),
+        actions: (settings.actions.iter())
+            .map(|action| wire::CustomAction {
+                name: action.name.clone(),
+                hotkey: optional(action.hotkey),
+                program: action.program.clone(),
+                arguments: action.arguments.clone(),
+                then: then_to(action.then),
+                cleanup: tidy_of(action.cleanup),
+                timeout: action.timeout,
+            })
+            .collect(),
     }
 }
 
@@ -199,18 +277,28 @@ fn status(facts: &Facts<'_>) -> wire::Status {
     // A model set by hand in the settings file is not on the list; it is
     // shown under the name it was written with, as an online one.
     let unlisted = Some(&facts.settings.model).filter(|name| !name.is_empty());
-    let carrying = facts.pro.carrying && facts.settings.provider == ProviderKind::Cloud;
+    let carrying = facts
+        .pro
+        .carrying
+        .filter(|_| facts.settings.provider == ProviderKind::Cloud)
+        .zip(spare(facts));
     let runs_on = match (chosen, facts.graphics_card) {
-        (Some(_), _) if carrying && spare(facts).is_some() => {
-            wire::RunsOn::Spare(spare(facts).unwrap_or_default().to_owned())
-        }
+        (Some(_), _) if carrying.is_some() => match carrying {
+            Some((Cause::OutOfReach, spare)) => wire::RunsOn::StandIn(spare.to_owned()),
+            Some((Cause::UsedUp, spare)) => wire::RunsOn::Spare(spare.to_owned()),
+            None => wire::RunsOn::Online,
+        },
         (None, _) if unlisted.is_none() => wire::RunsOn::Nowhere,
         (None, _) => wire::RunsOn::Online,
         (Some(model), _) if model.local.is_none() => wire::RunsOn::Online,
         // The graphics card is only at work once its engine is here, which
-        // for a model that comes as two files is the only engine it has.
+        // for a model that comes as two files is the only engine it has;
+        // and not if that engine, started for the card, said it cannot use
+        // it and runs the model on the processor.
         (Some(model), Some(card))
-            if facts.settings.local_gpu && (facts.card_engine || model.files().count() > 1) =>
+            if facts.settings.local_gpu
+                && facts.card_use == CardUse::AsAsked
+                && (facts.card_engine || model.files().count() > 1) =>
         {
             wire::RunsOn::GraphicsCard(card.to_owned())
         }
@@ -262,6 +350,53 @@ fn model(settings: &Settings, pc: Option<&Pc>, model: &Model, status: &Status) -
             },
             Status::Installed => wire::ModelState::Installed,
             Status::Failed(reason) => wire::ModelState::Failed {
+                reason: reason.clone(),
+            },
+        },
+    }
+}
+
+/// A model that writes, as its row shows it: how it would do on this PC
+/// by the rule for such models, and no word about languages, of which
+/// each knows more than dictation offers.
+fn writer(settings: &Settings, pc: Option<&Pc>, listed: &Model, status: &Status) -> wire::Model {
+    let fit = pc.and_then(|pc| rewrite::local::fit(listed, pc, settings.local_gpu));
+    wire::Model {
+        fit: fit.map(|fit| match fit {
+            Fit::Well => wire::Fit::Well,
+            Fit::Slow => wire::Fit::Slow,
+            Fit::Heavy => wire::Fit::Heavy,
+        }),
+        lacks: Vec::new(),
+        knows_none: false,
+        ..model(settings, None, listed, status)
+    }
+}
+
+/// The models that tidy and edit, and where the engine of the one in use
+/// stands.
+fn rewriting(facts: &Facts<'_>) -> wire::Rewrite {
+    wire::Rewrite {
+        with_pro: rewrite::uses_pro(facts.settings),
+        models: facts
+            .writers
+            .iter()
+            .map(|(listed, status)| writer(facts.settings, facts.pc, listed, status))
+            .collect(),
+        standing: match &facts.standing {
+            Standing::Idle => wire::Standing::Idle,
+            Standing::Loading { card, step } => wire::Standing::Loading {
+                card: *card,
+                read: match step {
+                    Step::Model(hundredths) => Some(*hundredths),
+                    Step::Card(_) => None,
+                },
+            },
+            Standing::Ready { card, fell_back } => wire::Standing::Ready {
+                card: *card,
+                fell_back: *fell_back,
+            },
+            Standing::Failed(reason) => wire::Standing::Failed {
                 reason: reason.clone(),
             },
         },
@@ -404,6 +539,7 @@ fn pro(all: &Facts<'_>) -> wire::Pro {
 }
 
 /// Draws the picture the facts describe.
+#[allow(clippy::needless_update)]
 pub(crate) fn build(facts: &Facts<'_>) -> wire::View {
     wire::View {
         version: update::CURRENT_VERSION.to_owned(),
@@ -459,7 +595,13 @@ pub(crate) fn build(facts: &Facts<'_>) -> wire::View {
         default_memo_dir: facts.default_memo_dir.clone(),
         update: update(&facts.update),
         pro: pro(facts),
+        rewrite: rewriting(facts),
         notice: facts.notice.clone(),
+        system_languages: facts.system_languages.to_vec(),
+        hub_installed: facts.hub_installed,
+        // What the other programs of the family show, when one is built
+        // beside this one: nothing, here.
+        ..wire::View::default()
     }
 }
 
@@ -467,15 +609,16 @@ pub(crate) fn build(facts: &Facts<'_>) -> wire::View {
 mod tests {
     use vinput_core::models::CATALOG;
     use vinput_core::models::custom::{Choice, Origin};
+    use vinput_core::rewrite::Mode;
 
     use super::*;
 
     const CARD: &str = "NVIDIA GeForce RTX 4070";
     /// The PC that card is in.
     const PC: Pc = Pc {
-        card_memory: 24 << 30,
-        memory: 64 << 30,
-        threads: 32,
+        card_memory: 12 << 30,
+        memory: 32 << 30,
+        threads: 16,
     };
 
     fn online() -> &'static Model {
@@ -513,7 +656,7 @@ mod tests {
             doing: ProDoing::Nothing,
             problem: None,
             prices,
-            carrying: false,
+            carrying: None,
         }
     }
 
@@ -541,6 +684,7 @@ mod tests {
             listening: false,
             graphics_card: Some(CARD),
             card_engine: true,
+            card_use: CardUse::AsAsked,
             pc: Some(&PC),
             models: CATALOG
                 .iter()
@@ -575,18 +719,108 @@ mod tests {
             default_memo_dir: r"C:\Users\you\Documents\Vinput memos".to_owned(),
             update: no_update(),
             pro: no_pro(built_in()),
+            writers: models::writers()
+                .iter()
+                .map(|model| {
+                    let bytes = model.bytes() + 1000;
+                    (model, Status::Missing { bytes })
+                })
+                .collect(),
+            standing: Standing::Idle,
             finder: Snapshot::default(),
             notice: None,
+            system_languages: &[],
+            hub_installed: false,
         }
+    }
+
+    #[test]
+    fn the_models_that_write_are_listed_apart_with_the_one_in_use_and_how_it_stands() {
+        let settings = Settings {
+            text_model: "qwen3.5-2b".to_owned(),
+            cleanup: Mode::Clean,
+            hotkey_command: Some(vinput_core::keys::Hotkey::plain(0x77)),
+            ..Settings::default()
+        };
+        let mut known = facts(&settings);
+        known.writers[2].1 = Status::Installed;
+        known.standing = Standing::Ready {
+            card: true,
+            fell_back: false,
+        };
+        let view = build(&known);
+        assert_eq!(view.settings.cleanup, wire::Tidy::Clean);
+        assert_eq!(view.settings.cleanup_enter, wire::Tidy::Plain);
+        assert_eq!(view.settings.hotkey_command, "F8");
+        let rewrite = &view.rewrite;
+        assert!(!rewrite.with_pro);
+        let ready = wire::Standing::Ready {
+            card: true,
+            fell_back: false,
+        };
+        assert_eq!(rewrite.standing, ready);
+        let names: Vec<&str> = rewrite
+            .models
+            .iter()
+            .map(|model| model.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["Gemma 4 E2B", "Gemma 4 E4B", "Qwen3.5 2B", "Qwen3.5 4B"]
+        );
+        let in_use: Vec<bool> = rewrite.models.iter().map(|model| model.in_use).collect();
+        assert_eq!(in_use, [false, false, true, false]);
+        assert_eq!(rewrite.models[2].state, wire::ModelState::Installed);
+        assert_eq!(rewrite.models[0].state, wire::ModelState::Missing);
+        // On the PC of these tests the card holds every one of them.
+        assert!(
+            rewrite
+                .models
+                .iter()
+                .all(|model| model.fit == Some(wire::Fit::Well))
+        );
+        assert!(
+            rewrite
+                .models
+                .iter()
+                .all(|model| model.local && model.lacks.is_empty())
+        );
+        // None of them is a speech model, and the one in use is not taken
+        // for the model dictation uses.
+        assert!(
+            view.models
+                .list
+                .iter()
+                .all(|model| !model.name.starts_with("Gemma"))
+        );
+        assert_eq!(view.status.model, None);
+        // Until one is chosen, the model of the subscription is.
+        let unchosen = Settings::default();
+        assert!(build(&facts(&unchosen)).rewrite.with_pro);
+        // While the model loads the page is told how far it is, and when
+        // only the graphics card is left to make ready.
+        let mut loading = facts(&settings);
+        for (step, read) in [(Step::Model(40), Some(40)), (Step::Card(12), None)] {
+            loading.standing = Standing::Loading { card: true, step };
+            let shown = build(&loading).rewrite.standing;
+            assert_eq!(shown, wire::Standing::Loading { card: true, read });
+        }
+        // A model that writes can be removed like any other when it is
+        // here and not in use.
+        let writer = &models::writers()[2];
+        assert!(writes(writer) && is_in_use(&settings, writer));
+        assert!(!is_in_use(&unchosen, writer));
+        assert!(!writes(local()));
     }
 
     fn release() -> Release {
         Release {
             version: "9.9.9".into(),
             notes: vec!["Faster".into(), "Smaller".into()],
-            url: "https://example.com/setup.exe".into(),
+            url: "https://vinput-dasvcr.web.app/releases/setup.exe".into(),
             sha256: "0".repeat(64),
             bytes: 6_000_000,
+            signature: String::new(),
         }
     }
 
@@ -848,13 +1082,20 @@ mod tests {
         // While it serves in place of VinPUT Pro, the status says so; the
         // model the settings choose is still VinPUT Pro.
         assert_eq!(build(&all).status.runs_on, wire::RunsOn::Online);
-        all.pro.carrying = true;
+        all.pro.carrying = Some(Cause::UsedUp);
         let shown = build(&all);
         assert_eq!(shown.status.model.as_deref(), Some(pro.name));
         assert_eq!(
             shown.status.runs_on,
             wire::RunsOn::Spare(last.name.to_owned())
         );
+        // And so it does while the server is out of reach.
+        all.pro.carrying = Some(Cause::OutOfReach);
+        assert_eq!(
+            build(&all).status.runs_on,
+            wire::RunsOn::StandIn(last.name.to_owned())
+        );
+        all.pro.carrying = Some(Cause::UsedUp);
         assert!(
             shown
                 .models
@@ -866,7 +1107,7 @@ mod tests {
         let other = choosing(first);
         let mut all = facts(&other);
         download(&mut all, first);
-        all.pro.carrying = true;
+        all.pro.carrying = Some(Cause::UsedUp);
         assert_ne!(
             build(&all).status.runs_on,
             wire::RunsOn::Spare(first.name.to_owned())
@@ -966,6 +1207,14 @@ mod tests {
         waiting.card_engine = false;
         assert_eq!(build(&waiting).status.runs_on, wire::RunsOn::Processor);
         on_pc.card_engine = true;
+        // An engine that was started for the card and said it cannot use it
+        // runs the model on the processor, and that is what is shown; the
+        // switch stays as the user set it.
+        on_pc.card_use = CardUse::Refused;
+        let refused = build(&on_pc);
+        assert_eq!(refused.status.runs_on, wire::RunsOn::Processor);
+        assert!(refused.settings.graphics_card);
+        on_pc.card_use = CardUse::AsAsked;
         on_pc.graphics_card = None;
         assert_eq!(build(&on_pc).status.runs_on, wire::RunsOn::Processor);
 
@@ -1110,7 +1359,7 @@ mod tests {
         }];
         let mut facts = facts(&settings);
         facts.microphones = &microphones;
-        facts.clients = vec!["Control Deck".into()];
+        facts.clients = vec!["Stream Deck".into()];
         facts.gemini_key_stored = true;
         let view = build(&facts);
         assert_eq!(
@@ -1120,7 +1369,7 @@ mod tests {
                 name: "Microphone (USB Audio)".into()
             }]
         );
-        assert_eq!(view.api.clients, ["Control Deck"]);
+        assert_eq!(view.api.clients, ["Stream Deck"]);
         assert!(view.gemini_key_stored);
         assert_eq!(view.default_memo_dir, facts.default_memo_dir);
     }

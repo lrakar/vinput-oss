@@ -20,7 +20,7 @@ use windows_sys::Win32::Networking::WinHttp::{
     WinHttpSendRequest, WinHttpSetOption, WinHttpSetStatusCallback, WinHttpSetTimeouts,
 };
 
-use super::{Request, Target, USER_AGENT};
+use super::{Request, Target, user_agent};
 
 /// The size of the numbers `WinHTTP` takes and gives as options.
 const U32_SIZE: u32 = 4;
@@ -193,7 +193,7 @@ fn header_lines(request: &Request<'_>) -> Result<String, String> {
 /// Opens a session with the system's proxy settings, TLS 1.2 and 1.3 only,
 /// and the request's timeouts.
 fn open_session(request: &Request<'_>) -> Result<Handle, String> {
-    let agent = wide(USER_AGENT);
+    let agent = wide(user_agent());
     // SAFETY: `agent` is NUL-terminated and outlives the call. The session
     // is opened without the asynchronous flag, so every call on it and on
     // what is opened from it returns when its work is done.

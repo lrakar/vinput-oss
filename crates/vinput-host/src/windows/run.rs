@@ -23,9 +23,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use super::instance::{SingleInstance, activate_running_instance};
 use super::tray::{TrayEvent, tray_event};
 use super::{
-    API_COMMAND, ENGINE_READY, FINDER_DONE, GOOGLE_CHECKED, Host, OPEN_SETTINGS, PICKED, PRO_HEARD,
-    QUIT, SESSION_ENDED, TRAY_CALLBACK, TRAY_EVENT, TRAY_RESTORE, UPDATE_CHECKED,
-    UPDATE_DOWNLOADED, UPDATE_TIMER_ID, WINDOW_SPOKE, WINDOW_TIMER_ID,
+    ACTION_DONE, API_COMMAND, ENGINE_READY, FINDER_DONE, GOOGLE_CHECKED, Host, OPEN_SETTINGS,
+    PICKED, PRO_HEARD, QUIT, SESSION_ENDED, TRAY_CALLBACK, TRAY_EVENT, TRAY_RESTORE, TYPING_ENTER,
+    UPDATE_CHECKED, UPDATE_DOWNLOADED, UPDATE_TIMER_ID, WINDOW_SPOKE, WINDOW_TIMER_ID, hotkeys,
 };
 use crate::win::{last_error, wide};
 use vinput_core::session::Controller;
@@ -170,6 +170,7 @@ pub fn run(settings: Settings, controller: &mut dyn Controller, launch: Launch) 
             SESSION_ENDED => host.on_session_ended(controller),
             PRO_HEARD => host.on_pro_heard(controller),
             GOOGLE_CHECKED => host.on_google_checked(),
+            ACTION_DONE => host.on_action_done(),
             QUIT => return Ok(()),
             // The tray icon and Explorer reach the hidden window through its
             // procedure, which turns what they say into `TRAY_EVENT` and
@@ -190,7 +191,7 @@ static MISSED: AtomicU32 = AtomicU32::new(0);
 /// The messages another thread, or another copy of Vinput, wakes the loop
 /// with. Each says "look at what was left for you", so hearing one twice
 /// does no harm, and missing one would leave something undone for good.
-const WAKES: [u32; 12] = [
+const WAKES: [u32; 13] = [
     WINDOW_SPOKE,
     FINDER_DONE,
     PICKED,
@@ -202,6 +203,7 @@ const WAKES: [u32; 12] = [
     SESSION_ENDED,
     PRO_HEARD,
     GOOGLE_CHECKED,
+    ACTION_DONE,
     QUIT,
 ];
 
@@ -245,6 +247,12 @@ pub(super) unsafe extern "system" fn host_proc(
             if let Some(event) = tray_event(lparam) {
                 PostMessageW(hwnd, TRAY_EVENT, event as usize, 0);
             }
+            return 0;
+        }
+        if message == TYPING_ENTER {
+            // On this thread, to which the key belongs, and answered at
+            // once: the session that types the Enter is waiting.
+            hotkeys::typing_enter(wparam != 0);
             return 0;
         }
         if let Some(bit) = wake_bit(message) {
@@ -310,6 +318,7 @@ mod tests {
             TRAY_CALLBACK,
             TRAY_EVENT,
             TRAY_RESTORE,
+            TYPING_ENTER,
             WM_TIMER,
             WM_HOTKEY,
             0,

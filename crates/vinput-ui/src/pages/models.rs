@@ -1,5 +1,11 @@
 //! The Models page: the speech model in use and the downloads.
 //!
+//! The model in use is named on one row. Opening that row shows every
+//! model in a list that scrolls by itself, so the page stays as long as it
+//! is however many there are. The row is open by itself while there is
+//! something to do in it: no model is chosen yet, or one is downloading or
+//! has failed to.
+//!
 //! Every model is a row that carries its own actions, so nothing has to be
 //! selected first: `Use` on a model that is ready, `Download` on one that is
 //! not on this PC, `Cancel` while it downloads. The model in use is the row
@@ -28,8 +34,9 @@ use super::common::{
 use super::pro::{usage, works_again};
 use crate::node::{
     Action, ButtonKind, Content, Icon, Node, Severity, Tone, accent_button, badge, button, card,
-    header, human_size, icon_button, info_bar, note, row, setting, toggle,
+    expander, header, human_size, icon_button, info_bar, note, row, scroll, setting, toggle,
 };
+use crate::theme::metric;
 
 /// What the page shows for `view`.
 #[must_use]
@@ -40,8 +47,14 @@ pub fn content(view: &View) -> Content {
     body.extend(prompt(&models.list));
     body.extend(wrong_language(&models.list));
     body.extend(engine_failure(&models.engine));
-    body.extend(online(view));
-    body.extend(on_this_pc(models, view.settings.graphics_card));
+    body.push(card([chosen(view)]));
+    body.extend(none_runs_well(&models.list));
+    if let Some(name) = models.graphics_card.as_deref() {
+        body.push(header("Graphics card"));
+        body.push(card([graphics_card_row(name, view.settings.graphics_card)]));
+    }
+    body.push(header("Storage"));
+    body.push(card([disk_row(models.disk_bytes)]));
     Content {
         title: "Models".to_owned(),
         pinned: pro_card(view).into_iter().collect(),
@@ -97,9 +110,41 @@ pub(super) fn engine_failure(engine: &Engine) -> Option<Node> {
     ))
 }
 
-/// The models that run at an online service.
+/// What the closed row says when no model is in use.
+const NOT_CHOSEN: &str = "Not chosen";
+
+/// The row that names the model in use and opens onto all of them.
+fn chosen(view: &View) -> Node {
+    let models = &view.models;
+    let in_use = models.list.iter().find(|model| model.in_use);
+    let busy = |model: &Model| {
+        matches!(
+            model.state,
+            ModelState::Installing { .. } | ModelState::Failed { .. }
+        )
+    };
+    let fetching = matches!(models.engine, Engine::Fetching { .. });
+    let mut list = online(view);
+    list.extend(on_this_pc(models));
+    let picker = expander(
+        "speech-model",
+        Icon::Model,
+        "Speech model",
+        [scroll("models", metric::LIST_MAX, list)],
+    )
+    .value(in_use.map_or(NOT_CHOSEN, |model| model.name.as_str()))
+    .value_tone(if in_use.is_some() {
+        Tone::Secondary
+    } else {
+        Tone::Caution
+    })
+    .open(in_use.is_none() || fetching || models.list.iter().any(busy));
+    picker.into()
+}
+
+/// The models that run at an online service, under their heading.
 fn online(view: &View) -> Vec<Node> {
-    let rows: Vec<Node> = view
+    let mut rows: Vec<Node> = view
         .models
         .list
         .iter()
@@ -114,16 +159,17 @@ fn online(view: &View) -> Vec<Node> {
             None => model_row(model),
         })
         .collect();
-    if rows.is_empty() {
-        Vec::new()
-    } else {
-        vec![header("Online"), card(rows)]
+    if !rows.is_empty() {
+        rows.insert(0, header("Online"));
     }
+    rows
 }
 
-/// The models that run on this PC, the way to add one, and what they take.
-fn on_this_pc(models: &Models, graphics_card_on: bool) -> Vec<Node> {
-    let mut rows: Vec<Node> = engine_download(&models.engine).into_iter().collect();
+/// The models that run on this PC, under their heading, and the way to add
+/// one.
+fn on_this_pc(models: &Models) -> Vec<Node> {
+    let mut rows = vec![header("On this PC")];
+    rows.extend(engine_download(&models.engine));
     rows.extend(
         models
             .list
@@ -132,18 +178,7 @@ fn on_this_pc(models: &Models, graphics_card_on: bool) -> Vec<Node> {
             .map(model_row),
     );
     rows.push(add_row());
-    let mut shown = vec![header("On this PC"), card(rows)];
-    shown.extend(none_runs_well(&models.list));
-    let mut facts = Vec::new();
-    facts.extend(
-        models
-            .graphics_card
-            .as_deref()
-            .map(|name| graphics_card_row(name, graphics_card_on)),
-    );
-    facts.push(disk_row(models.disk_bytes));
-    shown.push(card(facts));
-    shown
+    rows
 }
 
 /// What to dictate with on a PC that runs none of the models well: said
@@ -324,7 +359,7 @@ fn google_row(model: &Model, service: GoogleService, ready: bool) -> Node {
 ///
 /// A model that lacks a language dictation is set to says that first:
 /// quietly if it knows another of them, as a caution if it knows none.
-fn detail_line(model: &Model) -> (String, Tone) {
+pub(super) fn detail_line(model: &Model) -> (String, Tone) {
     let line = match &model.state {
         ModelState::Failed { reason } => return (reason.clone(), Tone::Critical),
         ModelState::Installing { done, total } => {
@@ -411,7 +446,7 @@ fn state_button(model: &Model) -> Option<Node> {
 /// The quiet button that deletes a model, where that is possible: never the
 /// one in use or one that is downloading, a built-in one only while it is on
 /// this PC, and one the user added in any other state.
-fn remove_button(model: &Model) -> Option<Node> {
+pub(super) fn remove_button(model: &Model) -> Option<Node> {
     let removable = !model.in_use
         && match model.state {
             ModelState::Installing { .. } => false,
@@ -440,8 +475,8 @@ fn add_row() -> Node {
 
 /// The switch that runs local models on the graphics card called `name`.
 fn graphics_card_row(name: &str, on: bool) -> Node {
-    setting(Icon::Chip, format!("Run on the graphics card ({name})"))
-        .detail("Models on this PC run faster on a graphics card than on the processor")
+    setting(Icon::Chip, "Run on the graphics card")
+        .detail(name)
         .control(toggle(on, |on| {
             Action::send(Command::Set(Change::GraphicsCard(on)))
         }))
@@ -453,7 +488,7 @@ fn disk_row(bytes: u64) -> Node {
     let detail = if bytes == 0 {
         "Nothing is downloaded yet".to_owned()
     } else {
-        format!("Models and their engine take {}", human_size(bytes))
+        format!("{} used", human_size(bytes))
     };
     setting(Icon::Storage, "Disk space")
         .detail(detail)
@@ -620,11 +655,14 @@ mod tests {
         let content = content(&scene("settings"));
         let texts = Seen::of(&content.body).texts;
         let at = |text: &str| texts.iter().position(|seen| seen == text);
+        // The model in use is named twice: on the closed row, and in the list.
+        let last = |text: &str| texts.iter().rposition(|seen| seen == text);
         let (online, here) = (at("Online"), at("On this PC"));
         assert!(online.is_some() && online < here);
+        assert!(at("Speech model") < online && at("Whisper base") < online);
         assert!(at("Google Gemini 3.5 Transcribe") < here);
-        assert!(at("Whisper base") > here);
-        assert!(at("Add a model") > at("Whisper base"));
+        assert!(last("Whisper base") > here);
+        assert!(at("Add a model") > last("Whisper base"));
     }
 
     #[test]
@@ -741,7 +779,8 @@ mod tests {
     fn the_facts_about_this_pc_follow_the_models() {
         let mut view = scene("settings");
         let page = content(&view);
-        let card = row_of(&page, "Run on the graphics card (NVIDIA GeForce RTX 4070)");
+        let card = row_of(&page, "Run on the graphics card");
+        assert_eq!(card.detail, "NVIDIA GeForce RTX 4070");
         let toggles = Seen::of_setting(card).toggles;
         let [(true, off)] = toggles.as_slice() else {
             unreachable!("one switch that is on was expected");
@@ -751,7 +790,7 @@ mod tests {
             Some(Command::Set(Change::GraphicsCard(false)))
         );
         let disk = row_of(&page, "Disk space");
-        assert_eq!(disk.detail, "Models and their engine take 1.9 GB");
+        assert_eq!(disk.detail, "1.9 GB used");
         assert_eq!(Seen::of_setting(disk).commands(), [Command::OpenModelsDir]);
         let add = row_of(&page, "Add a model");
         assert!(matches!(add.action, Action::Go(Page::AddModel)));

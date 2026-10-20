@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
@@ -19,7 +20,7 @@ use super::{Account, Kept, Server, Vault};
 
 /// How the stand-in treats one audio stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Script {
+pub enum Script {
     /// Says it is ready, answers each piece of audio with a guess and the
     /// end of it with the settled text, then `done`.
     Usual,
@@ -46,75 +47,106 @@ pub(crate) enum Script {
     /// Lets the stream in and then reads nothing more, like a connection
     /// that has stalled without closing.
     Deaf,
+    /// Settles some text at the first audio, which reaches this many
+    /// milliseconds of the audio if it says, and goes on guessing if
+    /// `guessing`; then the connection is dropped without a word.
+    SettlesThenDrops {
+        reached: Option<u32>,
+        guessing: bool,
+    },
+    /// The same, but the connection stays and nothing more is read from it
+    /// or said on it: it has stalled.
+    SettlesThenStalls {
+        reached: Option<u32>,
+        guessing: bool,
+    },
+}
+
+/// What becomes of a stream once a piece of audio has been answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Then {
+    /// It goes on.
+    Listen,
+    /// The server closes it, as it does when it has said its last.
+    Close,
+    /// The connection is dropped.
+    Drop,
+    /// The connection stays, and nothing more is read from it.
+    Stall,
 }
 
 /// What the stand-in saw of one audio stream.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Seen {
-    pub(crate) events: Vec<&'static str>,
-    pub(crate) languages: Value,
-    pub(crate) sample_rate: Value,
-    pub(crate) audio: Vec<i16>,
+pub struct Seen {
+    pub events: Vec<&'static str>,
+    pub languages: Value,
+    pub sample_rate: Value,
+    pub audio: Vec<i16>,
     /// The size of the largest binary message, in bytes.
-    pub(crate) largest: usize,
+    pub largest: usize,
     /// How many binary messages the audio came in.
-    pub(crate) messages: usize,
+    pub messages: usize,
 }
 
 /// What the stand-in knows and has seen. Tests change it as they go.
-pub(crate) struct State {
+pub struct State {
     /// How many more times a device code is told to wait.
-    pub(crate) pending: u32,
+    pub pending: u32,
     /// Whether the device code has been traded, or forgotten.
-    pub(crate) device_traded: bool,
+    pub device_traded: bool,
     /// The refresh token that is good now.
-    pub(crate) refresh: String,
+    pub refresh: String,
     /// The one before it, which the server takes once more for a while.
-    pub(crate) previous: Option<String>,
+    pub previous: Option<String>,
     /// How many answers to a trade of the refresh token are lost on their
     /// way: the trade happens, and the connection is dropped without a word.
-    pub(crate) lost_answers: u32,
+    pub lost_answers: u32,
     /// Requests that are refused once each, in this order: the request, the
     /// status and the code.
-    pub(crate) faults: Vec<(&'static str, u16, &'static str)>,
+    pub faults: Vec<(&'static str, u16, &'static str)>,
     /// Whether refusals are worded as servers did before there was a
     /// `reason`.
-    pub(crate) old_errors: bool,
+    pub old_errors: bool,
     /// The name the last sign-in was started with.
-    pub(crate) device_name: Value,
+    pub device_name: Value,
     /// The code the browser of a sign-in without a code to type is sent
     /// back to the app with, and the challenge that sign-in was begun with;
     /// `None` once the code was traded, or presented wrongly.
-    pub(crate) app_code: Option<(String, String)>,
+    pub app_code: Option<(String, String)>,
     /// How long every answer takes.
-    pub(crate) slow_answers: Duration,
+    pub slow_answers: Duration,
     /// What `/v1/plans` answers.
-    pub(crate) plans: Value,
+    pub plans: Value,
     /// The access token that is good now.
-    pub(crate) access: String,
+    pub access: String,
     /// How long an access token is said to be good for, in seconds.
-    pub(crate) expires_in: u64,
+    pub expires_in: u64,
     granted: u32,
     /// Whether a checkout is refused because there is a subscription.
-    pub(crate) subscribed: bool,
+    pub subscribed: bool,
     /// What `/v1/account` answers.
-    pub(crate) account: Value,
+    pub account: Value,
     /// What `/v1/billing/portal` answers with.
-    pub(crate) portal_url: String,
+    pub portal_url: String,
+    /// What `/v1/rewrite` answers with, an event each: the usual answer is
+    /// two pieces of text and `done`.
+    pub rewritten: Vec<Value>,
+    /// What `/v1/rewrite` was asked, each time.
+    pub rewrites: Vec<Value>,
     /// Every request, as `POST /v1/auth/token`.
-    pub(crate) asked: Vec<String>,
+    pub asked: Vec<String>,
     /// How each audio stream is treated, in the order they arrive; the ones
     /// after the last are treated as `Usual`.
-    pub(crate) scripts: Vec<Script>,
+    pub scripts: Vec<Script>,
     /// What was seen of each audio stream.
-    pub(crate) streams: Vec<Seen>,
+    pub streams: Vec<Seen>,
     /// How many connections were made to the stand-in.
-    pub(crate) connections: usize,
+    pub connections: usize,
     /// How many of them ended without anything having been asked on them.
-    pub(crate) left_unused: usize,
+    pub left_unused: usize,
     /// How long a connection may stay without anything being asked on it
     /// before the stand-in hangs up; `None` waits for as long as it takes.
-    pub(crate) unused_for: Option<Duration>,
+    pub unused_for: Option<Duration>,
 }
 
 impl State {
@@ -133,16 +165,16 @@ impl State {
 type Shared = Arc<Mutex<State>>;
 
 /// The stand-in, running until it is dropped.
-pub(crate) struct Fake {
+pub struct Fake {
     // Kept for the tasks that run on it.
     _runtime: Runtime,
     /// Its address, such as `http://127.0.0.1:50123`.
-    pub(crate) base: String,
+    pub base: String,
     state: Shared,
 }
 
 impl Fake {
-    pub(crate) fn start() -> std::io::Result<Self> {
+    pub fn start() -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -186,6 +218,12 @@ impl Fake {
                     "resets_at": 1_793_491_200_u64},
             }),
             portal_url: "https://billing.stripe.com/p/session/test".to_owned(),
+            rewritten: vec![
+                json!({"text": "Hello, "}),
+                json!({"text": "world."}),
+                json!({"done": true}),
+            ],
+            rewrites: Vec::new(),
             asked: Vec::new(),
             scripts: Vec::new(),
             streams: Vec::new(),
@@ -207,28 +245,28 @@ impl Fake {
         })
     }
 
-    pub(crate) fn change(&self, change: impl FnOnce(&mut State)) {
+    pub fn change(&self, change: impl FnOnce(&mut State)) {
         change(&mut self.state.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
-    pub(crate) fn read<T>(&self, read: impl FnOnce(&State) -> T) -> T {
+    pub fn read<T>(&self, read: impl FnOnce(&State) -> T) -> T {
         read(&self.state.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// How often `request`, such as `POST /v1/auth/token`, was made.
-    pub(crate) fn asked(&self, request: &str) -> usize {
+    pub fn asked(&self, request: &str) -> usize {
         self.read(|state| state.asked.iter().filter(|asked| *asked == request).count())
     }
 
     /// Waits until what was seen of the audio streams passes `check`. Says
     /// whether it did.
-    pub(crate) fn wait(&self, check: impl Fn(&[Seen]) -> bool) -> bool {
+    pub fn wait(&self, check: impl Fn(&[Seen]) -> bool) -> bool {
         self.wait_for(|state| check(&state.streams))
     }
 
     /// Waits until what the stand-in knows passes `check`. Says whether it
     /// did.
-    pub(crate) fn wait_for(&self, check: impl Fn(&State) -> bool) -> bool {
+    pub fn wait_for(&self, check: impl Fn(&State) -> bool) -> bool {
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(5) {
             if self.read(&check) {
@@ -241,14 +279,14 @@ impl Fake {
 
     /// An account at the stand-in with nobody signed in, and where its
     /// session is kept.
-    pub(crate) fn account(&self) -> (Arc<Account>, Memory) {
+    pub fn account(&self) -> (Arc<Account>, Memory) {
         let memory = Memory::default();
         (self.account_keeping(&memory), memory)
     }
 
     /// Another account at the stand-in that keeps its session in `memory`:
     /// what a second Vinput process on the same PC is.
-    pub(crate) fn account_keeping(&self, memory: &Memory) -> Arc<Account> {
+    pub fn account_keeping(&self, memory: &Memory) -> Arc<Account> {
         /// Tests do not wait half a minute for a retry.
         const QUICK: [Duration; 3] = [Duration::from_millis(10); 3];
         let server = Server {
@@ -272,7 +310,7 @@ struct Held {
 
 /// A session kept in memory.
 #[derive(Clone)]
-pub(crate) struct Memory(Arc<Mutex<Held>>);
+pub struct Memory(Arc<Mutex<Held>>);
 
 impl Default for Memory {
     fn default() -> Self {
@@ -297,14 +335,14 @@ impl Memory {
 
     /// As if someone had signed in earlier: the refresh token the stand-in
     /// takes is kept, and nothing is in memory.
-    pub(crate) fn sign_in(&self, fake: &Fake) {
+    pub fn sign_in(&self, fake: &Fake) {
         self.held().kept = Some(Kept {
             refresh_token: fake.read(|state| state.refresh.clone()),
             email: "ana@example.com".to_owned(),
         });
     }
 
-    pub(crate) fn refresh_token(&self) -> Option<String> {
+    pub fn refresh_token(&self) -> Option<String> {
         self.held()
             .kept
             .as_ref()
@@ -313,7 +351,7 @@ impl Memory {
 
     /// Keeps `first` until it has been read once, and `refresh_token` from
     /// then on: what another process trading the token looks like.
-    pub(crate) fn swap_after_next_read(&self, first: &Kept, refresh_token: &str) {
+    pub fn swap_after_next_read(&self, first: &Kept, refresh_token: &str) {
         let mut held = self.held();
         held.kept = Some(first.clone());
         held.then = Some(Kept {
@@ -439,8 +477,14 @@ async fn connection(mut stream: TcpStream, state: Shared, base: String) {
         .unwrap_or_else(PoisonError::into_inner)
         .slow_answers;
     tokio::time::sleep(slow).await;
+    // An answer that is written as it comes is a stream of events.
+    let kind = if answer.starts_with("data:") {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
     let reply = format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+        "HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{answer}",
         answer.len()
     );
@@ -562,6 +606,12 @@ fn route(head: &str, body: &[u8], state: &Shared, base: &str) -> Option<(u16, St
             (400, reasoned(old, "nothing_to_manage", "no customer yet"))
         }
         "POST /v1/billing/portal" => (200, json!({"url": state.portal_url}).to_string()),
+        "POST /v1/rewrite" => {
+            state.rewrites.push(body);
+            let events = state.rewritten.iter();
+            let events: Vec<String> = events.map(|event| format!("data: {event}\n\n")).collect();
+            (200, events.concat())
+        }
         _ => (404, error("not_found", "no such thing")),
     })
 }
@@ -598,28 +648,75 @@ fn admit(
     }
 }
 
-/// What a piece of audio is answered with; more than one message ends the
-/// stream, and `None` drops it.
-fn to_audio(script: Script) -> Option<Vec<Value>> {
+/// What a piece of audio is answered with, and what becomes of the stream
+/// then.
+fn to_audio(script: Script) -> (Vec<Value>, Then) {
     let so_far = json!({"type": "final", "text": "So far. "});
-    Some(match script {
-        Script::DropMidway => return None,
-        Script::FailMidway(code) => vec![
-            so_far,
-            json!({"type": "error", "error": {"code": code, "message": "refused"}}),
-        ],
-        Script::SpentMidway(counted) => vec![
-            so_far,
-            json!({"type": "error", "seconds": f64::from(counted) / 1000.0,
-                "error": {"code": "quota_exceeded", "message": "used up"}}),
-        ],
-        Script::DoneEarly(counted) => vec![
-            so_far,
-            json!({"type": "done", "seconds": f64::from(counted) / 1000.0}),
-        ],
-        Script::DoneAtOnce => vec![json!({"type": "done", "seconds": 0.0}), Value::Null],
-        _ => vec![json!({"type": "partial", "text": "hello wor"})],
-    })
+    let settled = |reached: Option<u32>, guessing: bool| {
+        let mut said = vec![match reached {
+            Some(reached) => json!({"type": "final", "text": "So far. ",
+                "until": f64::from(reached) / 1000.0}),
+            None => so_far.clone(),
+        }];
+        if guessing {
+            said.push(json!({"type": "partial", "text": "and then"}));
+        }
+        said
+    };
+    match script {
+        Script::DropMidway => (Vec::new(), Then::Drop),
+        Script::FailMidway(code) => (
+            vec![
+                so_far,
+                json!({"type": "error", "error": {"code": code, "message": "refused"}}),
+            ],
+            Then::Close,
+        ),
+        Script::SpentMidway(counted) => (
+            vec![
+                so_far,
+                json!({"type": "error", "seconds": f64::from(counted) / 1000.0,
+                    "error": {"code": "quota_exceeded", "message": "used up"}}),
+            ],
+            Then::Close,
+        ),
+        Script::DoneEarly(counted) => (
+            vec![
+                so_far,
+                json!({"type": "done", "seconds": f64::from(counted) / 1000.0}),
+            ],
+            Then::Close,
+        ),
+        Script::DoneAtOnce => (vec![json!({"type": "done", "seconds": 0.0})], Then::Close),
+        Script::SettlesThenDrops { reached, guessing } => (settled(reached, guessing), Then::Drop),
+        Script::SettlesThenStalls { reached, guessing } => {
+            (settled(reached, guessing), Then::Stall)
+        }
+        _ => (
+            vec![json!({"type": "partial", "text": "hello wor"})],
+            Then::Listen,
+        ),
+    }
+}
+
+/// Ends a stream the way `then` says.
+async fn end(socket: &mut WebSocketStream<TcpStream>, then: Then) {
+    match then {
+        Then::Listen => return,
+        Then::Stall => {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            return;
+        }
+        // Closes the way a server does.
+        Then::Close => drop(socket.close(None).await),
+        // The connection ends without a goodbye.
+        Then::Drop => drop(socket.get_mut().shutdown().await),
+    }
+    // What the client had on its way is still read, so that the connection
+    // is ended and not reset: a reset can overtake what was said just
+    // before it, and a test must know what arrived.
+    let rest = async { while socket.next().await.is_some() {} };
+    let _ = tokio::time::timeout(Duration::from_secs(1), rest).await;
 }
 
 #[expect(
@@ -665,7 +762,7 @@ async fn audio_stream(stream: TcpStream, state: Shared) {
     }
     while let Some(Ok(message)) = socket.next().await {
         let mut replies = Vec::new();
-        let mut close = false;
+        let mut then = Then::Listen;
         match message {
             Message::Text(said) => {
                 let said: Value = serde_json::from_str(said.as_str()).unwrap_or_default();
@@ -682,7 +779,7 @@ async fn audio_stream(stream: TcpStream, state: Shared) {
                         note(&|seen| seen.events.push("finish"));
                         replies.push(text(json!({"type": "final", "text": "Hello world."})));
                         replies.push(text(json!({"type": "done", "seconds": 1.5})));
-                        close = true;
+                        then = Then::Close;
                     }
                     _ => {}
                 }
@@ -698,12 +795,9 @@ async fn audio_stream(stream: TcpStream, state: Shared) {
                     seen.largest = seen.largest.max(bytes.len());
                     seen.messages += 1;
                 });
-                let Some(answers) = to_audio(script) else {
-                    return;
-                };
-                close = answers.len() > 1;
-                let said = answers.into_iter().filter(|answer| !answer.is_null());
-                replies.extend(said.map(text));
+                let (answers, after) = to_audio(script);
+                then = after;
+                replies.extend(answers.into_iter().map(text));
             }
             _ => {}
         }
@@ -712,13 +806,15 @@ async fn audio_stream(stream: TcpStream, state: Shared) {
                 return;
             }
         }
-        if close {
-            // Closes the way a server does: what the client had on its way
-            // is still read, so that it is not answered with a reset.
-            let _ = socket.close(None).await;
-            let rest = async { while socket.next().await.is_some() {} };
-            let _ = tokio::time::timeout(Duration::from_secs(1), rest).await;
-            break;
+        if then != Then::Listen {
+            if then == Then::Stall {
+                note(&|seen| seen.events.push("stalled"));
+            }
+            end(&mut socket, then).await;
+            if then == Then::Close {
+                break;
+            }
+            return;
         }
     }
     note(&|seen| seen.events.push("closed"));

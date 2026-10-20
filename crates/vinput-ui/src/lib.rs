@@ -48,6 +48,7 @@ pub mod geometry;
 pub mod hotkey;
 pub mod icons;
 pub mod layout;
+#[cfg(feature = "line")]
 pub mod link;
 pub mod look;
 #[cfg(any(debug_assertions, test))]
@@ -106,13 +107,33 @@ pub trait Backend: Send {
 pub type Listener = Box<dyn Fn(Event) + Send>;
 
 /// Where the windows of this process get their data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Source {
     /// From the background process that started this one, over standard
-    /// input and output.
+    /// input and output. A program built without the feature `line` has no
+    /// such process; a window of it that is given this source shows what a
+    /// view holds before anything is known, and nobody hears what is done
+    /// in it.
     Host,
     /// From canned data: the name of a scene in [`mock`].
     Mock(String),
+    /// From this process itself: a program that has no background process
+    /// and is its own window, as the hub is. The function is given where
+    /// to report and returns where to send.
+    Program(fn(Listener) -> Box<dyn Backend>),
+}
+
+impl PartialEq for Source {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Host, Self::Host) => true,
+            (Self::Mock(scene), Self::Mock(other)) => scene == other,
+            (Self::Program(connect), Self::Program(other)) => {
+                std::ptr::fn_addr_eq(*connect, *other)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The theme a window is drawn in.
@@ -155,6 +176,13 @@ pub struct Options {
     /// How much larger than usual text is in a picture, instead of what the
     /// user asked of Windows: 1 to 2.25.
     pub text_scale: Option<f32>,
+    /// The rows a picture shows open or closed, and what its lists are
+    /// searched for.
+    #[cfg(any(debug_assertions, test))]
+    pub memory: layout::Memory,
+    /// How far down the lists that scroll by themselves are scrolled in a
+    /// picture, in units.
+    pub list_scroll: u16,
 }
 
 impl Options {
@@ -172,6 +200,9 @@ impl Options {
             hover: None,
             scroll: 0,
             text_scale: None,
+            #[cfg(any(debug_assertions, test))]
+            memory: layout::Memory::default(),
+            list_scroll: 0,
         }
     }
 
@@ -183,34 +214,58 @@ impl Options {
     ///     [--mock <scene>] [--picture <file.png>]
     ///     [--theme light|dark|contrast] [--scale 1.5] [--size 940x660]
     ///     [--focus <n>] [--hover <n>] [--scroll <units>] [--text-scale 1.5]
+    ///     [--open <key>] [--shut <key>] [--search <key>=<text>]
+    ///     [--list-scroll <units>]
     /// ```
     ///
-    /// The last line is for pictures: which control has the focus or the
-    /// mouse over it, how far the page is scrolled, and how large text is.
+    /// The last lines are for pictures: which control has the focus or the
+    /// mouse over it, how far the page is scrolled, how large text is,
+    /// which rows are open or shut, what a list is searched for and how far
+    /// the lists are scrolled.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Arguments`] with what is wrong, in words for a
     /// terminal.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(args: &[&str]) -> Result<Self> {
         use vinput_view::Page;
         let wrong = |what: String| Error::Arguments(what);
         let (surface, mut rest) = match args {
             ["settings" | "general", rest @ ..] => (Surface::Settings(Page::General), rest),
+            ["shortcuts", rest @ ..] => (Surface::Settings(Page::Shortcuts), rest),
             ["models", rest @ ..] => (Surface::Settings(Page::Models), rest),
             ["add-model", rest @ ..] => (Surface::Settings(Page::AddModel), rest),
             ["google", rest @ ..] => (Surface::Settings(Page::Google), rest),
             ["pro", rest @ ..] => (Surface::Settings(Page::Pro), rest),
+            ["words", rest @ ..] => (Surface::Settings(Page::Words), rest),
+            ["cleanup", rest @ ..] => (Surface::Settings(Page::Cleanup), rest),
             ["advanced", rest @ ..] => (Surface::Settings(Page::Advanced), rest),
             ["about", rest @ ..] => (Surface::Settings(Page::About), rest),
             ["welcome", rest @ ..] => (Surface::Settings(Page::Welcome), rest),
             ["welcome-pro", rest @ ..] => (Surface::Settings(Page::WelcomePro), rest),
             ["welcome-local", rest @ ..] => (Surface::Settings(Page::WelcomeLocal), rest),
             ["update", rest @ ..] => (Surface::Update, rest),
+            #[cfg(feature = "hub")]
+            ["products", rest @ ..] => (Surface::Settings(Page::Products), rest),
+            #[cfg(feature = "hub")]
+            ["account", rest @ ..] => (Surface::Settings(Page::Account), rest),
+            #[cfg(feature = "hub")]
+            ["hub-about", rest @ ..] => (Surface::Settings(Page::HubAbout), rest),
+            #[cfg(feature = "voutput")]
+            ["reading", rest @ ..] => (Surface::Settings(Page::Reading), rest),
+            #[cfg(feature = "voutput")]
+            ["voices", rest @ ..] => (Surface::Settings(Page::Voices), rest),
+            #[cfg(feature = "voutput")]
+            ["summaries", rest @ ..] => (Surface::Settings(Page::Summaries), rest),
+            #[cfg(feature = "voutput")]
+            ["reader-advanced", rest @ ..] => (Surface::Settings(Page::ReaderAdvanced), rest),
+            #[cfg(feature = "voutput")]
+            ["reader-about", rest @ ..] => (Surface::Settings(Page::ReaderAbout), rest),
             _ => {
                 return Err(wrong(
-                    "which window? settings, models, add-model, google, pro, advanced, about, \
-                     welcome, welcome-pro, welcome-local or update"
+                    "which window? settings, shortcuts, models, add-model, google, pro, words, \
+                     cleanup, advanced, about, welcome, welcome-pro, welcome-local or update"
                         .to_owned(),
                 ));
             }
@@ -224,7 +279,9 @@ impl Options {
             };
             let bad = || wrong(format!("{value:?} is not a value for {name}"));
             match name {
-                "--mock" | "--picture" if !CANNED => {
+                "--mock" | "--picture" | "--open" | "--shut" | "--search" | "--list-scroll"
+                    if !CANNED =>
+                {
                     return Err(wrong(format!(
                         "{name} is for working on the windows; this build shows only the \
                          real ones"
@@ -257,6 +314,16 @@ impl Options {
                 "--focus" => options.focus = Some(value.parse().map_err(|_| bad())?),
                 "--hover" => options.hover = Some(value.parse().map_err(|_| bad())?),
                 "--scroll" => options.scroll = value.parse().map_err(|_| bad())?,
+                "--list-scroll" => options.list_scroll = value.parse().map_err(|_| bad())?,
+                #[cfg(any(debug_assertions, test))]
+                "--open" | "--shut" => {
+                    options.memory.set_open(value, name == "--open");
+                }
+                #[cfg(any(debug_assertions, test))]
+                "--search" => {
+                    let (key, text) = value.split_once('=').ok_or_else(bad)?;
+                    options.memory.set_typed(key, text.to_owned());
+                }
                 "--text-scale" => {
                     let scale = value
                         .parse()

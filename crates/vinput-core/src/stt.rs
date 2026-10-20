@@ -7,6 +7,7 @@
 
 pub mod check;
 mod cloud;
+pub(crate) mod deferred;
 mod gemini;
 mod google;
 mod live;
@@ -21,9 +22,9 @@ use std::thread;
 pub use cloud::{CloudSpeech, Timings, measure};
 pub use gemini::{GeminiConfig, GeminiSpeech};
 pub use google::{GoogleConfig, GoogleSession, GoogleSpeech};
-pub use local::LocalSpeech;
 pub(crate) use local::languages::name as language_name;
-pub use standby::Standby;
+pub use local::{LocalSpeech, fell_back};
+pub use standby::{Cause, Served, Standby};
 
 use crate::settings::Settings;
 use crate::{Error, Result, log};

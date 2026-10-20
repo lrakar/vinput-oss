@@ -61,7 +61,7 @@ const GIVE_UP_AFTER: u32 = 2;
 /// Backspaces in some programs), marks that combine with the letter before
 /// them, the scripts written in clusters, and line ends and tabs, which a
 /// program may turn into something else altogether.
-fn erasable(c: char) -> bool {
+pub(crate) fn erasable(c: char) -> bool {
     matches!(
         u32::from(c),
         0x20..=0x7E

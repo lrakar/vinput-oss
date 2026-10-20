@@ -55,7 +55,7 @@ $target = Join-Path $root "target\dist"
 # variable left over in this shell would replace those flags.
 Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 # The address of the VinPUT Pro server is built in from VINPUT_SERVER; the
-# source names none (cratesputlab-coresrcoud.rs).
+# source names none (crates\putlab-core\src\cloud.rs).
 if (-not $env:VINPUT_SERVER) { throw "set VINPUT_SERVER to the address of the VinPUT Pro server" }
 
 # The compiler writes the path of every source file it was given into the
